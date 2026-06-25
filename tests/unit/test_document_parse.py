@@ -82,7 +82,7 @@ def seed_document(settings: Settings) -> Path:
     document_dir = settings.paths.documents / "843" / "843_1"
     source_dir = document_dir / "source"
     source_dir.mkdir(parents=True, exist_ok=True)
-    image_bytes = b"image-bytes"
+    image_bytes = b"\x89PNG\r\n\x1a\n"
     image_base64 = base64.b64encode(image_bytes).decode("ascii")
     payload = {
         "success": True,
@@ -165,12 +165,12 @@ def test_parse_documents_writes_normalized_outputs(tmp_path: Path) -> None:
 
     image = parsed["images"][0]
     assert image["mime"] == "image/png"
-    assert image["sha256"] == hashlib.sha256(b"image-bytes").hexdigest()
+    assert image["sha256"] == hashlib.sha256(b"\x89PNG\r\n\x1a\n").hexdigest()
     assert image["path"] == "assets/doc_crat_info_1_2/image-0001.png"
     assert image["table_id"] == parsed["tables"][1]["id"]
     assert image["row"] == 2
     assert image["column"] == 1
-    assert (document_dir / image["path"]).read_bytes() == b"image-bytes"
+    assert (document_dir / image["path"]).read_bytes() == b"\x89PNG\r\n\x1a\n"
 
     recommendation = parsed["recommendations"][0]
     assert recommendation["uur"] == "C"
@@ -228,3 +228,30 @@ def test_parse_cli_writes_artifacts_for_selected_document(tmp_path: Path) -> Non
     assert "parse completed" in result.output
     assert "843_1: status=parsed" in result.output
     assert (document_dir / "parsed" / "document.json").exists()
+
+
+def test_qa_cli_checks_parsed_document_and_strict_pdf(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    seed_document(settings)
+    config_path = tmp_path / "config.yaml"
+    write_config(config_path, settings)
+
+    parse_result = runner.invoke(
+        app,
+        ["parse", "--config", str(config_path), "--code-version", "843_1"],
+    )
+    assert parse_result.exit_code == 0
+
+    qa_result = runner.invoke(
+        app,
+        ["qa", "--config", str(config_path), "--code-version", "843_1"],
+    )
+    assert qa_result.exit_code == 0
+    assert "qa completed" in qa_result.output
+
+    strict_result = runner.invoke(
+        app,
+        ["qa", "--config", str(config_path), "--code-version", "843_1", "--strict-pdf"],
+    )
+    assert strict_result.exit_code == 1
+    assert "errors: 1" in strict_result.output

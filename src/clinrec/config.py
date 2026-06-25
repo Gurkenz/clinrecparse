@@ -24,6 +24,8 @@ class HttpSettings(BaseModel):
     retries: int = Field(ge=0)
     backoff_initial_seconds: float = Field(gt=0)
     backoff_max_seconds: float = Field(gt=0)
+    user_agent: str = "clinrecparse/0.1 contact: local-development"
+    circuit_breaker_5xx_threshold: int = Field(default=5, ge=1)
 
     @field_validator("backoff_max_seconds")
     @classmethod

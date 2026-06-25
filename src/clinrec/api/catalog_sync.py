@@ -5,10 +5,9 @@ import math
 import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import ValidationError
 
@@ -21,13 +20,13 @@ from clinrec.models.external import (
     ExternalApiError,
     NkoListResponse,
     NormalizedCatalogRecord,
-    NormalizedDate,
     QaIssue,
     ReferenceOrganization,
 )
 
-SOURCE_TIMEZONE = "Europe/Moscow"
 INITIAL_PAGE_SIZE = 1000
+DATE_PREFIX_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})(?:[T\s].*)?$")
+MICROSOFT_DATE_RE = re.compile(r"/Date\((-?\d+)(?:[+-]\d+)?\)/")
 
 
 class SyncError(RuntimeError):
@@ -223,7 +222,16 @@ def sync_references(
         raise SyncError("NKO response validation failed") from exc
 
     organizations = [
-        ReferenceOrganization(id=item.id, name=item.name, short_name=item.short_name)
+        ReferenceOrganization(
+            id=item.id,
+            name=item.name,
+            short_name=item.short_name,
+            raw_short_name=item.raw_short_name,
+            engname=item.engname,
+            engshortname=item.engshortname,
+            profile=item.profile,
+            url=item.url,
+        )
         for item in response.d.data
     ]
     issues.extend(validate_reference_organizations(organizations))
@@ -481,7 +489,8 @@ def normalize_catalog_record(record: CatalogRecord) -> NormalizedCatalogRecord:
     code, version = split_code_version(code_version)
     code = to_int(record.code) if record.code is not None else code
     version = to_int(record.version) if record.version is not None else version
-    publish_date = parse_source_date(record.publish_date)
+    publish_date = parse_source_date(record.publish_date or record.publish_date_str)
+    created_date = parse_source_date(record.created or record.created_str)
     return NormalizedCatalogRecord(
         source_record_id=to_int(record.source_record_id),
         code=code,
@@ -489,16 +498,17 @@ def normalize_catalog_record(record: CatalogRecord) -> NormalizedCatalogRecord:
         code_version=code_version,
         name=record.title or "",
         status=to_int(record.status),
+        apply_status=record.apply_status,
+        apply_status_calculated=to_int(record.apply_status_calculated),
         npc_approved=record.npc_approved,
         age_category=to_int(record.age_category),
         age_category_name=record.age_category_name,
-        publish_date_raw=publish_date.raw,
-        publish_date_epoch_ms=publish_date.epoch_ms,
-        publish_date_utc=publish_date.utc,
-        publish_date_source_timezone=publish_date.source_timezone,
-        publish_date_source=source_datetime(publish_date),
+        publish_date=publish_date,
+        created_date=created_date,
+        prev_cr_id=to_int(record.prev_cr_id),
         developers=as_list(record.developers),
         mkbs=as_list(record.mkbs),
+        specialities=record.specialities,
     )
 
 
@@ -601,47 +611,26 @@ def validate_reference_organizations(organizations: list[ReferenceOrganization])
     return issues
 
 
-def parse_source_date(value: str | None) -> NormalizedDate:
+def parse_source_date(value: str | None) -> str | None:
     if not value:
-        return NormalizedDate()
+        return None
 
-    match = re.fullmatch(r"/Date\((-?\d+)(?:[+-]\d+)?\)/", value)
+    trimmed = value.strip()
+    date_match = DATE_PREFIX_RE.match(trimmed)
+    if date_match:
+        return date_match.group(1)
+
+    match = MICROSOFT_DATE_RE.fullmatch(trimmed)
     if match:
         epoch_ms = int(match.group(1))
-        utc_dt = datetime.fromtimestamp(epoch_ms / 1000, tz=UTC)
-        return NormalizedDate(
-            raw=value,
-            epoch_ms=epoch_ms,
-            utc=utc_dt.isoformat().replace("+00:00", "Z"),
-        )
+        return datetime.fromtimestamp(epoch_ms / 1000, tz=UTC).date().isoformat()
 
     try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(trimmed.replace("Z", "+00:00"))
     except ValueError:
-        return NormalizedDate(raw=value)
-
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=source_timezone())
-    utc_dt = parsed.astimezone(UTC)
-    return NormalizedDate(
-        raw=value,
-        epoch_ms=int(utc_dt.timestamp() * 1000),
-        utc=utc_dt.isoformat().replace("+00:00", "Z"),
-    )
-
-
-def source_datetime(value: NormalizedDate) -> str | None:
-    if value.epoch_ms is None:
         return None
-    source_dt = datetime.fromtimestamp(value.epoch_ms / 1000, tz=UTC).astimezone(source_timezone())
-    return source_dt.replace(tzinfo=None).isoformat(timespec="seconds")
 
-
-def source_timezone() -> ZoneInfo | timezone:
-    try:
-        return ZoneInfo(SOURCE_TIMEZONE)
-    except ZoneInfoNotFoundError:
-        return timezone(timedelta(hours=3), name=SOURCE_TIMEZONE)
+    return parsed.date().isoformat()
 
 
 def split_code_version(code_version: str) -> tuple[int | None, int | None]:

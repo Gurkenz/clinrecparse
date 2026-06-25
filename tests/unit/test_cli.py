@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from typer.testing import CliRunner
 
 from clinrec import __version__
@@ -18,8 +20,39 @@ def test_cli_help() -> None:
     assert "run-all" in result.output
 
 
-def test_qa_smoke_command() -> None:
-    result = runner.invoke(app, ["qa"])
+def test_qa_command_with_empty_temp_data(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.yaml"
+    data_root = tmp_path / "data"
+    config_path.write_text(
+        f"""
+paths:
+  data_root: {data_root.as_posix()}
+  snapshots: {(data_root / "snapshots").as_posix()}
+  references: {(data_root / "references").as_posix()}
+  documents: {(data_root / "documents").as_posix()}
+  indexes: {(data_root / "indexes").as_posix()}
+  reports: {(data_root / "reports").as_posix()}
+  logs: {(data_root / "logs").as_posix()}
+http:
+  timeout_seconds: 5
+  retries: 0
+  backoff_initial_seconds: 0.01
+  backoff_max_seconds: 0.01
+rate_limit:
+  requests_per_second: 2
+concurrency:
+  default: 1
+  max: 2
+discovery:
+  unavailable_retry_ttl_days: 7
+logging:
+  level: INFO
+  jsonl_path: {(data_root / "logs" / "test.jsonl").as_posix()}
+""".lstrip(),
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(app, ["qa", "--config", str(config_path)])
 
     assert result.exit_code == 0
-    assert "qa: config loaded" in result.output
+    assert "qa completed" in result.output

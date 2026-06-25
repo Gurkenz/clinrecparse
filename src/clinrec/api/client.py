@@ -1,14 +1,16 @@
 from __future__ import annotations
 
+import random
+import re
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
+from email.utils import parsedate_to_datetime
 from typing import Any, TypeVar
 
 import httpx
 import structlog
 from pydantic import BaseModel, ValidationError
-from tenacity import Retrying, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from clinrec.api.rate_limit import RateLimiter
 from clinrec.config import HttpSettings, RateLimitSettings
@@ -22,6 +24,11 @@ from clinrec.models.external import (
 )
 
 BASE_URL = "https://apicr.minzdrav.gov.ru/api.ashx"
+SAFE_BODY_PREVIEW_LIMIT = 4096
+SENSITIVE_BODY_RE = re.compile(
+    r"(?i)(\"?(?:authorization|cookie|set-cookie|token|password|secret)\"?\s*[:=]\s*\"?)"
+    r"([^\"\s;&,}]+)"
+)
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -35,14 +42,8 @@ class JsonPayloadResult:
     raw_content: bytes
     response_size_bytes: int
     duration_seconds: float
+    attempts: int = 1
     code_version: str | None = None
-
-
-class RetryableResponseError(Exception):
-    def __init__(self, response: httpx.Response, duration_seconds: float) -> None:
-        super().__init__(f"Retryable HTTP status {response.status_code}")
-        self.response = response
-        self.duration_seconds = duration_seconds
 
 
 class ClinrecApiClient:
@@ -58,10 +59,12 @@ class ClinrecApiClient:
         self._http = http
         self._rate_limiter = RateLimiter(rate_limit.requests_per_second)
         self._logger = structlog.get_logger()
+        self._consecutive_5xx = 0
         self._client = httpx.Client(
             timeout=http.timeout_seconds,
             transport=transport,
             follow_redirects=False,
+            headers={"User-Agent": http.user_agent},
         )
 
     def __enter__(self) -> ClinrecApiClient:
@@ -116,15 +119,21 @@ class ClinrecApiClient:
         if isinstance(response_or_error, ExternalApiError):
             return response_or_error
 
-        response, duration_seconds = response_or_error
+        response, duration_seconds, attempts = response_or_error
         content_type = response.headers.get("content-type", "")
         content = response.content
-        common = self._error_context(response, "GetClinrecPdf", duration_seconds, code_version)
+        common = self._error_context(
+            response,
+            "GetClinrecPdf",
+            duration_seconds,
+            code_version,
+            attempts,
+        )
 
         if not response.is_success:
             return ExternalApiError(
                 **common,
-                kind=ApiErrorKind.HTTP_STATUS,
+                kind=self._status_error_kind(response.status_code),
                 message=f"HTTP status {response.status_code}",
             )
         if not content:
@@ -167,6 +176,12 @@ class ClinrecApiClient:
     def fetch_nko_list_payload(self) -> JsonPayloadResult | ExternalApiError:
         return self._fetch_json_payload("GetNkoList", method="GET")
 
+    def health_probe(self) -> ExternalApiError | None:
+        result = self.fetch_catalog_payload({"currentPage": 1, "pageSize": 1, "filters": []})
+        if isinstance(result, ExternalApiError):
+            return result
+        return None
+
     def _fetch_json(
         self,
         endpoint: str,
@@ -205,13 +220,13 @@ class ClinrecApiClient:
         if isinstance(response_or_error, ExternalApiError):
             return response_or_error
 
-        response, duration_seconds = response_or_error
-        common = self._error_context(response, endpoint, duration_seconds, code_version)
+        response, duration_seconds, attempts = response_or_error
+        common = self._error_context(response, endpoint, duration_seconds, code_version, attempts)
 
         if not response.is_success:
             return ExternalApiError(
                 **common,
-                kind=ApiErrorKind.HTTP_STATUS,
+                kind=self._status_error_kind(response.status_code),
                 message=f"HTTP status {response.status_code}",
             )
         if not response.content:
@@ -250,6 +265,7 @@ class ClinrecApiClient:
             raw_content=response.content,
             response_size_bytes=len(response.content),
             duration_seconds=duration_seconds,
+            attempts=attempts,
             code_version=code_version,
         )
 
@@ -270,6 +286,7 @@ class ClinrecApiClient:
                 content_type=payload_or_error.content_type,
                 response_size_bytes=payload_or_error.response_size_bytes,
                 duration_seconds=payload_or_error.duration_seconds,
+                attempts=payload_or_error.attempts,
                 kind=ApiErrorKind.VALIDATION_ERROR,
                 message=f"Response schema validation failed: {exc.errors()}",
             )
@@ -282,47 +299,89 @@ class ClinrecApiClient:
         params: Mapping[str, str] | None = None,
         json: Mapping[str, Any] | None = None,
         code_version: str | None = None,
-    ) -> tuple[httpx.Response, float] | ExternalApiError:
-        try:
-            for attempt in Retrying(
-                stop=stop_after_attempt(self._http.retries + 1),
-                wait=wait_exponential(
-                    multiplier=self._http.backoff_initial_seconds,
-                    max=self._http.backoff_max_seconds,
-                ),
-                retry=retry_if_exception_type((httpx.RequestError, RetryableResponseError)),
-                reraise=True,
-            ):
-                with attempt:
-                    return self._send_once(
-                        method,
-                        endpoint,
-                        params=params,
-                        json=json,
-                        code_version=code_version,
-                    )
-        except RetryableResponseError as exc:
-            return (
-                exc.response,
-                exc.duration_seconds,
-            )
-        except httpx.TimeoutException as exc:
+    ) -> tuple[httpx.Response, float, int] | ExternalApiError:
+        if self._consecutive_5xx >= self._http.circuit_breaker_5xx_threshold:
             return ExternalApiError(
                 endpoint=endpoint,
-                kind=ApiErrorKind.REQUEST_ERROR,
-                message=str(exc),
+                kind=ApiErrorKind.CIRCUIT_OPEN,
+                message="Circuit breaker is open after consecutive 5xx responses",
                 code_version=code_version,
-                error_type="timeout",
-            )
-        except httpx.RequestError as exc:
-            return ExternalApiError(
-                endpoint=endpoint,
-                kind=ApiErrorKind.REQUEST_ERROR,
-                message=str(exc),
-                code_version=code_version,
-                error_type=exc.__class__.__name__,
+                attempts=0,
             )
 
+        max_attempts = self._http.retries + 1
+        last_request_error: httpx.RequestError | None = None
+        total_duration = 0.0
+        for attempt_number in range(1, max_attempts + 1):
+            try:
+                response, duration_seconds = self._send_once(
+                    method,
+                    endpoint,
+                    params=params,
+                    json=json,
+                    code_version=code_version,
+                )
+            except httpx.TimeoutException as exc:
+                last_request_error = exc
+                if attempt_number >= max_attempts:
+                    return ExternalApiError(
+                        endpoint=endpoint,
+                        kind=ApiErrorKind.REQUEST_ERROR,
+                        message=str(exc),
+                        code_version=code_version,
+                        error_type="timeout",
+                        attempts=attempt_number,
+                    )
+                self._sleep_before_retry(attempt_number, None)
+                continue
+            except httpx.RequestError as exc:
+                last_request_error = exc
+                if attempt_number >= max_attempts:
+                    return ExternalApiError(
+                        endpoint=endpoint,
+                        kind=ApiErrorKind.REQUEST_ERROR,
+                        message=str(exc),
+                        code_version=code_version,
+                        error_type=exc.__class__.__name__,
+                        attempts=attempt_number,
+                    )
+                self._sleep_before_retry(attempt_number, None)
+                continue
+
+            total_duration += duration_seconds
+            if response.status_code >= 500:
+                self._consecutive_5xx += 1
+            else:
+                self._consecutive_5xx = 0
+
+            if response.status_code in {429} or response.status_code >= 500:
+                if self._consecutive_5xx >= self._http.circuit_breaker_5xx_threshold:
+                    return ExternalApiError(
+                        **self._error_context(
+                            response,
+                            endpoint,
+                            total_duration,
+                            code_version,
+                            attempt_number,
+                        ),
+                        kind=ApiErrorKind.CIRCUIT_OPEN,
+                        message="Circuit breaker opened after consecutive 5xx responses",
+                    )
+                if attempt_number < max_attempts:
+                    self._sleep_before_retry(attempt_number, response)
+                    continue
+
+            return response, total_duration, attempt_number
+
+        if last_request_error is not None:
+            return ExternalApiError(
+                endpoint=endpoint,
+                kind=ApiErrorKind.REQUEST_ERROR,
+                message=str(last_request_error),
+                code_version=code_version,
+                error_type=last_request_error.__class__.__name__,
+                attempts=max_attempts,
+            )
         raise RuntimeError("unreachable retry loop state")
 
     def _send_once(
@@ -360,9 +419,6 @@ class ClinrecApiClient:
             duration_seconds=round(duration_seconds, 6),
         )
 
-        if response.status_code == 429 or response.status_code >= 500:
-            raise RetryableResponseError(response, duration_seconds)
-
         return response, duration_seconds
 
     def _error_context(
@@ -371,6 +427,7 @@ class ClinrecApiClient:
         endpoint: str,
         duration_seconds: float,
         code_version: str | None,
+        attempts: int,
     ) -> dict[str, Any]:
         return {
             "endpoint": endpoint,
@@ -379,7 +436,52 @@ class ClinrecApiClient:
             "content_type": response.headers.get("content-type"),
             "response_size_bytes": len(response.content),
             "duration_seconds": duration_seconds,
+            "attempts": attempts,
+            "retry_after": response.headers.get("retry-after"),
+            "server": response.headers.get("server"),
+            "date": response.headers.get("date"),
+            "safe_body_preview": self._safe_body_preview(response.content),
         }
+
+    def _sleep_before_retry(
+        self,
+        attempt_number: int,
+        response: httpx.Response | None,
+    ) -> None:
+        retry_after = self._retry_after_seconds(response) if response is not None else None
+        if retry_after is None:
+            retry_after = min(
+                self._http.backoff_initial_seconds * (2 ** max(0, attempt_number - 1)),
+                self._http.backoff_max_seconds,
+            )
+            retry_after += random.uniform(0, min(retry_after, self._http.backoff_initial_seconds))
+        time.sleep(retry_after)
+
+    @staticmethod
+    def _retry_after_seconds(response: httpx.Response | None) -> float | None:
+        if response is None:
+            return None
+        value = response.headers.get("retry-after")
+        if not value:
+            return None
+        if value.isdigit():
+            return max(0.0, float(value))
+        try:
+            retry_at = parsedate_to_datetime(value)
+        except (TypeError, ValueError):
+            return None
+        return max(0.0, retry_at.timestamp() - time.time())
+
+    @staticmethod
+    def _status_error_kind(status_code: int) -> ApiErrorKind:
+        if status_code == 429:
+            return ApiErrorKind.RATE_LIMITED_429
+        return ApiErrorKind.HTTP_STATUS
+
+    @staticmethod
+    def _safe_body_preview(content: bytes) -> str:
+        preview = content[:SAFE_BODY_PREVIEW_LIMIT].decode("utf-8", errors="replace")
+        return SENSITIVE_BODY_RE.sub(r"\1[redacted]", preview)
 
     @staticmethod
     def _main_content_type(content_type: str) -> str:

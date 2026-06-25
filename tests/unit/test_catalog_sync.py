@@ -19,13 +19,11 @@ def test_build_catalog_request_active_and_all_statuses() -> None:
     assert all_statuses["filters"] == []
 
 
-def test_parse_source_date_preserves_raw_epoch_utc_and_timezone() -> None:
+def test_parse_source_date_returns_date_only() -> None:
     parsed = parse_source_date("/Date(1734476342000)/")
 
-    assert parsed.raw == "/Date(1734476342000)/"
-    assert parsed.epoch_ms == 1734476342000
-    assert parsed.utc == "2024-12-17T22:59:02Z"
-    assert parsed.source_timezone == "Europe/Moscow"
+    assert parsed == "2024-12-17"
+    assert parse_source_date("2024-12-17T22:59:02Z") == "2024-12-17"
 
 
 def test_normalize_catalog_record_minimum_fields() -> None:
@@ -53,7 +51,7 @@ def test_normalize_catalog_record_minimum_fields() -> None:
     assert normalized.version == 1
     assert normalized.code_version == "843_1"
     assert normalized.name == "Fixture name"
-    assert normalized.publish_date_source == "2024-12-18T01:59:02"
+    assert normalized.publish_date == "2024-12-17"
     assert normalized.developers == [{"Name": "Developer"}]
     assert normalized.mkbs == ["H40"]
 

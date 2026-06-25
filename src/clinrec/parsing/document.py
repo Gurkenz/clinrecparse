@@ -16,8 +16,11 @@ from bs4.element import NavigableString, PageElement, Tag
 from pydantic import ValidationError
 
 from clinrec.api.catalog_sync import split_code_version, to_int, write_json, write_jsonl
+from clinrec.api.document_download import read_manifest, sha256_bytes
 from clinrec.config import Settings
 from clinrec.models.external import ClinrecResponse, QaIssue
+
+PARSER_VERSION = "0.1.0"
 
 
 class ParseError(RuntimeError):
@@ -135,14 +138,31 @@ UDD_PATTERNS = [
     ),
 ]
 EXPECTED_843_1 = {"sections": 31, "tables": 14, "images": 30}
+RECOMMENDATION_TERMS = (
+    "рекомендуется",
+    "рекомендуются",
+    "рекомендовано",
+    "рекомендованы",
+    "рекомендуем",
+    "р рµрєрѕрјрµрЅрґсѓрµс‚сѓ",
+    "р рµрєрѕрјрµрЅрґсѓсЋс‚сѓ",
+    "р рµрєрѕрјрµрЅрґрѕрІр°рЅрѕ",
+    "р рµрєрѕрјрµрЅрґрѕрІр°рЅс‹",
+    "р рµрєрѕрјрµрЅрґсѓрµрј",
+)
 IMAGE_EXTENSIONS = {
-    "image/gif": "gif",
     "image/jpeg": "jpg",
     "image/jpg": "jpg",
     "image/png": "png",
-    "image/svg+xml": "svg",
     "image/webp": "webp",
 }
+IMAGE_SIGNATURES = {
+    "image/jpeg": (b"\xff\xd8\xff",),
+    "image/jpg": (b"\xff\xd8\xff",),
+    "image/png": (b"\x89PNG\r\n\x1a\n",),
+    "image/webp": (b"RIFF",),
+}
+CHUNK_TEXT_LIMIT = 4000
 
 
 def parse_documents(settings: Settings, options: ParseOptions) -> ParseSummary:
@@ -158,7 +178,10 @@ def parse_documents(settings: Settings, options: ParseOptions) -> ParseSummary:
             summary = write_missing_source_report(document_dir, timestamp)
             documents.append(summary)
             continue
-        documents.append(parse_one_document(settings, document_dir, timestamp=timestamp))
+        try:
+            documents.append(parse_one_document(settings, document_dir, timestamp=timestamp))
+        except ParseError as exc:
+            documents.append(write_parse_error_report(document_dir, timestamp, exc))
 
     parsed = sum(1 for document in documents if document.status == "parsed")
     failed = len(documents) - parsed
@@ -190,8 +213,15 @@ def parse_one_document(
 
     raw_obj = as_mapping(first_present(raw_payload, "obj", "Obj", "data", "Data"))
     raw_sections = as_list(first_present(raw_obj, "sections", "Sections"))
+    if not raw_sections:
+        raise ParseError("source GetClinrec2 obj.sections is empty")
     catalog_record = load_catalog_record(settings, document_dir, response.obj.code_version)
-    document = build_document_metadata(response, raw_obj, catalog_record, document_dir)
+    document = build_document_metadata(response, raw_payload, raw_obj, catalog_record, document_dir)
+    if str(document.get("code_version")) != document_dir.name:
+        raise ParseError(
+            f"source code_version {document.get('code_version')!r} does not match "
+            f"document directory {document_dir.name!r}"
+        )
 
     state = ParseState(
         document_dir=document_dir,
@@ -208,7 +238,7 @@ def parse_one_document(
         state.issues.append(
             QaIssue(
                 severity="warning",
-                code="missing_pdf",
+                code="missing_pdf_control_source",
                 message="Official PDF is not available for visual/control validation.",
                 context={"path": "source/official.pdf"},
             )
@@ -228,7 +258,15 @@ def parse_one_document(
             )
 
     state.recommendations.extend(extract_recommendations(state))
+    manifest = read_manifest(document_dir / "manifest.json")
+    pdf_status = (manifest.get("pdf") or {}).get("status") if isinstance(manifest, dict) else None
     payload = {
+        "schema_version": "1.0",
+        "parser_version": PARSER_VERSION,
+        "source": {
+            "json_sha256": sha256_bytes(source_path.read_bytes()),
+            "pdf_status": pdf_status or "not_requested",
+        },
         "document": document,
         "sections": state.sections,
         "blocks": state.blocks,
@@ -346,14 +384,64 @@ def write_missing_source_report(document_dir: Path, timestamp: str) -> ParsedDoc
     )
 
 
+def write_parse_error_report(
+    document_dir: Path,
+    timestamp: str,
+    error: ParseError,
+) -> ParsedDocumentSummary:
+    code_version = document_dir.name
+    qa_report_path = document_dir / "qa" / "parse-report.json"
+    issue = QaIssue(
+        severity="fatal",
+        code="parse_fatal",
+        message=str(error),
+        context={"document_dir": str(document_dir)},
+    )
+    write_json(
+        qa_report_path,
+        {
+            "timestamp": timestamp,
+            "code_version": code_version,
+            "status": "failed",
+            "counts": {
+                "sections": 0,
+                "blocks": 0,
+                "tables": 0,
+                "images": 0,
+                "recommendations": 0,
+                "references": 0,
+            },
+            "issues": [issue.model_dump(mode="json")],
+        },
+    )
+    return ParsedDocumentSummary(
+        code_version=code_version,
+        document_dir=document_dir,
+        document_json_path=document_dir / "parsed" / "document.json",
+        markdown_path=document_dir / "parsed" / "content.md",
+        search_chunks_path=document_dir / "parsed" / "search_chunks.jsonl",
+        qa_report_path=qa_report_path,
+        sections=0,
+        blocks=0,
+        tables=0,
+        images=0,
+        recommendations=0,
+        references=0,
+        issues=1,
+        status="failed",
+    )
+
+
 def build_document_metadata(
     response: ClinrecResponse,
+    raw_payload: dict[str, Any],
     raw_obj: dict[str, Any],
     catalog_record: dict[str, Any],
     document_dir: Path,
 ) -> dict[str, Any]:
     raw_code_version = first_non_empty(
         response.obj.code_version,
+        first_present(raw_payload, "code_version", "CodeVersion", "id", "Id", "ID"),
         first_present(raw_obj, "code_version", "CodeVersion", "id", "Id", "ID"),
         catalog_record.get("code_version"),
         document_dir.name,
@@ -362,18 +450,27 @@ def build_document_metadata(
     parsed_code, parsed_version = split_code_version(code_version)
     code = first_int(
         response.obj.code,
+        raw_payload.get("code"),
+        raw_payload.get("Code"),
         raw_obj.get("code"),
         raw_obj.get("Code"),
         catalog_record.get("code"),
     )
     version = first_int(
         response.obj.version,
+        raw_payload.get("version"),
+        raw_payload.get("Version"),
+        raw_payload.get("ver"),
+        raw_payload.get("Ver"),
         raw_obj.get("version"),
         raw_obj.get("Version"),
+        raw_obj.get("ver"),
+        raw_obj.get("Ver"),
         catalog_record.get("version"),
     )
     title = first_non_empty(
         response.obj.title,
+        first_present(raw_payload, "title", "Title", "name", "Name"),
         first_present(raw_obj, "title", "Title", "name", "Name"),
         catalog_record.get("name"),
         catalog_record.get("title"),
@@ -398,16 +495,70 @@ def build_document_metadata(
             age["category_name"] = catalog_age_name
 
     return {
+        "db_id": first_int(
+            response.obj.db_id,
+            raw_payload.get("db_id"),
+            raw_payload.get("dbId"),
+            raw_obj.get("db_id"),
+        ),
         "code": code if code is not None else parsed_code,
         "version": version if version is not None else parsed_version,
+        "source_object_schema_version": 2,
         "code_version": code_version,
         "title": str(title or ""),
+        "adult": first_present(raw_payload, "adult", "Adult")
+        if first_present(raw_payload, "adult", "Adult") is not None
+        else response.obj.adult,
+        "child": first_present(raw_payload, "child", "Child")
+        if first_present(raw_payload, "child", "Child") is not None
+        else response.obj.child,
+        "publish_date": normalize_date_only(
+            first_non_empty(
+                response.obj.publish_date,
+                first_present(raw_payload, "publish_date", "PublishDate"),
+                catalog_record.get("publish_date"),
+            )
+        ),
+        "status": first_int(
+            response.obj.status,
+            raw_payload.get("status"),
+            raw_payload.get("Status"),
+            catalog_record.get("status"),
+        ),
+        "apply_status": first_non_empty(
+            response.obj.apply_status,
+            first_present(raw_payload, "apply_status", "ApplyStatus"),
+            catalog_record.get("apply_status"),
+        ),
+        "apply_status_calculated": first_int(
+            response.obj.apply_status_calculated,
+            raw_payload.get("apply_status_calculated"),
+            raw_payload.get("ApplyStatusCalculated"),
+            catalog_record.get("apply_status_calculated"),
+        ),
+        "prev_cr_id": first_int(
+            response.obj.prev_cr_id,
+            raw_payload.get("prev_cr_id"),
+            raw_payload.get("PrevCrId"),
+            catalog_record.get("prev_cr_id"),
+        ),
         "age": age,
         "mkbs": as_list(first_present(raw_obj, "mkbs", "MKBs", "Mkbs", "Mkb"))
+        or as_list(first_present(raw_payload, "mkbs", "MKBs", "Mkbs", "Mkb"))
         or as_list(catalog_record.get("mkbs")),
+        "proff_associations": as_list(
+            first_present(raw_payload, "proff_associations", "ProffAssociations")
+        )
+        or as_list(response.obj.proff_associations),
+        "specialities": as_list(
+            first_present(raw_payload, "specialities", "Specialities")
+        )
+        or as_list(response.obj.specialities)
+        or as_list(catalog_record.get("specialities")),
         "developers": as_list(
             first_present(raw_obj, "developers", "Developers", "developer", "Developer")
         )
+        or as_list(first_present(raw_payload, "developers", "Developers", "developer", "Developer"))
         or as_list(catalog_record.get("developers")),
     }
 
@@ -424,11 +575,12 @@ def parse_section(
     section_id = str(source_id if source_id is not None else f"section-{len(state.sections) + 1}")
     section_title = str(first_present(raw_section, "title", "Title", "name", "Name") or "")
     source_html = str(
-        first_present(raw_section, "html", "Html", "HTML", "text", "Text", "content", "Content")
+        first_present(raw_section, "content", "Content", "html", "Html", "HTML", "text", "Text")
         or ""
     )
     soup = BeautifulSoup(source_html, "lxml")
     root = soup.body or soup
+    sanitize_html_tree(root)
 
     section_blocks = parse_section_html(
         state,
@@ -444,6 +596,7 @@ def parse_section(
         "parent_id": parent_id,
         "depth": depth,
         "title": section_title,
+        "content": source_html,
         "source_html": source_html,
         "html": render_fragment_html(root),
         "found": raw_section.get("found"),
@@ -598,6 +751,8 @@ def process_tables(state: ParseState, root: Tag, *, section_id: str) -> dict[int
                     )
                     for img_tag in cell.find_all("img")
                 ]
+                rowspan = parse_span(cell.get("rowspan"))
+                colspan = parse_span(cell.get("colspan"))
                 cells.append(
                     {
                         "row": row_index,
@@ -605,8 +760,8 @@ def process_tables(state: ParseState, root: Tag, *, section_id: str) -> dict[int
                         "kind": cell.name,
                         "text": normalize_text(cell.get_text(" ", strip=True)),
                         "html": inner_html(cell),
-                        "rowspan": parse_span(cell.get("rowspan")),
-                        "colspan": parse_span(cell.get("colspan")),
+                        "rowspan": rowspan,
+                        "colspan": colspan,
                         "images": [image["id"] for image in images if image is not None],
                     }
                 )
@@ -615,6 +770,15 @@ def process_tables(state: ParseState, root: Tag, *, section_id: str) -> dict[int
             rows.append({"index": row_index, "cells": cells})
 
         caption = find_table_caption(table)
+        grid = build_table_grid(rows)
+        max_rowspan = max(
+            (int(cell.get("rowspan") or 1) for row in rows for cell in row.get("cells", [])),
+            default=1,
+        )
+        max_colspan = max(
+            (int(cell.get("colspan") or 1) for row in rows for cell in row.get("cells", [])),
+            default=1,
+        )
         table_record: dict[str, Any] = {
             "id": table_id,
             "order": state.table_order,
@@ -624,6 +788,9 @@ def process_tables(state: ParseState, root: Tag, *, section_id: str) -> dict[int
             "source_html": table_source_html,
             "html": str(table),
             "rows": rows,
+            "grid": grid,
+            "rowspan": max_rowspan,
+            "colspan": max_colspan,
             "header_rows": header_rows,
             "is_complex": is_complex_table(rows),
         }
@@ -644,6 +811,50 @@ def process_images_outside_tables(state: ParseState, root: Tag, *, section_id: s
                 row=None,
                 column=None,
             )
+
+
+def build_table_grid(rows: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+    grid: list[list[dict[str, Any]]] = []
+    occupied: dict[tuple[int, int], dict[str, Any]] = {}
+    for row_index, row in enumerate(rows, start=1):
+        grid_row: list[dict[str, Any]] = []
+        column_index = 1
+        for cell in cast(list[dict[str, Any]], row.get("cells") or []):
+            while (row_index, column_index) in occupied:
+                carried = dict(occupied[(row_index, column_index)])
+                carried["is_origin"] = False
+                grid_row.append(carried)
+                column_index += 1
+
+            rowspan = int(cell.get("rowspan") or 1)
+            colspan = int(cell.get("colspan") or 1)
+            origin = {
+                "source_row": cell.get("row"),
+                "source_column": cell.get("column"),
+                "grid_row": row_index,
+                "grid_column": column_index,
+                "text": cell.get("text"),
+                "rowspan": rowspan,
+                "colspan": colspan,
+                "is_origin": True,
+            }
+            grid_row.append(origin)
+            cell["grid_row"] = row_index
+            cell["grid_column"] = column_index
+            for row_offset in range(rowspan):
+                for column_offset in range(colspan):
+                    if row_offset == 0 and column_offset == 0:
+                        continue
+                    occupied[(row_index + row_offset, column_index + column_offset)] = origin
+            column_index += colspan
+
+        while (row_index, column_index) in occupied:
+            carried = dict(occupied[(row_index, column_index)])
+            carried["is_origin"] = False
+            grid_row.append(carried)
+            column_index += 1
+        grid.append(grid_row)
+    return grid
 
 
 def process_image(
@@ -668,6 +879,28 @@ def process_image(
     data_match = DATA_URI_RE.match(src)
     if data_match:
         mime = data_match.group("mime").lower()
+        if mime == "image/svg+xml":
+            state.issues.append(
+                QaIssue(
+                    severity="warning",
+                    code="quarantined_svg_image",
+                    message="SVG data URI is not published without a dedicated sanitizer.",
+                    context={"section_id": section_id, "image_id": image_id},
+                )
+            )
+            image_tag["src"] = ""
+            return None
+        if mime not in IMAGE_SIGNATURES:
+            state.issues.append(
+                QaIssue(
+                    severity="error",
+                    code="unsupported_image_mime",
+                    message="Image MIME type is not allowed.",
+                    context={"section_id": section_id, "image_id": image_id, "mime": mime},
+                )
+            )
+            image_tag["src"] = ""
+            return None
         try:
             encoded = re.sub(r"\s+", "", data_match.group("data"))
             content = base64.b64decode(encoded, validate=True)
@@ -680,10 +913,34 @@ def process_image(
                     context={"section_id": section_id, "image_id": image_id},
                 )
             )
-            content = b""
+            image_tag["src"] = ""
+            return None
+        if not content or not image_signature_matches(mime, content):
+            state.issues.append(
+                QaIssue(
+                    severity="error",
+                    code="invalid_image_signature",
+                    message="Image bytes do not match the declared MIME type.",
+                    context={"section_id": section_id, "image_id": image_id, "mime": mime},
+                )
+            )
+            image_tag["src"] = ""
+            return None
         extension = IMAGE_EXTENSIONS.get(mime, "bin")
-        asset_relative = f"assets/{section_id}/{image_id}.{extension}"
+        safe_section_id = safe_path_component(section_id)
+        asset_relative = f"assets/{safe_section_id}/{image_id}.{extension}"
         asset_path = state.document_dir / asset_relative
+        if not is_within_directory(asset_path, state.document_dir):
+            state.issues.append(
+                QaIssue(
+                    severity="fatal",
+                    code="image_path_traversal",
+                    message="Image asset path escapes the document directory.",
+                    context={"section_id": section_id, "image_id": image_id},
+                )
+            )
+            image_tag["src"] = ""
+            return None
         asset_path.parent.mkdir(parents=True, exist_ok=True)
         asset_path.write_bytes(content)
         sha256 = hashlib.sha256(content).hexdigest()
@@ -748,6 +1005,18 @@ def register_unknown_tags(state: ParseState, root: Tag, section_id: str) -> None
             )
 
 
+def sanitize_html_tree(root: Tag) -> None:
+    for tag in root.find_all(True):
+        current = tag
+        for attr in list(current.attrs):
+            attr_name = attr.lower()
+            if attr_name == "style" or attr_name.startswith("on"):
+                del current.attrs[attr]
+        href = current.get("href")
+        if isinstance(href, str) and href.strip().lower().startswith("javascript:"):
+            del current.attrs["href"]
+
+
 def parse_heading(
     tag: Tag,
     section_id: str,
@@ -801,23 +1070,47 @@ def extract_recommendations(state: ParseState) -> list[dict[str, Any]]:
             block = blocks[index]
             text = str(block.get("text") or "")
             if not is_recommendation_start(block, text):
+                if is_orphan_recommendation_metadata(block):
+                    state.issues.append(
+                        QaIssue(
+                            severity="warning",
+                            code="orphan_recommendation_metadata",
+                            message=(
+                                "Found UUR/UDD/comment block without a preceding recommendation."
+                            ),
+                            context={"section_id": section_id, "block_id": block.get("id")},
+                        )
+                    )
                 index += 1
                 continue
 
             group = [block]
             lookahead = index + 1
-            while lookahead < len(blocks) and is_recommendation_neighbor(blocks[lookahead]):
-                group.append(blocks[lookahead])
-                lookahead += 1
+            in_comment = False
+            while lookahead < len(blocks):
+                next_block = blocks[lookahead]
+                next_text = str(next_block.get("text") or "")
+                if is_recommendation_start(next_block, next_text) or is_recommendation_boundary(
+                    next_block
+                ):
+                    break
+                if COMMENT_RE.search(next_text):
+                    in_comment = is_comment_header_block(next_text)
+                    group.append(next_block)
+                    lookahead += 1
+                    continue
+                if is_recommendation_neighbor(next_block) or (
+                    in_comment and next_block.get("type") in {"paragraph", "list", "block"}
+                ):
+                    group.append(next_block)
+                    lookahead += 1
+                    continue
+                break
 
             state.recommendation_order += 1
             combined_text = "\n".join(str(item.get("text") or "") for item in group).strip()
             combined_html = "\n".join(str(item.get("source_html") or "") for item in group)
-            comments = [
-                str(item.get("text") or "")
-                for item in group[1:]
-                if COMMENT_RE.search(str(item.get("text") or ""))
-            ]
+            comments = extract_comments_from_group(group)
             reference_occurrences = merge_reference_occurrences(group)
             recommendation = {
                 "id": f"recommendation-{state.recommendation_order:04d}",
@@ -906,7 +1199,7 @@ def render_block_markdown(block: dict[str, Any], tables: dict[str, dict[str, Any
         image = soup.find("img")
         if isinstance(image, Tag):
             alt = str(image.get("alt") or "")
-            src = str(image.get("src") or "")
+            src = safe_markdown_src(str(image.get("src") or ""))
             return f"![{escape_markdown(alt)}]({src})"
     if block_type == "paragraph":
         return inline_html_to_markdown(str(block.get("html") or block.get("text") or ""))
@@ -980,7 +1273,7 @@ def markdown_node(node: PageElement) -> str:
         return f"<{name}>{content}</{name}>"
     if name == "img":
         alt = str(node.get("alt") or "")
-        src = str(node.get("src") or "")
+        src = safe_markdown_src(str(node.get("src") or ""))
         return f"![{escape_markdown(alt)}]({src})"
     if name == "p":
         return content
@@ -990,23 +1283,18 @@ def markdown_node(node: PageElement) -> str:
 def build_search_chunks(document: dict[str, Any], state: ParseState) -> list[dict[str, Any]]:
     section_lookup = {str(section["section_id"]): section for section in state.sections}
     chunks: list[dict[str, Any]] = []
+    document_id = str(document.get("code_version"))
     for recommendation in state.recommendations:
         section = section_lookup.get(str(recommendation["section_id"]), {})
+        chunk_id = next_chunk_id(document_id, chunks)
         chunks.append(
             {
-                "id": f"chunk-{len(chunks) + 1:04d}",
+                "id": chunk_id,
+                "chunk_id": chunk_id,
+                "document_id": document_id,
                 "type": "recommendation",
-                "document": {
-                    "code": document.get("code"),
-                    "version": document.get("version"),
-                    "code_version": document.get("code_version"),
-                    "title": document.get("title"),
-                },
-                "section": {
-                    "id": section.get("section_id"),
-                    "title": section.get("title"),
-                },
-                "text": recommendation.get("text"),
+                "section_path": section_path(section),
+                "text": limit_chunk_text(str(recommendation.get("text") or "")),
                 "uur": recommendation.get("uur"),
                 "udd": recommendation.get("udd"),
                 "comments": recommendation.get("comments"),
@@ -1027,24 +1315,72 @@ def build_search_chunks(document: dict[str, Any], state: ParseState) -> list[dic
             if str(block.get("id")) not in recommendation_block_ids and block.get("text")
         ).strip()
         if text:
+            chunk_id = next_chunk_id(document_id, chunks)
             chunks.append(
                 {
-                    "id": f"chunk-{len(chunks) + 1:04d}",
-                    "type": "section",
-                    "document": {
-                        "code": document.get("code"),
-                        "version": document.get("version"),
-                        "code_version": document.get("code_version"),
-                        "title": document.get("title"),
-                    },
-                    "section": {
-                        "id": section.get("section_id"),
-                        "title": section.get("title"),
-                    },
-                    "text": text,
+                    "id": chunk_id,
+                    "chunk_id": chunk_id,
+                    "document_id": document_id,
+                    "type": "section_text",
+                    "section_path": section_path(section),
+                    "text": limit_chunk_text(text),
                 }
             )
+    for table in state.tables:
+        section = section_lookup.get(str(table["section_id"]), {})
+        for row in cast(list[dict[str, Any]], table.get("rows") or []):
+            text = " | ".join(
+                str(cell.get("text") or "")
+                for cell in cast(list[dict[str, Any]], row.get("cells") or [])
+                if cell.get("text")
+            ).strip()
+            if not text:
+                continue
+            chunk_id = next_chunk_id(document_id, chunks)
+            chunks.append(
+                {
+                    "id": chunk_id,
+                    "chunk_id": chunk_id,
+                    "document_id": document_id,
+                    "type": "table_row",
+                    "section_path": section_path(section),
+                    "text": limit_chunk_text(text),
+                    "table_id": table.get("id"),
+                    "row": row.get("index"),
+                }
+            )
+    for image in state.images:
+        alt = str(image.get("alt") or "").strip()
+        if not alt:
+            continue
+        section = section_lookup.get(str(image["section_id"]), {})
+        chunk_id = next_chunk_id(document_id, chunks)
+        chunks.append(
+            {
+                "id": chunk_id,
+                "chunk_id": chunk_id,
+                "document_id": document_id,
+                "type": "image_caption",
+                "section_path": section_path(section),
+                "text": limit_chunk_text(alt),
+                "image_id": image.get("id"),
+            }
+        )
     return chunks
+
+
+def next_chunk_id(document_id: str, chunks: list[dict[str, Any]]) -> str:
+    return f"{document_id}:chunk:{len(chunks) + 1:04d}"
+
+
+def section_path(section: dict[str, Any]) -> list[dict[str, Any]]:
+    if not section:
+        return []
+    return [{"id": section.get("section_id"), "title": section.get("title")}]
+
+
+def limit_chunk_text(text: str) -> str:
+    return text[:CHUNK_TEXT_LIMIT]
 
 
 def write_qa_report(
@@ -1243,10 +1579,32 @@ def source_html_contains_image(element: Tag, image: dict[str, Any]) -> bool:
     return element.find("img", attrs={"data-clinrec-image-id": image_id}) is not None
 
 
+def image_signature_matches(mime: str, content: bytes) -> bool:
+    if mime == "image/webp":
+        return content.startswith(b"RIFF") and content[8:12] == b"WEBP"
+    return any(content.startswith(signature) for signature in IMAGE_SIGNATURES.get(mime, ()))
+
+
+def safe_path_component(value: str) -> str:
+    cleaned = re.sub(r"[^0-9A-Za-zА-Яа-я_-]+", "-", value).strip("-")
+    return cleaned or "section"
+
+
+def is_within_directory(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+    except ValueError:
+        return False
+    return True
+
+
 def is_recommendation_start(block: dict[str, Any], text: str) -> bool:
     if block.get("type") not in {"paragraph", "list", "block"}:
         return False
-    return RECOMMENDATION_RE.search(text) is not None
+    html = str(block.get("source_html") or block.get("html") or "")
+    if has_structural_recommendation_signal(html):
+        return True
+    return block.get("tag") == "li" and RECOMMENDATION_RE.search(text) is not None
 
 
 def is_recommendation_neighbor(block: dict[str, Any]) -> bool:
@@ -1259,6 +1617,47 @@ def is_recommendation_neighbor(block: dict[str, Any]) -> bool:
         or extract_udd(text) is not None
         or bool(REFERENCE_RE.search(text))
     )
+
+
+def is_orphan_recommendation_metadata(block: dict[str, Any]) -> bool:
+    return is_recommendation_neighbor(block)
+
+
+def is_recommendation_boundary(block: dict[str, Any]) -> bool:
+    return block.get("type") in {"heading", "table"}
+
+
+def has_structural_recommendation_signal(html: str) -> bool:
+    soup = BeautifulSoup(html, "lxml")
+    root = soup.body or soup
+    strongs = root.find_all("strong")
+    for strong in strongs:
+        text = normalize_text(strong.get_text(" ", strip=True)).lower()
+        if any(text.startswith(term) for term in RECOMMENDATION_TERMS):
+            return True
+    return False
+
+
+def extract_comments_from_group(blocks: list[dict[str, Any]]) -> list[str]:
+    comments: list[str] = []
+    in_comment = False
+    for block in blocks[1:]:
+        text = str(block.get("text") or "")
+        if COMMENT_RE.search(text):
+            in_comment = is_comment_header_block(text)
+            comments.append(text)
+            continue
+        if in_comment and text:
+            comments.append(text)
+    return comments
+
+
+def is_comment_header_block(text: str) -> bool:
+    match = COMMENT_RE.search(text)
+    if not match:
+        return False
+    tail = text[match.end() :].strip()
+    return tail in {"", ":"}
 
 
 def extract_uur(text: str) -> str | None:
@@ -1347,8 +1746,25 @@ def escape_table_cell(value: str) -> str:
     return value.replace("|", "\\|").replace("\n", "<br>")
 
 
+def safe_markdown_src(value: str) -> str:
+    stripped = value.strip()
+    if not stripped or stripped.lower().startswith("data:"):
+        return ""
+    if re.match(r"^[A-Za-z]:[\\/]", stripped) or stripped.startswith(("/", "\\")):
+        return ""
+    return stripped
+
+
 def normalize_text(value: str) -> str:
     return re.sub(r"\s+", " ", value).strip()
+
+
+def normalize_date_only(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    match = re.match(r"^(\d{4}-\d{2}-\d{2})(?:[T\s].*)?$", text)
+    return match.group(1) if match else None
 
 
 def as_mapping(value: Any) -> dict[str, Any]:

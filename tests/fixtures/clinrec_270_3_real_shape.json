@@ -1,0 +1,33 @@
+{
+  "success": true,
+  "id": "270_3",
+  "code": 270,
+  "version": 3,
+  "ver": 3,
+  "name": "Fixture recommendation 270 revision 3",
+  "adult": true,
+  "child": false,
+  "publish_date": "2025-02-20T00:00:00",
+  "apply_status": "Применяется",
+  "apply_status_calculated": 1,
+  "prev_cr_id": 1002,
+  "proff_associations": [],
+  "mkbs": [],
+  "specialities": [],
+  "obj": {
+    "sections": [
+      {
+        "id": "section-1",
+        "title": "Introduction",
+        "content": "<p>Fixture content.</p>",
+        "sections": [
+          {
+            "id": "section-1-1",
+            "title": "Nested section",
+            "content": "<p>Nested fixture content.</p>"
+          }
+        ]
+      }
+    ]
+  }
+}

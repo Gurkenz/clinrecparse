@@ -1,0 +1,41 @@
+{
+  "success": true,
+  "db_id": 1737,
+  "id": "843_1",
+  "code": 843,
+  "version": 1,
+  "ver": 1,
+  "name": "Глаукомы вторичные",
+  "mkb": "H40",
+  "ssid": null,
+  "created": "2024-12-17T11:15:00",
+  "schemes": [],
+  "textBlock": null,
+  "textBlockCreatedBy": null,
+  "textBlockCreatedAt": null,
+  "status": 0,
+  "createdBy": "fixture",
+  "adult": true,
+  "child": false,
+  "NPC_approved": true,
+  "proff_associations": [{"name": "Ассоциация офтальмологов"}],
+  "approved": true,
+  "publish_date": "2024-12-17T00:00:00",
+  "tablesArray": [],
+  "tables": [],
+  "mkbs": [{"code": "H40"}],
+  "specialities": [{"name": "Офтальмология"}],
+  "apply_status": "Применяется",
+  "apply_status_calculated": 1,
+  "prev_cr_id": null,
+  "specialityids": [31],
+  "obj": {
+    "sections": [
+      {
+        "id": "doc_crat_info_1_2",
+        "title": "1.2 Диагностика",
+        "content": "<ul><li><strong>Рекомендуется</strong> выполнить обследование [8-10, 109].</li></ul><p>УУР: C; УДД: 5</p><p>Комментарии:</p><p>Первый абзац комментария.</p><p>Второй абзац комментария.</p><table><tr><th rowspan=\"2\">Показатель</th><th>Значение</th></tr><tr><td>1</td></tr></table><table><tr><th colspan=\"2\">Схема</th></tr><tr><td><img alt=\"Схема\" src=\"data:image/png;base64,iVBORw0KGgo=\"></td><td>Описание</td></tr></table>"
+      }
+    ]
+  }
+}

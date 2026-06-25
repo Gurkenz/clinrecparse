@@ -12,12 +12,15 @@ from clinrec.api.catalog_sync import sync_references as run_references_sync
 from clinrec.api.client import ClinrecApiClient
 from clinrec.api.document_download import DownloadError, DownloadOptions
 from clinrec.api.document_download import download_documents as run_download_documents
+from clinrec.api.document_download import download_pdfs as run_download_pdfs
 from clinrec.api.version_discovery import DiscoveryError, DiscoveryOptions
 from clinrec.api.version_discovery import discover_versions as run_discover_versions
 from clinrec.config import DEFAULT_CONFIG_PATH, Settings, ensure_data_directories, load_settings
 from clinrec.logging import configure_logging
 from clinrec.parsing.document import ParseError, ParseOptions
 from clinrec.parsing.document import parse_documents as run_parse_documents
+from clinrec.qa.checks import QaOptions
+from clinrec.qa.checks import run_qa as run_qa_checks
 
 app = typer.Typer(help="Clinical recommendations pipeline CLI.")
 
@@ -112,6 +115,10 @@ def discover_versions(
         int | None,
         typer.Option("--to-code", help="Check Codes less than or equal to this value."),
     ] = None,
+    all_versions: Annotated[
+        bool,
+        typer.Option("--all", help="Check every catalog candidate version."),
+    ] = False,
     force: Annotated[bool, typer.Option("--force", help="Recheck every selected version.")] = False,
     retry_failed: Annotated[
         bool,
@@ -128,6 +135,7 @@ def discover_versions(
         code=code,
         from_code=from_code,
         to_code=to_code,
+        all_versions=all_versions,
         force=force,
         retry_failed=retry_failed,
         dry_run=dry_run,
@@ -172,21 +180,31 @@ def download(
         int | None,
         typer.Option("--to-code", help="Download Codes less than or equal to this value."),
     ] = None,
+    all_versions: Annotated[
+        bool,
+        typer.Option("--all", help="Download every available JSON version."),
+    ] = False,
     force: Annotated[bool, typer.Option("--force", help="Redownload selected files.")] = False,
     dry_run: Annotated[
         bool,
         typer.Option("--dry-run", help="Show selected documents without HTTP requests or writes."),
     ] = False,
+    retry_failed: Annotated[
+        bool,
+        typer.Option("--retry-failed", help="Include temporary discovery failures."),
+    ] = False,
 ) -> None:
-    """Download raw GetClinrec2 JSON and official PDF files."""
+    """Download raw GetClinrec2 JSON files only."""
     settings = bootstrap(config)
     options = DownloadOptions(
         code_versions=code_version,
         code=code,
         from_code=from_code,
         to_code=to_code,
+        all_versions=all_versions,
         force=force,
         dry_run=dry_run,
+        retry_failed=retry_failed,
     )
     try:
         if dry_run:
@@ -214,6 +232,74 @@ def download(
                 f"{document.code_version}: status={document.status}, "
                 f"manifest={document.manifest_path}"
             )
+    if summary.failed:
+        raise typer.Exit(1)
+
+
+@app.command("download-pdf")
+def download_pdf(
+    config: ConfigOption = DEFAULT_CONFIG_PATH,
+    code_version: Annotated[
+        list[str] | None,
+        typer.Option("--code-version", help="Download one CodeVersion PDF; can be repeated."),
+    ] = None,
+    code: Annotated[int | None, typer.Option("--code", help="Download one Code only.")] = None,
+    from_code: Annotated[
+        int | None,
+        typer.Option("--from-code", help="Download Codes greater than or equal to this value."),
+    ] = None,
+    to_code: Annotated[
+        int | None,
+        typer.Option("--to-code", help="Download Codes less than or equal to this value."),
+    ] = None,
+    all_versions: Annotated[
+        bool,
+        typer.Option("--all", help="Download every available PDF."),
+    ] = False,
+    force: Annotated[bool, typer.Option("--force", help="Redownload selected files.")] = False,
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="Show selected PDFs without HTTP requests or writes."),
+    ] = False,
+) -> None:
+    """Download official PDF files only."""
+    settings = bootstrap(config)
+    options = DownloadOptions(
+        code_versions=code_version,
+        code=code,
+        from_code=from_code,
+        to_code=to_code,
+        all_versions=all_versions,
+        force=force,
+        dry_run=dry_run,
+    )
+    try:
+        if dry_run:
+            summary = run_download_pdfs(settings, None, options)
+        else:
+            with ClinrecApiClient(settings.http, settings.rate_limit) as client:
+                summary = run_download_pdfs(settings, client, options)
+    except DownloadError as exc:
+        typer.echo(f"download-pdf failed: {exc}", err=True)
+        raise typer.Exit(1) from exc
+
+    typer.echo("download-pdf completed")
+    typer.echo(f"timestamp: {summary.timestamp}")
+    typer.echo(f"planned: {summary.planned}")
+    typer.echo(f"downloaded: {summary.downloaded}")
+    typer.echo(f"skipped: {summary.skipped}")
+    typer.echo(f"failed: {summary.failed}")
+    typer.echo(f"dry_run: {summary.dry_run}")
+    if dry_run:
+        typer.echo(f"candidates_preview: {summary.candidates_preview}")
+    else:
+        for document in summary.documents:
+            typer.echo(
+                f"{document.code_version}: pdf_status={document.pdf_status}, "
+                f"manifest={document.manifest_path}"
+            )
+    if summary.failed:
+        raise typer.Exit(1)
 
 
 @app.command("parse")
@@ -270,13 +356,52 @@ def build_families(config: ConfigOption = DEFAULT_CONFIG_PATH) -> None:
 
 
 @app.command("qa")
-def qa(config: ConfigOption = DEFAULT_CONFIG_PATH) -> None:
-    """Run basic local smoke checks."""
-    settings = load_settings(config)
-    ensure_data_directories(settings)
-    configure_logging(settings.logging)
-    structlog.get_logger().info("qa_smoke_check_completed", config=str(config))
-    typer.echo("qa: config loaded, data directories are available, logging configured.")
+def qa(
+    config: ConfigOption = DEFAULT_CONFIG_PATH,
+    code_version: Annotated[
+        list[str] | None,
+        typer.Option("--code-version", help="Check one CodeVersion; can be repeated."),
+    ] = None,
+    code: Annotated[int | None, typer.Option("--code", help="Check one Code only.")] = None,
+    from_code: Annotated[
+        int | None,
+        typer.Option("--from-code", help="Check Codes greater than or equal to this value."),
+    ] = None,
+    to_code: Annotated[
+        int | None,
+        typer.Option("--to-code", help="Check Codes less than or equal to this value."),
+    ] = None,
+    strict_pdf: Annotated[
+        bool,
+        typer.Option("--strict-pdf", help="Treat missing PDF control sources as errors."),
+    ] = False,
+) -> None:
+    """Run local source, parsed artifact, manifest, and optional PDF QA checks."""
+    settings = bootstrap(config)
+    summary = run_qa_checks(
+        settings,
+        QaOptions(
+            code_versions=code_version,
+            code=code,
+            from_code=from_code,
+            to_code=to_code,
+            strict_pdf=strict_pdf,
+        ),
+    )
+    typer.echo("qa completed")
+    typer.echo(f"planned: {summary.planned}")
+    typer.echo(f"fatal: {summary.fatal}")
+    typer.echo(f"errors: {summary.errors}")
+    typer.echo(f"warnings: {summary.warnings}")
+    typer.echo(f"info: {summary.info}")
+    typer.echo(f"report: {summary.report_path}")
+    for document in summary.documents:
+        typer.echo(
+            f"{document.code_version}: fatal={document.fatal}, errors={document.errors}, "
+            f"warnings={document.warnings}, info={document.info}"
+        )
+    if summary.fatal or summary.errors:
+        raise typer.Exit(1)
 
 
 @app.command("run-all")

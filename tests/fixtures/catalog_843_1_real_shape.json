@@ -1,0 +1,28 @@
+{
+  "Success": true,
+  "Total": 1,
+  "Erorrs": [],
+  "Data": [
+    {
+      "Id": 1737,
+      "Name": "Глаукомы вторичные",
+      "NPC_approved": true,
+      "PublishDate": "2024-12-17T00:00:00",
+      "PublishDateStr": "17.12.2024",
+      "Code": 843,
+      "Version": 1,
+      "CodeVersion": "843_1",
+      "Status": 0,
+      "ApplyStatus": null,
+      "AgeCategory": 1,
+      "AgeCategoryStr": "Взрослые",
+      "Created": "2024-12-17T11:15:00",
+      "CreatedStr": "17.12.2024",
+      "ApplyStatusCalculated": 1,
+      "PrevCrId": null,
+      "Developers": [],
+      "Mkbs": [],
+      "Specialities": null
+    }
+  ]
+}

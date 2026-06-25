@@ -23,6 +23,7 @@ from clinrec.models.external import (
 
 TEMPORARY_AVAILABILITY = {
     VersionAvailability.SERVER_ERROR,
+    VersionAvailability.RATE_LIMITED_429,
     VersionAvailability.TIMEOUT,
     VersionAvailability.INVALID_JSON,
     VersionAvailability.HTML_ERROR,
@@ -44,6 +45,7 @@ class DiscoveryOptions:
     code: int | None = None
     from_code: int | None = None
     to_code: int | None = None
+    all_versions: bool = False
     force: bool = False
     retry_failed: bool = False
     dry_run: bool = False
@@ -84,6 +86,12 @@ def discover_versions(
     client: ClinrecApiClient | None,
     options: DiscoveryOptions,
 ) -> DiscoverySummary:
+    if not has_selection_filter(options):
+        raise DiscoveryError(
+            "Refusing to discover the full corpus without an explicit selection. "
+            "Use --all, --code, or --from-code/--to-code."
+        )
+
     timestamp = options.timestamp or datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     index_path = settings.paths.indexes / "version-availability.jsonl"
     report_path = settings.paths.reports / f"version-discovery-{timestamp}.json"
@@ -117,6 +125,10 @@ def discover_versions(
 
     if client is None:
         raise DiscoveryError("HTTP client is required unless --dry-run is used.")
+    if options.all_versions or len(candidates_to_check) > 20:
+        probe_error = client.health_probe()
+        if probe_error is not None:
+            raise DiscoveryError(f"Health probe failed before discovery: {probe_error.message}")
 
     current = dict(existing)
     checked = 0
@@ -191,6 +203,12 @@ def filter_candidates(
     if options.to_code is not None:
         filtered = [candidate for candidate in filtered if candidate.code <= options.to_code]
     return filtered
+
+
+def has_selection_filter(options: DiscoveryOptions) -> bool:
+    return options.all_versions or any(
+        value is not None for value in (options.code, options.from_code, options.to_code)
+    )
 
 
 def should_check(
@@ -303,7 +321,11 @@ def classify_external_error(error: ExternalApiError) -> VersionAvailability:
         return VersionAvailability.FORBIDDEN_403
     if error.status_code == 404:
         return VersionAvailability.NOT_FOUND_404
+    if error.status_code == 429 or error.kind == ApiErrorKind.RATE_LIMITED_429:
+        return VersionAvailability.RATE_LIMITED_429
     if error.status_code is not None and error.status_code >= 500:
+        return VersionAvailability.SERVER_ERROR
+    if error.kind == ApiErrorKind.CIRCUIT_OPEN:
         return VersionAvailability.SERVER_ERROR
     if getattr(error, "error_type", None) == "timeout":
         return VersionAvailability.TIMEOUT
@@ -456,6 +478,7 @@ def write_discovery_report(summary: DiscoverySummary, options: DiscoveryOptions)
                 "from_code": options.from_code,
                 "to_code": options.to_code,
                 "force": options.force,
+                "all": options.all_versions,
                 "retry_failed": options.retry_failed,
                 "dry_run": options.dry_run,
             },

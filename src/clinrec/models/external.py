@@ -8,18 +8,21 @@ from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
 
 class ApiErrorKind(StrEnum):
     HTTP_STATUS = "http_status"
+    RATE_LIMITED_429 = "rate_limited_429"
     REQUEST_ERROR = "request_error"
     EMPTY_RESPONSE = "empty_response"
     HTML_ERROR = "html_error"
     INVALID_JSON = "invalid_json"
     UNEXPECTED_CONTENT_TYPE = "unexpected_content_type"
     VALIDATION_ERROR = "validation_error"
+    CIRCUIT_OPEN = "circuit_open"
 
 
 class VersionAvailability(StrEnum):
     AVAILABLE_JSON = "available_json"
     FORBIDDEN_403 = "forbidden_403"
     NOT_FOUND_404 = "not_found_404"
+    RATE_LIMITED_429 = "rate_limited_429"
     SERVER_ERROR = "server_error"
     TIMEOUT = "timeout"
     INVALID_JSON = "invalid_json"
@@ -39,6 +42,11 @@ class ExternalApiError(BaseModel):
     content_type: str | None = None
     response_size_bytes: int = 0
     duration_seconds: float = 0.0
+    attempts: int = 1
+    retry_after: str | None = None
+    server: str | None = None
+    date: str | None = None
+    safe_body_preview: str | None = None
     error_type: str | None = None
 
 
@@ -62,9 +70,26 @@ class CatalogRecord(BaseModel):
         default=None,
         validation_alias=AliasChoices("Status", "status"),
     )
+    apply_status: Any = Field(
+        default=None,
+        validation_alias=AliasChoices("ApplyStatus", "apply_status", "applyStatus"),
+    )
+    apply_status_calculated: int | str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "ApplyStatusCalculated",
+            "apply_status_calculated",
+            "applyStatusCalculated",
+        ),
+    )
     npc_approved: bool | None = Field(
         default=None,
-        validation_alias=AliasChoices("NpcApproved", "NPCApproved", "npc_approved"),
+        validation_alias=AliasChoices(
+            "NPC_approved",
+            "NpcApproved",
+            "NPCApproved",
+            "npc_approved",
+        ),
     )
     age_category: int | str | None = Field(
         default=None,
@@ -72,11 +97,32 @@ class CatalogRecord(BaseModel):
     )
     age_category_name: str | None = Field(
         default=None,
-        validation_alias=AliasChoices("AgeCategoryName", "ageCategoryName", "age_category_name"),
+        validation_alias=AliasChoices(
+            "AgeCategoryStr",
+            "AgeCategoryName",
+            "ageCategoryName",
+            "age_category_name",
+        ),
     )
     publish_date: str | None = Field(
         default=None,
         validation_alias=AliasChoices("PublishDate", "publishdate", "publish_date"),
+    )
+    publish_date_str: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("PublishDateStr", "publish_date_str"),
+    )
+    created: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("Created", "created"),
+    )
+    created_str: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("CreatedStr", "created_str"),
+    )
+    prev_cr_id: int | str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("PrevCrId", "prev_cr_id", "prevCrId"),
     )
     developers: Any = Field(
         default_factory=list,
@@ -85,6 +131,10 @@ class CatalogRecord(BaseModel):
     mkbs: Any = Field(
         default_factory=list,
         validation_alias=AliasChoices("MKBs", "Mkbs", "mkbs", "Mkb", "mkb"),
+    )
+    specialities: Any = Field(
+        default=None,
+        validation_alias=AliasChoices("Specialities", "specialities", "Specialties", "specialties"),
     )
 
 
@@ -153,6 +203,10 @@ class ClinrecSection(BaseModel):
 class ClinrecDocument(BaseModel):
     model_config = ConfigDict(extra="allow", populate_by_name=True)
 
+    db_id: int | str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("db_id", "dbId", "DbId", "DB_ID"),
+    )
     id: str | None = Field(
         default=None,
         validation_alias=AliasChoices("id", "Id", "ID"),
@@ -172,11 +226,53 @@ class ClinrecDocument(BaseModel):
     code: int | str | None = Field(default=None, validation_alias=AliasChoices("code", "Code"))
     version: int | str | None = Field(
         default=None,
-        validation_alias=AliasChoices("version", "Version"),
+        validation_alias=AliasChoices("version", "Version", "ver", "Ver"),
     )
+    ver: int | str | None = Field(default=None, validation_alias=AliasChoices("ver", "Ver"))
     title: str | None = Field(
         default=None,
         validation_alias=AliasChoices("title", "Title", "name", "Name"),
+    )
+    created: str | None = Field(default=None, validation_alias=AliasChoices("created", "Created"))
+    status: int | str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("status", "Status"),
+    )
+    adult: bool | None = Field(default=None, validation_alias=AliasChoices("adult", "Adult"))
+    child: bool | None = Field(default=None, validation_alias=AliasChoices("child", "Child"))
+    npc_approved: bool | None = Field(
+        default=None,
+        validation_alias=AliasChoices("NPC_approved", "npc_approved", "NpcApproved"),
+    )
+    approved: Any = Field(default=None, validation_alias=AliasChoices("approved", "Approved"))
+    publish_date: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("publish_date", "PublishDate"),
+    )
+    apply_status: Any = Field(
+        default=None,
+        validation_alias=AliasChoices("apply_status", "ApplyStatus"),
+    )
+    apply_status_calculated: int | str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("apply_status_calculated", "ApplyStatusCalculated"),
+    )
+    prev_cr_id: int | str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("prev_cr_id", "PrevCrId"),
+    )
+    proff_associations: Any = Field(
+        default_factory=list,
+        validation_alias=AliasChoices("proff_associations", "ProffAssociations"),
+    )
+    mkbs: Any = Field(default_factory=list, validation_alias=AliasChoices("mkbs", "Mkbs", "MKBs"))
+    specialities: Any = Field(
+        default_factory=list,
+        validation_alias=AliasChoices("specialities", "Specialities", "specialties"),
+    )
+    specialityids: Any = Field(
+        default_factory=list,
+        validation_alias=AliasChoices("specialityids", "SpecialityIds", "speciality_ids"),
     )
     sections: list[ClinrecSection] = Field(
         default_factory=list,
@@ -203,7 +299,32 @@ class ClinrecResponse(BaseModel):
         if not isinstance(value, dict) or "obj" not in value or not isinstance(value["obj"], dict):
             return value
         obj = dict(value["obj"])
-        for key in ("id", "code", "version", "name", "Name", "title", "Title"):
+        metadata_keys = (
+            "db_id",
+            "id",
+            "code",
+            "version",
+            "ver",
+            "name",
+            "Name",
+            "title",
+            "Title",
+            "created",
+            "status",
+            "adult",
+            "child",
+            "NPC_approved",
+            "approved",
+            "publish_date",
+            "apply_status",
+            "apply_status_calculated",
+            "prev_cr_id",
+            "proff_associations",
+            "mkbs",
+            "specialities",
+            "specialityids",
+        )
+        for key in metadata_keys:
             if key in value and key not in obj:
                 obj[key] = value[key]
         merged = dict(value)
@@ -218,8 +339,23 @@ class NkoOrganization(BaseModel):
     name: str = Field(validation_alias=AliasChoices("name", "Name", "FullName", "fullname"))
     short_name: str | None = Field(
         default=None,
-        validation_alias=AliasChoices("short_name", "ShortName", "shortName"),
+        validation_alias=AliasChoices("shortname", "short_name", "ShortName", "shortName"),
     )
+    raw_short_name: str | None = None
+    engname: str | None = Field(default=None, validation_alias=AliasChoices("engname", "EngName"))
+    engshortname: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("engshortname", "EngShortName"),
+    )
+    profile: Any = None
+    url: str | None = None
+
+    @model_validator(mode="after")
+    def keep_raw_short_name(self) -> NkoOrganization:
+        self.raw_short_name = self.short_name
+        if self.short_name:
+            self.short_name = " ".join(self.short_name.split())
+        return self
 
 
 class NkoPayload(BaseModel):
@@ -263,16 +399,17 @@ class NormalizedCatalogRecord(BaseModel):
     code_version: str
     name: str
     status: int | None
+    apply_status: Any = None
+    apply_status_calculated: int | None = None
     npc_approved: bool | None
     age_category: int | None
     age_category_name: str | None
-    publish_date_raw: str | None
-    publish_date_epoch_ms: int | None
-    publish_date_utc: str | None
-    publish_date_source_timezone: str
-    publish_date_source: str | None
+    publish_date: str | None
+    created_date: str | None
+    prev_cr_id: int | None = None
     developers: list[Any]
     mkbs: list[Any]
+    specialities: Any = None
 
 
 class QaIssue(BaseModel):
@@ -293,6 +430,11 @@ class ReferenceOrganization(BaseModel):
     id: str | int | None
     name: str
     short_name: str | None = None
+    raw_short_name: str | None = None
+    engname: str | None = None
+    engshortname: str | None = None
+    profile: Any = None
+    url: str | None = None
 
 
 class VersionAvailabilityRecord(BaseModel):

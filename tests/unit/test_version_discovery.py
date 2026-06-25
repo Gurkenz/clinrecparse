@@ -5,7 +5,7 @@ from pathlib import Path
 
 import httpx
 
-from clinrec.api.client import JsonPayloadResult
+from clinrec.api.client import ClinrecApiClient, JsonPayloadResult
 from clinrec.api.version_discovery import (
     DiscoveryOptions,
     VersionCandidate,
@@ -227,4 +227,13 @@ def test_timeout_exception_from_mock_transport_is_classified() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.TimeoutException("timeout", request=request)
 
-    assert handler
+    settings = make_settings()
+    with ClinrecApiClient(
+        settings.http,
+        settings.rate_limit,
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        result = check_candidate(client, VersionCandidate(270, 1))
+
+    assert result.availability == VersionAvailability.TIMEOUT
+    assert result.attempts == 1

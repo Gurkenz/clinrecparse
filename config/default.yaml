@@ -12,6 +12,8 @@ http:
   retries: 3
   backoff_initial_seconds: 1.0
   backoff_max_seconds: 30.0
+  user_agent: "clinrecparse/0.1 contact: local-development"
+  circuit_breaker_5xx_threshold: 5
 
 rate_limit:
   requests_per_second: 2.0

@@ -9,7 +9,13 @@ from typing import Any
 
 from clinrec.api.catalog_sync import write_json
 from clinrec.api.client import ClinrecApiClient
-from clinrec.api.version_discovery import read_availability_index, read_jsonl
+from clinrec.api.version_discovery import (
+    TEMPORARY_AVAILABILITY,
+    VersionCandidate,
+    classify_success_payload,
+    read_availability_index,
+    read_jsonl,
+)
 from clinrec.config import Settings
 from clinrec.models.external import ExternalApiError, VersionAvailability, VersionAvailabilityRecord
 
@@ -24,8 +30,10 @@ class DownloadOptions:
     code: int | None = None
     from_code: int | None = None
     to_code: int | None = None
+    all_versions: bool = False
     force: bool = False
     dry_run: bool = False
+    retry_failed: bool = False
     timestamp: str | None = None
 
 
@@ -61,14 +69,14 @@ def download_documents(
     client: ClinrecApiClient | None,
     options: DownloadOptions,
 ) -> DownloadSummary:
-    if not has_selection_filter(options) and not options.dry_run:
+    if not has_selection_filter(options):
         raise DownloadError(
             "Refusing to download the full corpus without a filter. "
-            "Use --code-version, --code, --from-code/--to-code, or --dry-run."
+            "Use --all, --code-version, --code, or --from-code/--to-code."
         )
 
     timestamp = options.timestamp or datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-    candidates = filter_download_candidates(load_available_records(settings), options)
+    candidates = filter_download_candidates(load_available_records(settings, options), options)
 
     if options.dry_run:
         return DownloadSummary(
@@ -85,11 +93,14 @@ def download_documents(
 
     if client is None:
         raise DownloadError("HTTP client is required unless --dry-run is used.")
+    run_health_probe_if_needed(client, candidates, options)
 
     catalog_records = load_catalog_records(settings.paths.indexes / "catalog.jsonl")
     documents: list[DownloadedDocumentSummary] = []
     for record in candidates:
-        documents.append(download_one_document(settings, client, record, catalog_records, options))
+        documents.append(
+            download_one_json_document(settings, client, record, catalog_records, options)
+        )
 
     counts = count_document_statuses(documents)
     return DownloadSummary(
@@ -105,7 +116,55 @@ def download_documents(
     )
 
 
-def download_one_document(
+def download_pdfs(
+    settings: Settings,
+    client: ClinrecApiClient | None,
+    options: DownloadOptions,
+) -> DownloadSummary:
+    if not has_selection_filter(options):
+        raise DownloadError(
+            "Refusing to download PDFs without a filter. "
+            "Use --all, --code-version, --code, or --from-code/--to-code."
+        )
+
+    timestamp = options.timestamp or datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    candidates = filter_download_candidates(load_available_records(settings, options), options)
+    if options.dry_run:
+        return DownloadSummary(
+            timestamp=timestamp,
+            planned=len(candidates),
+            downloaded=0,
+            skipped=0,
+            partial=0,
+            failed=0,
+            dry_run=True,
+            documents=[],
+            candidates_preview=[record.requested_code_version for record in candidates[:20]],
+        )
+    if client is None:
+        raise DownloadError("HTTP client is required unless --dry-run is used.")
+    run_health_probe_if_needed(client, candidates, options)
+
+    catalog_records = load_catalog_records(settings.paths.indexes / "catalog.jsonl")
+    documents = [
+        download_one_pdf_document(settings, client, record, catalog_records, options)
+        for record in candidates
+    ]
+    counts = count_document_statuses(documents)
+    return DownloadSummary(
+        timestamp=timestamp,
+        planned=len(candidates),
+        downloaded=counts["downloaded"],
+        skipped=counts["skipped"],
+        partial=counts["partial"],
+        failed=counts["failed"],
+        dry_run=False,
+        documents=documents,
+        candidates_preview=[record.requested_code_version for record in candidates[:20]],
+    )
+
+
+def download_one_json_document(
     settings: Settings,
     client: ClinrecApiClient,
     record: VersionAvailabilityRecord,
@@ -144,13 +203,7 @@ def download_one_document(
         manifest.get("json"),
         options.force,
     )
-    pdf_info = ensure_pdf_source(
-        client,
-        record,
-        source_dir / "official.pdf",
-        manifest.get("pdf"),
-        options.force,
-    )
+    pdf_info = pdf_not_requested_info(source_dir / "official.pdf", manifest.get("pdf"))
 
     document_status = document_status_from_parts(json_info["status"], pdf_info["status"])
     manifest_payload = {
@@ -168,6 +221,70 @@ def download_one_document(
     write_json(manifest_path, manifest_payload)
     write_http_metadata(source_dir / "http-metadata.json", manifest_payload)
 
+    return DownloadedDocumentSummary(
+        code_version=record.requested_code_version,
+        document_dir=document_dir,
+        manifest_path=manifest_path,
+        status=document_status,
+        json_status=str(json_info["status"]),
+        pdf_status=str(pdf_info["status"]),
+    )
+
+
+def download_one_pdf_document(
+    settings: Settings,
+    client: ClinrecApiClient,
+    record: VersionAvailabilityRecord,
+    catalog_records: dict[str, dict[str, Any]],
+    options: DownloadOptions,
+) -> DownloadedDocumentSummary:
+    document_dir = document_directory(settings, record)
+    source_dir = document_dir / "source"
+    for directory in (
+        source_dir,
+        document_dir / "parsed",
+        document_dir / "assets",
+        document_dir / "qa",
+    ):
+        directory.mkdir(parents=True, exist_ok=True)
+
+    manifest_path = document_dir / "manifest.json"
+    manifest = read_manifest(manifest_path)
+    catalog_record = catalog_records.get(record.requested_code_version)
+    catalog_path = source_dir / "catalog-record.json"
+    if catalog_record is None:
+        catalog_path.write_text("null\n", encoding="utf-8")
+        catalog_record_status = "missing"
+    else:
+        catalog_path.write_text(
+            json.dumps(catalog_record, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        catalog_record_status = "saved"
+
+    json_info = json_manifest_or_missing(source_dir / "getclinrec.json", manifest.get("json"))
+    pdf_info = ensure_pdf_source(
+        client,
+        record,
+        source_dir / "official.pdf",
+        manifest.get("pdf"),
+        options.force,
+    )
+    document_status = pdf_info["status"]
+    manifest_payload = {
+        "code": record.code,
+        "version": record.version,
+        "code_version": record.requested_code_version,
+        "status": document_status,
+        "catalog_record": {
+            "path": "source/catalog-record.json",
+            "status": catalog_record_status,
+        },
+        "json": json_info,
+        "pdf": pdf_info,
+    }
+    write_json(manifest_path, manifest_payload)
+    write_http_metadata(source_dir / "http-metadata.json", manifest_payload)
     return DownloadedDocumentSummary(
         code_version=record.requested_code_version,
         document_dir=document_dir,
@@ -197,6 +314,21 @@ def ensure_json_source(
     if not is_valid_json_file(part_path):
         part_path.unlink(missing_ok=True)
         return failed_info("source/getclinrec.json", "failed", "Downloaded JSON is invalid", None)
+    candidate = VersionCandidate(code=record.code, version=record.version)
+    validated = classify_success_payload(
+        result,
+        candidate,
+        checked_at=utc_now(),
+        attempts=result.attempts,
+    )
+    if validated.availability != VersionAvailability.AVAILABLE_JSON:
+        part_path.unlink(missing_ok=True)
+        return failed_info(
+            "source/getclinrec.json",
+            "failed",
+            validated.error or "Downloaded JSON failed semantic validation",
+            result.status_code,
+        )
     part_path.replace(path)
     return file_info(path, "downloaded", fetched_at=utc_now())
 
@@ -230,16 +362,21 @@ def ensure_pdf_source(
     return file_info(path, "downloaded", fetched_at=utc_now())
 
 
-def load_available_records(settings: Settings) -> list[VersionAvailabilityRecord]:
+def load_available_records(
+    settings: Settings,
+    options: DownloadOptions | None = None,
+) -> list[VersionAvailabilityRecord]:
     index_path = settings.paths.indexes / "version-availability.jsonl"
     if not index_path.exists():
         raise DownloadError(
             "version-availability.jsonl is missing. Run 'clinrec discover-versions' first."
         )
+    retry_failed = bool(options and options.retry_failed)
     records = [
         record
         for record in read_availability_index(index_path).values()
         if record.availability == VersionAvailability.AVAILABLE_JSON
+        or (retry_failed and record.availability in TEMPORARY_AVAILABILITY)
     ]
     return sorted(records, key=lambda item: (item.code, item.version))
 
@@ -261,12 +398,24 @@ def filter_download_candidates(
     return filtered
 
 
+def run_health_probe_if_needed(
+    client: ClinrecApiClient,
+    candidates: list[VersionAvailabilityRecord],
+    options: DownloadOptions,
+) -> None:
+    if not options.all_versions and len(candidates) <= 20:
+        return
+    probe_error = client.health_probe()
+    if probe_error is not None:
+        raise DownloadError(f"Health probe failed before download: {probe_error.message}")
+
+
 def document_directory(settings: Settings, record: VersionAvailabilityRecord) -> Path:
     return settings.paths.documents / str(record.code) / record.requested_code_version
 
 
 def has_selection_filter(options: DownloadOptions) -> bool:
-    return bool(options.code_versions) or any(
+    return bool(options.all_versions or options.code_versions) or any(
         value is not None for value in (options.code, options.from_code, options.to_code)
     )
 
@@ -333,6 +482,31 @@ def failed_info(
     }
 
 
+def json_manifest_or_missing(path: Path, previous: Any) -> dict[str, Any]:
+    if is_existing_file_valid(path, previous, kind="json"):
+        return existing_file_info(path, previous, "already_valid")
+    return {
+        "path": normalized_source_path(path),
+        "sha256": None,
+        "size": 0,
+        "fetched_at": None,
+        "status": "missing",
+    }
+
+
+def pdf_not_requested_info(path: Path, previous: Any) -> dict[str, Any]:
+    if is_existing_file_valid(path, previous, kind="pdf"):
+        status = "already_valid" if isinstance(previous, dict) else "downloaded"
+        return existing_file_info(path, previous, status)
+    return {
+        "path": normalized_source_path(path),
+        "sha256": None,
+        "size": 0,
+        "fetched_at": None,
+        "status": "not_requested",
+    }
+
+
 def normalized_source_path(path: Path) -> str:
     return f"source/{path.name}"
 
@@ -375,13 +549,9 @@ def sha256_bytes(content: bytes) -> str:
 
 
 def document_status_from_parts(json_status: str, pdf_status: str) -> str:
-    if json_status in {"downloaded", "already_valid"} and pdf_status in {
-        "downloaded",
-        "already_valid",
-    }:
-        return "downloaded"
+    _ = pdf_status
     if json_status in {"downloaded", "already_valid"}:
-        return "partial"
+        return "downloaded"
     return "failed"
 
 
@@ -389,10 +559,14 @@ def count_document_statuses(documents: list[DownloadedDocumentSummary]) -> dict[
     counts = {"downloaded": 0, "skipped": 0, "partial": 0, "failed": 0}
     for document in documents:
         if document.status == "downloaded":
-            if document.json_status == "already_valid" and document.pdf_status == "already_valid":
-                counts["skipped"] += 1
-            else:
+            if "downloaded" in {document.json_status, document.pdf_status}:
                 counts["downloaded"] += 1
+            else:
+                counts["skipped"] += 1
+        elif document.status == "already_valid":
+            counts["skipped"] += 1
+        elif document.status == "not_requested":
+            counts["skipped"] += 1
         elif document.status == "partial":
             counts["partial"] += 1
         else:

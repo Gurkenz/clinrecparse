@@ -1,0 +1,16 @@
+{
+  "d": {
+    "success": true,
+    "data": [
+      {
+        "Id": 10,
+        "name": "Fixture Medical Association",
+        "shortname": "  FMA  ",
+        "engname": "Fixture Medical Association",
+        "engshortname": "FMA",
+        "profile": "fixture",
+        "url": "https://example.test/fma"
+      }
+    ]
+  }
+}

@@ -1,0 +1,49 @@
+{
+  "Success": true,
+  "Total": 2,
+  "Erorrs": [],
+  "Data": [
+    {
+      "Id": 1002,
+      "Name": "Fixture recommendation 270",
+      "NPC_approved": true,
+      "PublishDate": "2024-03-15T00:00:00",
+      "PublishDateStr": "15.03.2024",
+      "Code": 270,
+      "Version": 2,
+      "CodeVersion": "270_2",
+      "Status": 0,
+      "ApplyStatus": "Применяется",
+      "AgeCategory": 1,
+      "AgeCategoryStr": "Взрослые",
+      "Created": "2024-03-15T09:00:00",
+      "CreatedStr": "15.03.2024",
+      "ApplyStatusCalculated": 1,
+      "PrevCrId": 1001,
+      "Developers": [{"Name": "Association 270"}],
+      "Mkbs": [{"Code": "A00"}],
+      "Specialities": [{"Name": "Therapy"}]
+    },
+    {
+      "Id": 1003,
+      "Name": "Fixture recommendation 270 revision 3",
+      "NPC_approved": true,
+      "PublishDate": "2025-02-20T00:00:00",
+      "PublishDateStr": "20.02.2025",
+      "Code": 270,
+      "Version": 3,
+      "CodeVersion": "270_3",
+      "Status": 0,
+      "ApplyStatus": "Применяется",
+      "AgeCategory": 1,
+      "AgeCategoryStr": "Взрослые",
+      "Created": "2025-02-20T09:00:00",
+      "CreatedStr": "20.02.2025",
+      "ApplyStatusCalculated": 1,
+      "PrevCrId": 1002,
+      "Developers": [{"Name": "Association 270"}],
+      "Mkbs": [{"Code": "A00"}],
+      "Specialities": [{"Name": "Therapy"}]
+    }
+  ]
+}

@@ -133,8 +133,8 @@ def test_sync_catalog_saves_pages_manifest_and_jsonl(tmp_path: Path) -> None:
     ]
     assert len(rows) == 5
     assert rows[0]["code_version"] == "843_1"
-    assert rows[0]["publish_date_raw"] == "/Date(1734476342000)/"
-    assert rows[0]["publish_date_utc"] == "2024-12-17T22:59:02Z"
+    assert rows[0]["publish_date"] == "2024-12-17"
+    assert "publish_date_utc" not in rows[0]
 
 
 def test_sync_references_saves_raw_normalized_and_qa(tmp_path: Path) -> None:

@@ -53,16 +53,20 @@ def mock_handler(request: httpx.Request) -> httpx.Response:
     code_version = request.url.params.get("id")
 
     routes: dict[tuple[str | None, str | None], tuple[int, str, str]] = {
-        ("GetJsonClinrecsFilterV2", None): (200, "catalog_success.json", "application/json"),
-        ("GetClinrec2", "843_1"): (200, "clinrec_843_1.json", "application/json"),
-        ("GetClinrec2", "270_2"): (200, "clinrec_270_2.json", "application/json"),
-        ("GetClinrec2", "270_3"): (200, "clinrec_270_3.json", "application/json"),
+        ("GetJsonClinrecsFilterV2", None): (
+            200,
+            "catalog_843_1_real_shape.json",
+            "application/json",
+        ),
+        ("GetClinrec2", "843_1"): (200, "clinrec_843_1_real_shape.json", "application/json"),
+        ("GetClinrec2", "270_2"): (200, "clinrec_270_2_real_shape.json", "application/json"),
+        ("GetClinrec2", "270_3"): (200, "clinrec_270_3_real_shape.json", "application/json"),
         ("GetClinrec2", "270_1"): (403, "270_1_403.html", "text/html"),
-        ("GetClinrec2", "html_200"): (200, "html_error.html", "text/html"),
-        ("GetClinrec2", "bad_json"): (200, "corrupted.json", "application/json"),
+        ("GetClinrec2", "html_200"): (200, "html_error_200.html", "text/html"),
+        ("GetClinrec2", "bad_json"): (200, "invalid_json.json", "application/json"),
         ("GetClinrec2", "text_200"): (200, "unexpected_content.txt", "text/plain"),
-        ("GetClinrecPdf", "843_1"): (200, "sample.pdf", "application/pdf"),
-        ("GetNkoList", None): (200, "nko_list_success.json", "application/json"),
+        ("GetClinrecPdf", "843_1"): (200, "pdf_sample.pdf", "application/pdf"),
+        ("GetNkoList", None): (200, "nko_list_real_shape.json", "application/json"),
     }
     status_code, fixture_name, content_type = routes[(op, code_version)]
     return response_from_fixture(status_code, fixture_name, content_type)
@@ -146,3 +150,24 @@ def test_request_error_does_not_expose_sensitive_headers() -> None:
     dumped: dict[str, Any] = result.model_dump()
     assert "authorization" not in dumped
     assert "cookie" not in dumped
+
+
+def test_http_error_context_redacts_body_preview_and_sends_user_agent() -> None:
+    seen_user_agent: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_user_agent.append(request.headers["user-agent"])
+        return httpx.Response(
+            500,
+            headers={"content-type": "application/json", "retry-after": "1"},
+            content=b'{"token":"secret-value","message":"failed"}',
+        )
+
+    with make_client(httpx.MockTransport(handler)) as client:
+        result = client.fetch_clinrec("843_1")
+
+    assert isinstance(result, ExternalApiError)
+    assert seen_user_agent == ["clinrecparse/0.1 contact: local-development"]
+    assert result.retry_after == "1"
+    assert result.safe_body_preview is not None
+    assert "secret-value" not in result.safe_body_preview

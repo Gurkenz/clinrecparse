@@ -6,7 +6,7 @@ from pathlib import Path
 import httpx
 
 from clinrec.api.client import ClinrecApiClient
-from clinrec.api.document_download import DownloadOptions, download_documents
+from clinrec.api.document_download import DownloadOptions, download_documents, download_pdfs
 from clinrec.api.version_discovery import write_availability_index
 from clinrec.config import (
     ConcurrencySettings,
@@ -114,7 +114,7 @@ def make_handler(*, pdf_available: bool = True) -> httpx.MockTransport:
     return httpx.MockTransport(handler)
 
 
-def test_download_success_saves_json_pdf_manifest_and_no_part_files(tmp_path: Path) -> None:
+def test_download_success_saves_json_manifest_without_pdf(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
     seed_indexes(settings, {"843_1": availability("843_1", 843, 1)})
 
@@ -134,14 +134,14 @@ def test_download_success_saves_json_pdf_manifest_and_no_part_files(tmp_path: Pa
     manifest = json.loads(document.manifest_path.read_text(encoding="utf-8"))
     assert summary.downloaded == 1
     assert (source_dir / "getclinrec.json").read_bytes() == json_payload(843, 1)
-    assert (source_dir / "official.pdf").read_bytes().startswith(b"%PDF-")
+    assert not (source_dir / "official.pdf").exists()
     assert not list(document.document_dir.rglob("*.part"))
     assert manifest["json"]["status"] == "downloaded"
-    assert manifest["pdf"]["status"] == "downloaded"
+    assert manifest["pdf"]["status"] == "not_requested"
     assert manifest["catalog_record"]["status"] == "saved"
 
 
-def test_download_partial_when_pdf_unavailable(tmp_path: Path) -> None:
+def test_download_pdf_unavailable_is_separate_from_json(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
     seed_indexes(settings, {"270_2": availability("270_2", 270, 2)})
 
@@ -150,17 +150,41 @@ def test_download_partial_when_pdf_unavailable(tmp_path: Path) -> None:
         settings.rate_limit,
         transport=make_handler(pdf_available=False),
     ) as client:
-        summary = download_documents(
-            settings,
-            client,
-            DownloadOptions(code_versions=["270_2"], force=True),
-        )
+            summary = download_pdfs(
+                settings,
+                client,
+                DownloadOptions(code_versions=["270_2"], force=True),
+            )
 
     manifest = json.loads(summary.documents[0].manifest_path.read_text(encoding="utf-8"))
-    assert summary.partial == 1
-    assert manifest["status"] == "partial"
-    assert manifest["json"]["status"] == "downloaded"
+    assert summary.failed == 1
+    assert manifest["status"] == "unavailable"
+    assert manifest["json"]["status"] == "missing"
     assert manifest["pdf"]["status"] == "unavailable"
+
+
+def test_download_pdf_success_saves_pdf_manifest(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    seed_indexes(settings, {"843_1": availability("843_1", 843, 1)})
+
+    with ClinrecApiClient(
+        settings.http,
+        settings.rate_limit,
+        transport=make_handler(),
+    ) as client:
+        summary = download_pdfs(
+            settings,
+            client,
+            DownloadOptions(code_versions=["843_1"], force=True),
+        )
+
+    document = summary.documents[0]
+    source_dir = document.document_dir / "source"
+    manifest = json.loads(document.manifest_path.read_text(encoding="utf-8"))
+    assert summary.downloaded == 1
+    assert (source_dir / "official.pdf").read_bytes().startswith(b"%PDF-")
+    assert manifest["json"]["status"] == "missing"
+    assert manifest["pdf"]["status"] == "downloaded"
 
 
 def test_download_dry_run_does_not_call_http_or_write_documents(tmp_path: Path) -> None:
