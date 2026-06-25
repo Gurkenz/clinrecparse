@@ -1,0 +1,28 @@
+{
+  "Success": true,
+  "Total": 3,
+  "Erorrs": [],
+  "Data": [
+    {
+      "Code": "843",
+      "CodeVersion": "843_1",
+      "Name": "Fixture recommendation 843",
+      "Status": 0,
+      "PublishDate": "2026-01-10"
+    },
+    {
+      "Code": "270",
+      "CodeVersion": "270_2",
+      "Name": "Fixture recommendation 270, revision 2",
+      "Status": 0,
+      "PublishDate": "2024-03-15"
+    },
+    {
+      "Code": "270",
+      "CodeVersion": "270_3",
+      "Name": "Fixture recommendation 270, revision 3",
+      "Status": 0,
+      "PublishDate": "2025-02-20"
+    }
+  ]
+}

@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "clinrec"
+version = "0.1.0"
+description = "Pipeline skeleton for downloading and parsing Russian Ministry of Health clinical recommendations."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "beautifulsoup4>=4.12",
+    "httpx>=0.27",
+    "lxml>=5.2",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.2",
+    "PyYAML>=6.0",
+    "rapidfuzz>=3.9",
+    "structlog>=24.1",
+    "tenacity>=8.2",
+    "typer>=0.12",
+]
+
+[project.optional-dependencies]
+dev = [
+    "mypy>=1.10",
+    "pytest>=8.2",
+    "ruff>=0.5",
+    "types-PyYAML>=6.0",
+]
+
+[project.scripts]
+clinrec = "clinrec.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+mypy_path = "src"
+packages = ["clinrec"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

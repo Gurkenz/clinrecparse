@@ -1,0 +1,15 @@
+{
+  "success": true,
+  "obj": {
+    "code_version": "843_1",
+    "code": "843",
+    "title": "Fixture recommendation 843",
+    "sections": [
+      {
+        "id": 1,
+        "title": "General information",
+        "text": "Fixture text for section 1."
+      }
+    ]
+  }
+}

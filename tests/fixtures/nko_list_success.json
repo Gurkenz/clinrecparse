@@ -1,0 +1,12 @@
+{
+  "d": {
+    "success": true,
+    "data": [
+      {
+        "id": 10,
+        "name": "Fixture Medical Association",
+        "short_name": "FMA"
+      }
+    ]
+  }
+}

@@ -1,0 +1,28 @@
+paths:
+  data_root: data
+  snapshots: data/snapshots
+  references: data/references
+  documents: data/documents
+  indexes: data/indexes
+  reports: data/reports
+  logs: data/logs
+
+http:
+  timeout_seconds: 30.0
+  retries: 3
+  backoff_initial_seconds: 1.0
+  backoff_max_seconds: 30.0
+
+rate_limit:
+  requests_per_second: 2.0
+
+concurrency:
+  default: 1
+  max: 2
+
+discovery:
+  unavailable_retry_ttl_days: 7
+
+logging:
+  level: INFO
+  jsonl_path: data/logs/clinrec.jsonl

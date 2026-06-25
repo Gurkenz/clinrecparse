@@ -1,0 +1,15 @@
+{
+  "success": true,
+  "obj": {
+    "code_version": "270_2",
+    "code": "270",
+    "title": "Fixture recommendation 270, revision 2",
+    "sections": [
+      {
+        "id": "intro",
+        "title": "Introduction",
+        "html": "<p>Revision 2 fixture text.</p>"
+      }
+    ]
+  }
+}

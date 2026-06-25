@@ -1,0 +1,22 @@
+{
+  "success": true,
+  "obj": {
+    "code_version": "270_3",
+    "code": "270",
+    "title": "Fixture recommendation 270, revision 3",
+    "sections": [
+      {
+        "id": "intro",
+        "title": "Introduction",
+        "html": "<p>Revision 3 fixture text.</p>",
+        "sections": [
+          {
+            "id": "intro-child",
+            "title": "Nested section",
+            "text": "Nested fixture text."
+          }
+        ]
+      }
+    ]
+  }
+}
