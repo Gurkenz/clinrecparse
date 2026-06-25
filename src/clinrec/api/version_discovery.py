@@ -168,8 +168,13 @@ def discover_versions(
 
 def build_version_candidates(settings: Settings) -> list[VersionCandidate]:
     max_versions: dict[int, int] = {}
-    for code, version in read_catalog_index_candidates(settings.paths.indexes / "catalog.jsonl"):
-        max_versions[code] = max(max_versions.get(code, 0), version)
+    for index_name in (
+        "catalog-all-statuses.jsonl",
+        "catalog-active.jsonl",
+        "catalog.jsonl",
+    ):
+        for code, version in read_catalog_index_candidates(settings.paths.indexes / index_name):
+            max_versions[code] = max(max_versions.get(code, 0), version)
     for code, version in read_raw_catalog_candidates(settings.paths.snapshots / "catalog"):
         max_versions[code] = max(max_versions.get(code, 0), version)
     for code, version in read_availability_candidates(

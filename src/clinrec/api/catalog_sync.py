@@ -4,6 +4,7 @@ import json
 import math
 import re
 from collections import Counter, defaultdict
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -37,9 +38,12 @@ class SyncError(RuntimeError):
 class CatalogSubsetSummary:
     name: str
     snapshot_dir: Path
+    index_path: Path
     pages: int
     records: int
     total_records: int | None
+    unique_code_versions: int
+    duplicates: list[dict[str, Any]]
     issues: int
 
 
@@ -47,7 +51,8 @@ class CatalogSubsetSummary:
 class CatalogSyncSummary:
     timestamp: str
     snapshot_root: Path
-    index_path: Path
+    active_index_path: Path
+    all_statuses_index_path: Path
     qa_report_path: Path
     active: CatalogSubsetSummary
     all_statuses: CatalogSubsetSummary
@@ -142,14 +147,6 @@ def sync_catalog(
         )
         raise
 
-    all_records = _read_subset_records(all_statuses.snapshot_dir)
-    normalized_records = [normalize_catalog_record(record) for record in all_records]
-    report_issues.extend(validate_catalog_records(normalized_records))
-
-    settings.paths.indexes.mkdir(parents=True, exist_ok=True)
-    index_path = settings.paths.indexes / "catalog.jsonl"
-    write_jsonl(index_path, [record.model_dump(mode="json") for record in normalized_records])
-
     report = CatalogQaReport(
         timestamp=current_timestamp,
         active_records=active.records,
@@ -162,7 +159,8 @@ def sync_catalog(
     return CatalogSyncSummary(
         timestamp=current_timestamp,
         snapshot_root=snapshot_root,
-        index_path=index_path,
+        active_index_path=active.index_path,
+        all_statuses_index_path=all_statuses.index_path,
         qa_report_path=qa_report_path,
         active=CatalogSubsetSummary(
             **{**active.__dict__, "issues": _subset_issue_count(report_issues, "active")}
@@ -173,7 +171,7 @@ def sync_catalog(
                 "issues": _subset_issue_count(report_issues, "all-statuses"),
             }
         ),
-        normalized_records=len(normalized_records),
+        normalized_records=active.records + all_statuses.records,
         issues=report_issues,
     )
 
@@ -281,6 +279,7 @@ def _sync_catalog_subset(
 
     pages: list[CatalogResponse] = []
     page_files: list[str] = []
+    page_hashes: list[dict[str, Any]] = []
     page = 1
     total_records: int | None = None
     actual_page_size: int | None = None
@@ -305,6 +304,7 @@ def _sync_catalog_subset(
                 subset_dir,
                 subset_name,
                 page_files,
+                page_hashes,
                 pages,
                 total_records,
                 issues,
@@ -314,6 +314,13 @@ def _sync_catalog_subset(
         page_path = subset_dir / f"page-{page:04d}.json"
         page_path.write_bytes(result.raw_content)
         page_files.append(page_path.name)
+        page_hashes.append(
+            {
+                "file": page_path.name,
+                "size": len(result.raw_content),
+                "sha256": sha256_bytes(result.raw_content),
+            }
+        )
 
         response = _validate_catalog_payload(result, subset_name, page, issues)
         pages.append(response)
@@ -331,6 +338,7 @@ def _sync_catalog_subset(
                 subset_dir,
                 subset_name,
                 page_files,
+                page_hashes,
                 pages,
                 total_records,
                 issues,
@@ -384,6 +392,59 @@ def _sync_catalog_subset(
             )
         )
 
+    normalized_records = [
+        normalize_catalog_record(record)
+        for page_response in pages
+        for record in page_response.data
+    ]
+    subset_issues = validate_catalog_records(normalized_records)
+    for issue_item in subset_issues:
+        issue_item.context.setdefault("subset", subset_name)
+    issues.extend(subset_issues)
+    duplicate_rows = duplicate_code_versions(normalized_records)
+    unique_code_versions = len({record.code_version for record in normalized_records})
+
+    if active_only:
+        if total_records is not None and record_count != total_records:
+            _write_catalog_manifest(
+                subset_dir,
+                subset_name,
+                page_files,
+                page_hashes,
+                pages,
+                total_records,
+                issues,
+            )
+            raise SyncError("Active catalog actual_records does not match TotalRecords")
+        if total_records is not None and unique_code_versions != total_records:
+            issues.append(
+                QaIssue(
+                    severity="error",
+                    code="active_unique_code_versions_mismatch",
+                    message="Active catalog unique CodeVersion count does not match TotalRecords",
+                    context={
+                        "subset": subset_name,
+                        "unique_code_versions": unique_code_versions,
+                        "total_records": total_records,
+                    },
+                )
+            )
+            _write_catalog_manifest(
+                subset_dir,
+                subset_name,
+                page_files,
+                page_hashes,
+                pages,
+                total_records,
+                issues,
+            )
+            raise SyncError("Active catalog unique CodeVersion count does not match TotalRecords")
+
+    settings.paths.indexes.mkdir(parents=True, exist_ok=True)
+    index_name = "catalog-active.jsonl" if active_only else "catalog-all-statuses.jsonl"
+    index_path = settings.paths.indexes / index_name
+    write_jsonl(index_path, [record.model_dump(mode="json") for record in normalized_records])
+
     expected_page_numbers = list(range(1, len(pages) + 1))
     actual_page_numbers = [
         response.current_page if response.current_page is not None else index
@@ -403,13 +464,24 @@ def _sync_catalog_subset(
             )
         )
 
-    _write_catalog_manifest(subset_dir, subset_name, page_files, pages, total_records, issues)
+    _write_catalog_manifest(
+        subset_dir,
+        subset_name,
+        page_files,
+        page_hashes,
+        pages,
+        total_records,
+        issues,
+    )
     return CatalogSubsetSummary(
         name=subset_name,
         snapshot_dir=subset_dir,
+        index_path=index_path,
         pages=len(pages),
         records=record_count,
         total_records=total_records,
+        unique_code_versions=unique_code_versions,
+        duplicates=duplicate_rows,
         issues=_subset_issue_count(issues, subset_name),
     )
 
@@ -438,18 +510,28 @@ def _write_catalog_manifest(
     subset_dir: Path,
     subset_name: str,
     page_files: list[str],
+    page_hashes: list[dict[str, Any]],
     pages: list[CatalogResponse],
     total_records: int | None,
     issues: list[QaIssue],
 ) -> None:
+    records = [
+        normalize_catalog_record(record)
+        for page_response in pages
+        for record in page_response.data
+    ]
     write_json(
         subset_dir / "manifest.json",
         {
             "subset": subset_name,
             "pages": page_files,
+            "source_pages": page_hashes,
             "page_count": len(page_files),
             "record_count": sum(len(page.data) for page in pages),
+            "actual_records": sum(len(page.data) for page in pages),
             "total_records": total_records,
+            "unique_code_versions": len({record.code_version for record in records}),
+            "duplicates": duplicate_code_versions(records),
             "issues": [
                 issue.model_dump(mode="json")
                 for issue in issues
@@ -670,6 +752,21 @@ def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
     with path.open("w", encoding="utf-8", newline="\n") as file:
         for row in rows:
             file.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def duplicate_code_versions(records: Iterable[NormalizedCatalogRecord]) -> list[dict[str, Any]]:
+    counts = Counter(record.code_version for record in records)
+    return [
+        {"code_version": code_version, "count": count}
+        for code_version, count in sorted(counts.items())
+        if count > 1
+    ]
+
+
+def sha256_bytes(content: bytes) -> str:
+    import hashlib
+
+    return hashlib.sha256(content).hexdigest()
 
 
 def _subset_issue_count(issues: list[QaIssue], subset_name: str) -> int:

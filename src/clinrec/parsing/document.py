@@ -1456,7 +1456,7 @@ def load_catalog_record(
 
     if not code_version:
         code_version = document_dir.name
-    index_path = settings.paths.indexes / "catalog.jsonl"
+    index_path = default_catalog_index_path(settings)
     if not index_path.exists():
         return {}
     with index_path.open("r", encoding="utf-8") as file:
@@ -1467,6 +1467,14 @@ def load_catalog_record(
             if isinstance(row, dict) and row.get("code_version") == code_version:
                 return row
     return {}
+
+
+def default_catalog_index_path(settings: Settings) -> Path:
+    for name in ("catalog-all-statuses.jsonl", "catalog-active.jsonl", "catalog.jsonl"):
+        path = settings.paths.indexes / name
+        if path.exists():
+            return path
+    return settings.paths.indexes / "catalog-all-statuses.jsonl"
 
 
 def table_lookup(tables: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:

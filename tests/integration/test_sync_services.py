@@ -124,17 +124,73 @@ def test_sync_catalog_saves_pages_manifest_and_jsonl(tmp_path: Path) -> None:
     assert (summary.snapshot_root / "active" / "request.json").exists()
     assert (summary.snapshot_root / "active" / "page-0001.json").exists()
     assert (summary.snapshot_root / "all-statuses" / "page-0003.json").exists()
-    assert summary.index_path.exists()
+    assert summary.active_index_path.exists()
+    assert summary.all_statuses_index_path.exists()
     assert summary.qa_report_path.exists()
 
     rows = [
         json.loads(line)
-        for line in summary.index_path.read_text(encoding="utf-8").splitlines()
+        for line in summary.active_index_path.read_text(encoding="utf-8").splitlines()
     ]
-    assert len(rows) == 5
+    assert len(rows) == 3
     assert rows[0]["code_version"] == "843_1"
     assert rows[0]["publish_date"] == "2024-12-17"
     assert "publish_date_utc" not in rows[0]
+
+    all_rows = [
+        json.loads(line)
+        for line in summary.all_statuses_index_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert len(all_rows) == 5
+    manifest = json.loads(
+        (summary.snapshot_root / "active" / "manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["actual_records"] == 3
+    assert manifest["total_records"] == 3
+    assert manifest["unique_code_versions"] == 3
+    assert manifest["source_pages"][0]["sha256"]
+
+
+def test_sync_catalog_fails_when_active_code_versions_are_not_unique(
+    tmp_path: Path,
+) -> None:
+    settings = make_settings(tmp_path)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        assert body["filters"]
+        duplicate = catalog_record(1, 843, 1, "Fixture 843", 0)
+        payload = {
+            "Success": True,
+            "TotalRecords": 2,
+            "PageSize": 2,
+            "CurrentPage": 1,
+            "Data": [duplicate, {**duplicate, "Id": 2}],
+        }
+        return response(payload)
+
+    with ClinrecApiClient(
+        settings.http,
+        settings.rate_limit,
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        try:
+            sync_catalog(settings, client, timestamp="20260625T030000Z")
+        except SyncError as exc:
+            assert "unique CodeVersion" in str(exc)
+        else:
+            raise AssertionError("sync_catalog should fail on duplicate active CodeVersion")
+
+    manifest_path = (
+        settings.paths.snapshots
+        / "catalog"
+        / "20260625T030000Z"
+        / "active"
+        / "manifest.json"
+    )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["unique_code_versions"] == 1
+    assert manifest["duplicates"] == [{"code_version": "843_1", "count": 2}]
 
 
 def test_sync_references_saves_raw_normalized_and_qa(tmp_path: Path) -> None:

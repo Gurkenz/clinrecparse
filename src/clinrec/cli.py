@@ -15,6 +15,11 @@ from clinrec.api.document_download import download_documents as run_download_doc
 from clinrec.api.document_download import download_pdfs as run_download_pdfs
 from clinrec.api.version_discovery import DiscoveryError, DiscoveryOptions
 from clinrec.api.version_discovery import discover_versions as run_discover_versions
+from clinrec.bank.common import BankError, BankRecordFilter
+from clinrec.bank.current import download_current_documents as run_bank_download_current
+from clinrec.bank.previous import check_previous_documents as run_bank_check_previous
+from clinrec.bank.qa import run_bank_qa
+from clinrec.bank.run import run_bank_pipeline
 from clinrec.config import DEFAULT_CONFIG_PATH, Settings, ensure_data_directories, load_settings
 from clinrec.logging import configure_logging
 from clinrec.parsing.document import ParseError, ParseOptions
@@ -77,9 +82,30 @@ def sync_catalog(config: ConfigOption = DEFAULT_CONFIG_PATH) -> None:
         f"all-statuses: pages={summary.all_statuses.pages}, "
         f"records={summary.all_statuses.records}, total={summary.all_statuses.total_records}"
     )
-    typer.echo(f"index: {summary.index_path}")
+    typer.echo(f"active_index: {summary.active_index_path}")
+    typer.echo(f"all_statuses_index: {summary.all_statuses_index_path}")
     typer.echo(f"qa_report: {summary.qa_report_path}")
     typer.echo(f"qa_issues: {len(summary.issues)}")
+
+
+@app.command("bank-sync-catalog")
+def bank_sync_catalog(config: ConfigOption = DEFAULT_CONFIG_PATH) -> None:
+    """Synchronize catalog indexes required by the raw JSON bank."""
+    settings = bootstrap(config)
+    try:
+        with ClinrecApiClient(settings.http, settings.rate_limit) as client:
+            summary = run_catalog_sync(settings, client)
+    except SyncError as exc:
+        typer.echo(f"bank-sync-catalog failed: {exc}", err=True)
+        raise typer.Exit(1) from exc
+
+    typer.echo("bank-sync-catalog completed")
+    typer.echo(f"active_records: {summary.active.records}")
+    typer.echo(f"active_unique_code_versions: {summary.active.unique_code_versions}")
+    typer.echo(f"all_statuses_records: {summary.all_statuses.records}")
+    typer.echo(f"active_index: {summary.active_index_path}")
+    typer.echo(f"all_statuses_index: {summary.all_statuses_index_path}")
+    typer.echo(f"qa_report: {summary.qa_report_path}")
 
 
 @app.command("sync-references")
@@ -233,6 +259,282 @@ def download(
                 f"manifest={document.manifest_path}"
             )
     if summary.failed:
+        raise typer.Exit(1)
+
+
+@app.command("bank-download-current")
+def bank_download_current(
+    config: ConfigOption = DEFAULT_CONFIG_PATH,
+    code_version: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--code-version",
+            help="Download one active bank CodeVersion; can be repeated.",
+        ),
+    ] = None,
+    code: Annotated[int | None, typer.Option("--code", help="Download one Code only.")] = None,
+    from_code: Annotated[
+        int | None,
+        typer.Option("--from-code", help="Download Codes greater than or equal to this value."),
+    ] = None,
+    to_code: Annotated[
+        int | None,
+        typer.Option("--to-code", help="Download Codes less than or equal to this value."),
+    ] = None,
+    all_records: Annotated[
+        bool,
+        typer.Option("--all", help="Download every active catalog record."),
+    ] = False,
+    force: Annotated[bool, typer.Option("--force", help="Redownload selected files.")] = False,
+    retry_failed: Annotated[
+        bool,
+        typer.Option("--retry-failed", help="Retry temporary failed records."),
+    ] = False,
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="Show selected records without HTTP requests or writes."),
+    ] = False,
+) -> None:
+    """Download active-bank raw GetClinrec2 JSON files only."""
+    settings = bootstrap(config)
+    options = BankRecordFilter(
+        code_versions=code_version,
+        code=code,
+        from_code=from_code,
+        to_code=to_code,
+        all_records=all_records,
+        force=force,
+        retry_failed=retry_failed,
+        dry_run=dry_run,
+    )
+    try:
+        if dry_run:
+            summary = run_bank_download_current(settings, None, options)
+        else:
+            with ClinrecApiClient(settings.http, settings.rate_limit) as client:
+                summary = run_bank_download_current(settings, client, options)
+    except BankError as exc:
+        typer.echo(f"bank-download-current failed: {exc}", err=True)
+        raise typer.Exit(1) from exc
+
+    typer.echo("bank-download-current completed")
+    typer.echo(f"planned: {summary.planned}")
+    typer.echo(f"downloaded: {summary.downloaded}")
+    typer.echo(f"skipped: {summary.skipped}")
+    typer.echo(f"failed: {summary.failed}")
+    typer.echo(f"dry_run: {summary.dry_run}")
+    if summary.references_index_path is not None:
+        typer.echo(f"references_index: {summary.references_index_path}")
+    if dry_run:
+        typer.echo(f"candidates_preview: {summary.candidates_preview}")
+    for document in summary.documents:
+        typer.echo(
+            f"{document.code_version}: status={document.status}, "
+            f"manifest={document.manifest_path}"
+        )
+    if summary.failed:
+        raise typer.Exit(1)
+
+
+@app.command("bank-check-previous")
+def bank_check_previous(
+    config: ConfigOption = DEFAULT_CONFIG_PATH,
+    code_version: Annotated[
+        list[str] | None,
+        typer.Option("--code-version", help="Check one active bank CodeVersion; can be repeated."),
+    ] = None,
+    code: Annotated[int | None, typer.Option("--code", help="Check one Code only.")] = None,
+    from_code: Annotated[
+        int | None,
+        typer.Option("--from-code", help="Check Codes greater than or equal to this value."),
+    ] = None,
+    to_code: Annotated[
+        int | None,
+        typer.Option("--to-code", help="Check Codes less than or equal to this value."),
+    ] = None,
+    all_records: Annotated[
+        bool,
+        typer.Option("--all", help="Check every active catalog record."),
+    ] = False,
+    force: Annotated[bool, typer.Option("--force", help="Recheck selected relations.")] = False,
+    retry_failed: Annotated[
+        bool,
+        typer.Option("--retry-failed", help="Retry previous_temporary_failure relations."),
+    ] = False,
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="Show selected previous candidates without writes."),
+    ] = False,
+) -> None:
+    """Check only Version - 1 for active bank records."""
+    settings = bootstrap(config)
+    options = BankRecordFilter(
+        code_versions=code_version,
+        code=code,
+        from_code=from_code,
+        to_code=to_code,
+        all_records=all_records,
+        force=force,
+        retry_failed=retry_failed,
+        dry_run=dry_run,
+    )
+    try:
+        if dry_run:
+            summary = run_bank_check_previous(settings, None, options)
+        else:
+            with ClinrecApiClient(settings.http, settings.rate_limit) as client:
+                summary = run_bank_check_previous(settings, client, options)
+    except BankError as exc:
+        typer.echo(f"bank-check-previous failed: {exc}", err=True)
+        raise typer.Exit(1) from exc
+
+    typer.echo("bank-check-previous completed")
+    typer.echo(f"planned: {summary.planned}")
+    typer.echo(f"checked: {summary.checked}")
+    typer.echo(f"skipped: {summary.skipped}")
+    typer.echo(f"failed: {summary.failed}")
+    typer.echo(f"dry_run: {summary.dry_run}")
+    if dry_run:
+        typer.echo(f"candidates_preview: {summary.candidates_preview}")
+    for document in summary.documents:
+        typer.echo(
+            f"{document.code_version}: previous={document.previous_code_version}, "
+            f"relation_status={document.relation_status}, relation={document.relation_path}"
+        )
+    if summary.failed:
+        raise typer.Exit(1)
+
+
+@app.command("bank-qa")
+def bank_qa(
+    config: ConfigOption = DEFAULT_CONFIG_PATH,
+    code_version: Annotated[
+        list[str] | None,
+        typer.Option("--code-version", help="Check one active bank CodeVersion; can be repeated."),
+    ] = None,
+    code: Annotated[int | None, typer.Option("--code", help="Check one Code only.")] = None,
+    from_code: Annotated[
+        int | None,
+        typer.Option("--from-code", help="Check Codes greater than or equal to this value."),
+    ] = None,
+    to_code: Annotated[
+        int | None,
+        typer.Option("--to-code", help="Check Codes less than or equal to this value."),
+    ] = None,
+    all_records: Annotated[
+        bool,
+        typer.Option("--all", help="Check every active catalog record."),
+    ] = False,
+    force: Annotated[bool, typer.Option("--force", help="Accepted for filter parity.")] = False,
+    retry_failed: Annotated[
+        bool,
+        typer.Option("--retry-failed", help="Accepted for filter parity."),
+    ] = False,
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="Accepted for filter parity."),
+    ] = False,
+) -> None:
+    """Run global active-bank completeness checks."""
+    _ = (force, retry_failed, dry_run)
+    settings = bootstrap(config)
+    options = BankRecordFilter(
+        code_versions=code_version,
+        code=code,
+        from_code=from_code,
+        to_code=to_code,
+        all_records=all_records or not any((code_version, code, from_code, to_code)),
+    )
+    try:
+        summary = run_bank_qa(settings, options)
+    except BankError as exc:
+        typer.echo(f"bank-qa failed: {exc}", err=True)
+        raise typer.Exit(1) from exc
+
+    typer.echo("bank-qa completed")
+    typer.echo(f"expected: {summary.expected}")
+    typer.echo(f"folders: {summary.folders}")
+    typer.echo(f"valid_current_json: {summary.valid_current_json}")
+    typer.echo(f"valid_manifests: {summary.valid_manifests}")
+    typer.echo(f"fatal: {summary.fatal}")
+    typer.echo(f"errors: {summary.errors}")
+    typer.echo(f"completeness: {summary.completeness_path}")
+    typer.echo(f"previous_relations: {summary.previous_relations_path}")
+    typer.echo(f"anomalies: {summary.anomalies_path}")
+    if summary.fatal or summary.errors:
+        raise typer.Exit(1)
+
+
+@app.command("bank-run")
+def bank_run(
+    config: ConfigOption = DEFAULT_CONFIG_PATH,
+    code_version: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--code-version",
+            help="Run bank pipeline for one CodeVersion; can be repeated.",
+        ),
+    ] = None,
+    code: Annotated[int | None, typer.Option("--code", help="Run one Code only.")] = None,
+    from_code: Annotated[
+        int | None,
+        typer.Option("--from-code", help="Run Codes greater than or equal to this value."),
+    ] = None,
+    to_code: Annotated[
+        int | None,
+        typer.Option("--to-code", help="Run Codes less than or equal to this value."),
+    ] = None,
+    all_records: Annotated[
+        bool,
+        typer.Option("--all", help="Run every active catalog record."),
+    ] = False,
+    force: Annotated[
+        bool,
+        typer.Option("--force", help="Redownload/recheck selected files."),
+    ] = False,
+    retry_failed: Annotated[
+        bool,
+        typer.Option("--retry-failed", help="Retry previous temporary failures."),
+    ] = False,
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="Show selected records without HTTP requests or writes."),
+    ] = False,
+) -> None:
+    """Run the new raw JSON bank pipeline only."""
+    settings = bootstrap(config)
+    options = BankRecordFilter(
+        code_versions=code_version,
+        code=code,
+        from_code=from_code,
+        to_code=to_code,
+        all_records=all_records,
+        force=force,
+        retry_failed=retry_failed,
+        dry_run=dry_run,
+    )
+    try:
+        if dry_run:
+            summary = run_bank_pipeline(settings, None, options)
+        else:
+            with ClinrecApiClient(settings.http, settings.rate_limit) as client:
+                summary = run_bank_pipeline(settings, client, options)
+    except (BankError, RuntimeError, SyncError) as exc:
+        typer.echo(f"bank-run failed: {exc}", err=True)
+        raise typer.Exit(1) from exc
+
+    typer.echo("bank-run completed")
+    typer.echo(f"catalog_active_records: {summary.catalog_active_records}")
+    typer.echo(f"download_planned: {summary.download.planned}")
+    typer.echo(f"download_failed: {summary.download.failed}")
+    typer.echo(f"previous_planned: {summary.previous.planned}")
+    typer.echo(f"previous_failed: {summary.previous.failed}")
+    if summary.qa is not None:
+        typer.echo(f"qa_fatal: {summary.qa.fatal}")
+        typer.echo(f"qa_errors: {summary.qa.errors}")
+    if summary.download.failed or summary.previous.failed or (
+        summary.qa is not None and (summary.qa.fatal or summary.qa.errors)
+    ):
         raise typer.Exit(1)
 
 

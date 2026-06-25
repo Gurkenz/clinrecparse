@@ -1,12 +1,20 @@
 # clinrec
 
 `clinrec` is a local pipeline for Russian Ministry of Health clinical recommendations.
-The current priority is a stable JSON corpus and parser. PDF is kept as a separate
-official control layer and must not be downloaded together with JSON.
+The current priority is a stable bank of raw source JSON for active recommendations.
+HTML parsing, Markdown, chunks, recommendation extraction, and family analysis are
+paused for this stage. PDF is kept as a separate official control layer and must not
+be downloaded together with the JSON bank.
 
 ## Current Status
 
-- `sync-catalog` and `sync-references` save raw snapshots and normalized indexes.
+- `sync-catalog` and `bank-sync-catalog` save raw catalog snapshots plus separate
+  `catalog-active.jsonl` and `catalog-all-statuses.jsonl` indexes.
+- `bank-download-current` downloads byte-for-byte raw `GetClinrec2` JSON into
+  `data/bank/active/{CODE_VERSION}/current/`.
+- `bank-check-previous` checks only the nearest `Version - 1` candidate.
+- `bank-qa` verifies active-bank completeness and writes bank reports.
+- `bank-run` orchestrates the new raw JSON bank pipeline only.
 - `discover-versions` independently checks candidate `CodeVersion` values.
 - `download` downloads only raw `GetClinrec2` JSON.
 - `download-pdf` downloads official PDF files separately.
@@ -30,31 +38,27 @@ Pinned direct dependencies live in `pyproject.toml`. A full local lock is commit
 ## Recommended Order
 
 ```powershell
-clinrec sync-catalog
-clinrec sync-references
-clinrec discover-versions --code 270 --force
-clinrec discover-versions --code 843 --force
-clinrec download --code-version 843_1 --force
-clinrec download --code-version 270_2 --force
-clinrec download --code-version 270_3 --force
-clinrec parse --code-version 843_1
-clinrec parse --code-version 270_2
-clinrec parse --code-version 270_3
-clinrec qa --code 843
-clinrec qa --code 270
+clinrec bank-sync-catalog
+clinrec bank-download-current --code-version 843_1 --force
+clinrec bank-download-current --code-version 270_2 --force
+clinrec bank-download-current --code-version 270_3 --force
+clinrec bank-check-previous --code-version 843_1 --force
+clinrec bank-check-previous --code-version 270_3 --force
+clinrec bank-qa --code 843
+clinrec bank-qa --code 270
 ```
 
-For an intentional full JSON run:
+For an intentional full active-bank JSON run:
 
 ```powershell
-clinrec discover-versions --all
-clinrec download --all
-clinrec parse
-clinrec qa
+clinrec bank-sync-catalog
+clinrec bank-download-current --all
+clinrec bank-check-previous --all
+clinrec bank-qa
 ```
 
-If `parse --all` is not available in a future intermediate state, parse by filters or
-explicit `--code-version` values.
+Do not run `clinrec parse`, old `clinrec qa`, `clinrec build-families`, or old
+`clinrec run-all` as part of this raw-bank stage.
 
 ## PDF Layer
 
@@ -77,6 +81,11 @@ may keep timestamps.
 
 The `data/` directory is local working storage and excluded from Git. It may contain raw
 API responses, PDFs, normalized documents, indexes, logs, and reports.
+
+The active raw JSON bank lives under `data/bank/active/{CODE_VERSION}/` and does not
+create `parsed/`, `assets/`, `content.md`, `document.json`, or `search_chunks.jsonl`.
+Mass PDF download is intentionally outside the bank; bank manifests record
+`pdf_status: not_requested`.
 
 ## Development Checks
 

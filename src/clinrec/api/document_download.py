@@ -95,7 +95,7 @@ def download_documents(
         raise DownloadError("HTTP client is required unless --dry-run is used.")
     run_health_probe_if_needed(client, candidates, options)
 
-    catalog_records = load_catalog_records(settings.paths.indexes / "catalog.jsonl")
+    catalog_records = load_catalog_records(default_catalog_index_path(settings))
     documents: list[DownloadedDocumentSummary] = []
     for record in candidates:
         documents.append(
@@ -145,7 +145,7 @@ def download_pdfs(
         raise DownloadError("HTTP client is required unless --dry-run is used.")
     run_health_probe_if_needed(client, candidates, options)
 
-    catalog_records = load_catalog_records(settings.paths.indexes / "catalog.jsonl")
+    catalog_records = load_catalog_records(default_catalog_index_path(settings))
     documents = [
         download_one_pdf_document(settings, client, record, catalog_records, options)
         for record in candidates
@@ -430,6 +430,14 @@ def load_catalog_records(path: Path) -> dict[str, dict[str, Any]]:
         if isinstance(code_version, str):
             records[code_version] = row
     return records
+
+
+def default_catalog_index_path(settings: Settings) -> Path:
+    for name in ("catalog-all-statuses.jsonl", "catalog-active.jsonl", "catalog.jsonl"):
+        path = settings.paths.indexes / name
+        if path.exists():
+            return path
+    return settings.paths.indexes / "catalog-all-statuses.jsonl"
 
 
 def read_manifest(path: Path) -> dict[str, Any]:
