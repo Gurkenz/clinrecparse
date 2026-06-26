@@ -13,6 +13,7 @@ from clinrec.bank.common import (
     write_jsonl,
 )
 from clinrec.bank.current import download_current_documents
+from clinrec.bank.identities import analyze_identities
 from clinrec.bank.previous import check_previous_documents, relation_status_for_error
 from clinrec.bank.qa import run_bank_qa
 from clinrec.config import (
@@ -54,8 +55,16 @@ def make_settings(tmp_path: Path) -> Settings:
     )
 
 
-def catalog_row(code_version: str, code: int, version: int, status: int) -> dict[str, Any]:
+def catalog_row(
+    code_version: str,
+    code: int,
+    version: int,
+    status: int,
+    *,
+    source_record_id: int | None = None,
+) -> dict[str, Any]:
     return {
+        "source_record_id": source_record_id or fixture_source_record_id(code_version),
         "code_version": code_version,
         "code": code,
         "version": version,
@@ -65,6 +74,15 @@ def catalog_row(code_version: str, code: int, version: int, status: int) -> dict
         "developers": [{"Name": "Association"}],
         "mkbs": [{"code": "A00"}],
     }
+
+
+def fixture_source_record_id(code_version: str) -> int:
+    return {
+        "773_2": 2191,
+        "843_1": 1737,
+        "270_2": 1002,
+        "270_3": 1003,
+    }.get(code_version, 9000)
 
 
 def write_catalog_indexes(
@@ -96,11 +114,13 @@ def document_bytes(
     code: int,
     version: int,
     status: int,
+    db_id: int | None = None,
     title: str | None = None,
 ) -> bytes:
     payload = {
         "success": True,
         "id": code_version,
+        "db_id": db_id if db_id is not None else fixture_source_record_id(code_version),
         "code": code,
         "version": version,
         "name": title or f"Fixture {code_version}",
@@ -161,6 +181,14 @@ def test_bank_download_current_preserves_raw_and_creates_no_parsed_outputs(
     manifest = json.loads((document_dir / "current" / "manifest.json").read_text("utf-8"))
     assert manifest["validation"] == "valid"
     assert manifest["sha256"] == sha256_bytes(raw)
+    assert manifest["catalog_source_record_id"] == 1737
+    assert manifest["document_db_id"] == 1737
+    assert manifest["db_id_match"] is True
+    catalog_record = json.loads(
+        (document_dir / "current" / "catalog-record.json").read_text("utf-8")
+    )
+    assert catalog_record["source_record_id"] == 1737
+    assert "Id" not in catalog_record
     bank_manifest = json.loads((document_dir / "bank-manifest.json").read_text("utf-8"))
     assert bank_manifest["pdf_status"] == "not_requested"
 
@@ -203,6 +231,9 @@ def test_bank_download_current_uses_real_773_2_fixture_byte_for_byte(
     assert manifest["status"] == 0
     assert manifest["validation"] == "valid"
     assert manifest["sha256"] == sha256_bytes(raw)
+    assert manifest["catalog_source_record_id"] == 2191
+    assert manifest["document_db_id"] == 2191
+    assert manifest["db_id_match"] is True
     assert (document_dir / "current" / "catalog-record.json").exists()
     assert (document_dir / "current" / "developers.json").exists()
     assert not (document_dir / "parsed").exists()
@@ -330,6 +361,8 @@ def test_bank_qa_writes_completeness_reports(tmp_path: Path) -> None:
             content_type="application/json",
             raw_content=raw,
             validation="valid",
+            catalog_source_record_id=1737,
+            document_db_id=1737,
         ),
     )
     write_json(current_dir / "catalog-record.json", catalog_row("843_1", 843, 1, 0))
@@ -361,3 +394,98 @@ def test_bank_qa_writes_completeness_reports(tmp_path: Path) -> None:
     completeness = json.loads(summary.completeness_path.read_text("utf-8"))
     assert completeness["expected_unique"] == 1
     assert completeness["valid_current_json"] == 1
+    assert completeness["identity_conflicts"] == 0
+
+
+def test_bank_qa_reports_catalog_db_id_mismatch(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    write_catalog_indexes(
+        settings,
+        active=[catalog_row("843_1", 843, 1, 0, source_record_id=9999)],
+    )
+    raw = (FIXTURES / "clinrec_843_1_real_shape.json").read_bytes()
+    document_dir = settings.paths.data_root / "bank" / "active" / "843_1"
+    current_dir = document_dir / "current"
+    current_dir.mkdir(parents=True)
+    (current_dir / "getclinrec.json").write_bytes(raw)
+    write_json(
+        current_dir / "manifest.json",
+        manifest_for_raw_json(
+            code_version="843_1",
+            code=843,
+            version=1,
+            status=0,
+            source="GetClinrec2",
+            http_status=200,
+            content_type="application/json",
+            raw_content=raw,
+            validation="valid",
+            catalog_source_record_id=9999,
+            document_db_id=1737,
+        ),
+    )
+    write_json(
+        current_dir / "catalog-record.json",
+        catalog_row("843_1", 843, 1, 0, source_record_id=9999),
+    )
+    write_json(
+        current_dir / "developers.json",
+        {
+            "catalog_developers": [],
+            "association_ids": [],
+            "resolved_associations": [],
+            "unresolved_association_ids": [],
+        },
+    )
+    write_json(
+        document_dir / "bank-manifest.json",
+        {
+            "code_version": "843_1",
+            "code": 843,
+            "version": 1,
+            "current_status": "valid",
+            "previous_status": "no_lower_version",
+            "pdf_status": "not_requested",
+        },
+    )
+
+    summary = run_bank_qa(settings)
+
+    assert summary.errors == 1
+    completeness = json.loads(summary.completeness_path.read_text("utf-8"))
+    assert completeness["identity_conflicts"] == 1
+    assert completeness["catalog_db_id_mismatch"][0]["kind"] == "identity_conflict"
+    anomalies = summary.anomalies_path.read_text("utf-8")
+    assert "catalog_db_id_mismatch" in anomalies
+
+
+def test_bank_analyze_identities_reports_duplicates_and_pairs(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    rows = [
+        catalog_row("100_1", 100, 1, 0, source_record_id=500),
+        catalog_row("101_1", 101, 1, 0, source_record_id=500),
+    ]
+    rows[0]["publish_date"] = "2024-01-01"
+    rows[1]["publish_date"] = "2024-01-02"
+    write_catalog_indexes(settings, active=rows)
+    for row in rows:
+        code_version = row["code_version"]
+        current_dir = settings.paths.data_root / "bank" / "active" / code_version / "current"
+        current_dir.mkdir(parents=True)
+        write_json(
+            current_dir / "manifest.json",
+            {
+                "code_version": code_version,
+                "catalog_source_record_id": 500,
+                "document_db_id": 500,
+                "db_id_match": True,
+            },
+        )
+
+    summary = analyze_identities(settings)
+
+    assert summary.unique_db_ids == 1
+    assert summary.duplicate_db_ids == 1
+    report = json.loads(summary.report_path.read_text("utf-8"))
+    assert report["db_id_to_many_code_versions"]["500"] == ["100_1", "101_1"]
+    assert report["catalog_document_db_id_matches"] == 2

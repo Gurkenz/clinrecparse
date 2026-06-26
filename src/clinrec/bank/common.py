@@ -38,6 +38,7 @@ class RawDocumentInfo:
     code_version: str
     code: int
     version: int
+    db_id: int | None
     name: str
     status: int | None
     adult: bool | None
@@ -265,6 +266,7 @@ def minimal_validate_raw_document(
         first_present(obj, "status", "Status"),
     )
     status = to_int(status_value)
+    db_id = to_int(first_present(payload, "db_id", "dbId", "DbId", "DB_ID"))
     sections = first_present(obj, "sections", "Sections")
 
     errors: list[str] = []
@@ -290,6 +292,7 @@ def minimal_validate_raw_document(
             code_version=expected_code_version,
             code=expected_code,
             version=expected_version,
+            db_id=db_id,
             name=name,
             status=status,
             adult=bool_or_none(
@@ -351,6 +354,8 @@ def manifest_for_raw_json(
     content_type: str,
     raw_content: bytes,
     validation: str,
+    catalog_source_record_id: int | None = None,
+    document_db_id: int | None = None,
     error: str | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
@@ -365,10 +370,38 @@ def manifest_for_raw_json(
         "sha256": sha256_bytes(raw_content),
         "downloaded_at": utc_now(),
         "validation": validation,
+        "catalog_source_record_id": catalog_source_record_id,
+        "document_db_id": document_db_id,
+        "db_id_match": ids_match(catalog_source_record_id, document_db_id),
     }
     if error:
         payload["error"] = error
     return payload
+
+
+def source_record_id_from_catalog(catalog_record: dict[str, Any]) -> int | None:
+    return to_int(
+        first_non_empty(
+            first_present(catalog_record, "source_record_id", "SourceRecordId"),
+            first_present(catalog_record, "Id", "ID", "id"),
+        )
+    )
+
+
+def catalog_record_for_bank(catalog_record: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(catalog_record)
+    source_record_id = source_record_id_from_catalog(catalog_record)
+    if source_record_id is not None:
+        normalized["source_record_id"] = source_record_id
+    for legacy_key in ("Id", "ID"):
+        normalized.pop(legacy_key, None)
+    return normalized
+
+
+def ids_match(left: int | None, right: int | None) -> bool | None:
+    if left is None or right is None:
+        return None
+    return left == right
 
 
 def refresh_bank_manifest(

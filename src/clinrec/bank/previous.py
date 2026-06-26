@@ -13,6 +13,7 @@ from clinrec.bank.common import (
     BankError,
     BankRecordFilter,
     append_checkpoint,
+    catalog_record_for_bank,
     current_dir,
     existing_manifest_matches,
     first_non_empty,
@@ -26,6 +27,7 @@ from clinrec.bank.common import (
     read_json_file,
     refresh_bank_manifest,
     selected_active_records,
+    source_record_id_from_catalog,
     string_value,
     utc_now,
 )
@@ -207,7 +209,7 @@ def check_one_previous(
     target_dir.mkdir(parents=True, exist_ok=True)
     target_path = target_dir / "getclinrec.json"
     manifest_path = target_dir / "manifest.json"
-    previous_catalog = all_catalog.get(previous_code_version, {})
+    previous_catalog = catalog_record_for_bank(all_catalog.get(previous_code_version, {}))
     previous_info = None
     previous_errors: list[str] = []
     result_status = "checked"
@@ -287,6 +289,8 @@ def check_one_previous(
                 content_type=result.content_type,
                 raw_content=result.raw_content,
                 validation="valid",
+                catalog_source_record_id=source_record_id_from_catalog(previous_catalog),
+                document_db_id=previous_info.db_id,
             ),
         )
         write_json(target_dir / "catalog-record.json", previous_catalog or None)

@@ -63,6 +63,7 @@ def run_bank_qa(settings: Any, options: BankRecordFilter | None = None) -> BankQ
     valid_catalog_records: set[str] = set()
     valid_developers: set[str] = set()
     valid_manifests: set[str] = set()
+    identity_conflicts: list[dict[str, Any]] = []
     relation_rows: list[dict[str, Any]] = []
     anomaly_rows: list[dict[str, Any]] = []
     bank_manifest_rows: list[dict[str, Any]] = []
@@ -87,6 +88,10 @@ def run_bank_qa(settings: Any, options: BankRecordFilter | None = None) -> BankQ
         if validate_bank_manifest(bank_manifest, code_version):
             valid_manifests.add(code_version)
             bank_manifest_rows.append(bank_manifest)
+        identity_issue = validate_identity_manifest(code_version, current_manifest)
+        if identity_issue is not None:
+            identity_conflicts.append(identity_issue)
+            anomaly_rows.append(identity_issue)
 
         relation = read_json_file(document_dir / "previous" / "relation.json")
         if relation:
@@ -129,6 +134,8 @@ def run_bank_qa(settings: Any, options: BankRecordFilter | None = None) -> BankQ
         "metadata_conflicts": relation_counts.get("metadata_conflict", 0),
         "previous_unavailable": relation_counts.get("previous_unavailable", 0),
         "temporary_failures": relation_counts.get("previous_temporary_failure", 0),
+        "identity_conflicts": len(identity_conflicts),
+        "catalog_db_id_mismatch": identity_conflicts,
         "missing_folders": missing_folders,
         "unexpected_folders": unexpected_folders,
         "missing_current_json": missing_current_json,
@@ -149,6 +156,7 @@ def run_bank_qa(settings: Any, options: BankRecordFilter | None = None) -> BankQ
         for condition in (
             expected != valid_catalog_records,
             expected != valid_developers,
+            bool(identity_conflicts),
         )
         if condition
     )
@@ -219,6 +227,28 @@ def validate_bank_manifest(payload: dict[str, Any], code_version: str) -> bool:
     )
 
 
+def validate_identity_manifest(
+    code_version: str,
+    manifest: dict[str, Any],
+) -> dict[str, Any] | None:
+    catalog_source_record_id = manifest.get("catalog_source_record_id")
+    document_db_id = manifest.get("document_db_id")
+    if (
+        isinstance(catalog_source_record_id, int)
+        and isinstance(document_db_id, int)
+        and catalog_source_record_id == document_db_id
+    ):
+        return None
+    return {
+        "code": "catalog_db_id_mismatch",
+        "kind": "identity_conflict",
+        "code_version": code_version,
+        "catalog_source_record_id": catalog_source_record_id,
+        "document_db_id": document_db_id,
+        "db_id_match": manifest.get("db_id_match"),
+    }
+
+
 def render_completeness_markdown(completeness: dict[str, Any]) -> str:
     lines = [
         "# Bank completeness",
@@ -233,6 +263,7 @@ def render_completeness_markdown(completeness: dict[str, Any]) -> str:
         f"- metadata_conflicts: {completeness['metadata_conflicts']}",
         f"- previous_unavailable: {completeness['previous_unavailable']}",
         f"- temporary_failures: {completeness['temporary_failures']}",
+        f"- identity_conflicts: {completeness['identity_conflicts']}",
     ]
     return "\n".join(lines) + "\n"
 

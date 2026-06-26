@@ -17,6 +17,7 @@ from clinrec.api.version_discovery import DiscoveryError, DiscoveryOptions
 from clinrec.api.version_discovery import discover_versions as run_discover_versions
 from clinrec.bank.common import BankError, BankRecordFilter
 from clinrec.bank.current import download_current_documents as run_bank_download_current
+from clinrec.bank.identities import analyze_identities as run_bank_analyze_identities
 from clinrec.bank.previous import check_previous_documents as run_bank_check_previous
 from clinrec.bank.qa import run_bank_qa
 from clinrec.bank.run import run_bank_pipeline
@@ -463,6 +464,56 @@ def bank_qa(
     typer.echo(f"anomalies: {summary.anomalies_path}")
     if summary.fatal or summary.errors:
         raise typer.Exit(1)
+
+
+@app.command("bank-analyze-identities")
+def bank_analyze_identities(
+    config: ConfigOption = DEFAULT_CONFIG_PATH,
+    code_version: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--code-version",
+            help="Analyze one active bank CodeVersion; can be repeated.",
+        ),
+    ] = None,
+    code: Annotated[int | None, typer.Option("--code", help="Analyze one Code only.")] = None,
+    from_code: Annotated[
+        int | None,
+        typer.Option("--from-code", help="Analyze Codes greater than or equal to this value."),
+    ] = None,
+    to_code: Annotated[
+        int | None,
+        typer.Option("--to-code", help="Analyze Codes less than or equal to this value."),
+    ] = None,
+    all_records: Annotated[
+        bool,
+        typer.Option("--all", help="Analyze every active catalog record."),
+    ] = False,
+) -> None:
+    """Analyze catalog/source db_id identity consistency without changing bank keys."""
+    settings = bootstrap(config)
+    options = BankRecordFilter(
+        code_versions=code_version,
+        code=code,
+        from_code=from_code,
+        to_code=to_code,
+        all_records=all_records or not any((code_version, code, from_code, to_code)),
+    )
+    try:
+        summary = run_bank_analyze_identities(settings, options)
+    except BankError as exc:
+        typer.echo(f"bank-analyze-identities failed: {exc}", err=True)
+        raise typer.Exit(1) from exc
+
+    typer.echo("bank-analyze-identities completed")
+    typer.echo(f"unique_db_ids: {summary.unique_db_ids}")
+    typer.echo(f"duplicate_db_ids: {summary.duplicate_db_ids}")
+    typer.echo(f"duplicate_code_versions: {summary.duplicate_code_versions}")
+    typer.echo(f"db_id_to_many_code_versions: {summary.db_id_to_many_code_versions}")
+    typer.echo(f"code_version_to_many_db_ids: {summary.code_version_to_many_db_ids}")
+    typer.echo(f"mismatches: {summary.mismatches}")
+    typer.echo(f"report: {summary.report_path}")
+    typer.echo(f"pairs: {summary.pairs_path}")
 
 
 @app.command("bank-run")

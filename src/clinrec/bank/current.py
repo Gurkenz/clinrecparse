@@ -14,6 +14,7 @@ from clinrec.bank.common import (
     BankRecordFilter,
     append_checkpoint,
     bank_references_root,
+    catalog_record_for_bank,
     compact_timestamp,
     current_dir,
     existing_manifest_matches,
@@ -27,6 +28,7 @@ from clinrec.bank.common import (
     refresh_bank_manifest,
     selected_active_records,
     sha256_bytes,
+    source_record_id_from_catalog,
     string_value,
     utc_now,
     write_jsonl,
@@ -187,12 +189,25 @@ def download_one_current(
     target_path = target_dir / "getclinrec.json"
     manifest_path = target_dir / "manifest.json"
     manifest = read_json_file(manifest_path)
+    bank_catalog_record = catalog_record_for_bank(catalog_record)
+    catalog_source_record_id = source_record_id_from_catalog(bank_catalog_record)
 
     if not options.force and existing_manifest_matches(target_path, manifest):
         content = target_path.read_bytes()
         info, errors = minimal_validate_raw_document(content, expected_code_version=code_version)
         if info is not None and not errors:
-            write_current_sidecars(target_dir, catalog_record, info, nko_index)
+            write_current_sidecars(target_dir, bank_catalog_record, info, nko_index)
+            write_json(
+                manifest_path,
+                {
+                    **manifest,
+                    "catalog_source_record_id": catalog_source_record_id,
+                    "document_db_id": info.db_id,
+                    "db_id_match": catalog_source_record_id == info.db_id
+                    if catalog_source_record_id is not None and info.db_id is not None
+                    else None,
+                },
+            )
             refresh_bank_manifest(settings, code_version, current_status="valid")
             return BankDownloadDocumentSummary(
                 code_version=code_version,
@@ -215,6 +230,9 @@ def download_one_current(
                 "sha256": None,
                 "downloaded_at": utc_now(),
                 "validation": status,
+                "catalog_source_record_id": catalog_source_record_id,
+                "document_db_id": None,
+                "db_id_match": None,
                 "error": result.message,
             },
         )
@@ -248,6 +266,7 @@ def download_one_current(
                 content_type=result.content_type,
                 raw_content=result.raw_content,
                 validation="invalid",
+                catalog_source_record_id=catalog_source_record_id,
                 error=error,
             ),
         )
@@ -273,9 +292,11 @@ def download_one_current(
             content_type=result.content_type,
             raw_content=result.raw_content,
             validation="valid",
+            catalog_source_record_id=catalog_source_record_id,
+            document_db_id=info.db_id,
         ),
     )
-    write_current_sidecars(target_dir, catalog_record, info, nko_index)
+    write_current_sidecars(target_dir, bank_catalog_record, info, nko_index)
     refresh_bank_manifest(settings, code_version, current_status="valid")
     return BankDownloadDocumentSummary(
         code_version=code_version,

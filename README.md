@@ -14,6 +14,8 @@ be downloaded together with the JSON bank.
   `data/bank/active/{CODE_VERSION}/current/`.
 - `bank-check-previous` checks only the nearest `Version - 1` candidate.
 - `bank-qa` verifies active-bank completeness and writes bank reports.
+- `bank-analyze-identities` reports `catalog.source_record_id` / `GetClinrec2.db_id`
+  consistency, duplicate ids, and db id to `CodeVersion` pairs.
 - `bank-run` orchestrates the new raw JSON bank pipeline only.
 - `discover-versions` independently checks candidate `CodeVersion` values.
 - `download` downloads only raw `GetClinrec2` JSON.
@@ -54,6 +56,7 @@ For an intentional full active-bank JSON run:
 clinrec bank-sync-catalog
 clinrec bank-download-current --all
 clinrec bank-check-previous --all
+clinrec bank-analyze-identities
 clinrec bank-qa
 ```
 
@@ -86,6 +89,11 @@ The active raw JSON bank lives under `data/bank/active/{CODE_VERSION}/` and does
 create `parsed/`, `assets/`, `content.md`, `document.json`, or `search_chunks.jsonl`.
 Mass PDF download is intentionally outside the bank; bank manifests record
 `pdf_status: not_requested`.
+
+The bank folder key remains `CodeVersion`. `db_id` from raw `GetClinrec2` and
+`source_record_id` from the catalog are stored in manifests as strong identity checks
+only; they are not used as the only lifecycle key until full-corpus identity statistics
+are reviewed.
 
 ## Development Checks
 
