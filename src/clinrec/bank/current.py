@@ -5,35 +5,29 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from pydantic import ValidationError
-
-from clinrec.api.catalog_sync import validate_reference_organizations, write_json
+from clinrec.api.catalog_sync import write_json
 from clinrec.api.client import ClinrecApiClient, JsonPayloadResult
 from clinrec.bank.common import (
     BankError,
     BankRecordFilter,
+    add_catalog_status_fields,
     append_checkpoint,
-    bank_references_root,
     catalog_record_for_bank,
     compact_timestamp,
     current_dir,
     existing_manifest_matches,
-    first_present,
-    list_value,
     load_catalog_records,
     manifest_for_raw_json,
     minimal_validate_raw_document,
+    parse_code_version_or_raise,
     read_json_file,
-    read_jsonl,
     refresh_bank_manifest,
     selected_active_records,
-    sha256_bytes,
     source_record_id_from_catalog,
     string_value,
     utc_now,
-    write_jsonl,
 )
-from clinrec.models.external import ExternalApiError, NkoListResponse, ReferenceOrganization
+from clinrec.models.external import ExternalApiError
 
 
 @dataclass(frozen=True)
@@ -62,6 +56,8 @@ def download_current_documents(
     settings: Any,
     client: ClinrecApiClient | None,
     options: BankRecordFilter,
+    *,
+    destination_root: Path | None = None,
 ) -> BankDownloadSummary:
     timestamp = compact_timestamp(options.timestamp)
     records = selected_active_records(settings, options)
@@ -80,12 +76,17 @@ def download_current_documents(
     if client is None:
         raise BankError("HTTP client is required unless --dry-run is used.")
 
-    nko_index_path, nko_index = ensure_bank_references(settings, client, force=options.force)
     documents: list[BankDownloadDocumentSummary] = []
     for record in records:
         code_version = string_value(record.get("code_version"))
         try:
-            document = download_one_current(settings, client, record, nko_index, options)
+            document = download_one_current(
+                settings,
+                client,
+                record,
+                options,
+                destination_root=destination_root,
+            )
         except (KeyboardInterrupt, SystemExit):
             raise
         except Exception as exc:
@@ -116,75 +117,22 @@ def download_current_documents(
         dry_run=False,
         documents=documents,
         candidates_preview=preview,
-        references_index_path=nko_index_path,
+        references_index_path=None,
     )
-
-
-def ensure_bank_references(
-    settings: Any,
-    client: ClinrecApiClient,
-    *,
-    force: bool,
-) -> tuple[Path, dict[str, dict[str, Any]]]:
-    references_dir = bank_references_root(settings)
-    raw_path = references_dir / "getnkolist.json"
-    index_path = references_dir / "nko.jsonl"
-    if not force and raw_path.exists() and index_path.exists():
-        return index_path, nko_rows_by_id(read_jsonl(index_path))
-
-    result = client.fetch_nko_list_payload()
-    if isinstance(result, ExternalApiError):
-        raise BankError(f"GetNkoList failed: {result.message}")
-    raw_path.parent.mkdir(parents=True, exist_ok=True)
-    raw_path.write_bytes(result.raw_content)
-    try:
-        response = NkoListResponse.model_validate(result.payload)
-    except ValidationError as exc:
-        raise BankError(f"GetNkoList response validation failed: {exc.errors()}") from exc
-
-    organizations = [
-        ReferenceOrganization(
-            id=item.id,
-            name=item.name,
-            short_name=item.short_name,
-            raw_short_name=item.raw_short_name,
-            engname=item.engname,
-            engshortname=item.engshortname,
-            profile=item.profile,
-            url=item.url,
-        )
-        for item in response.d.data
-    ]
-    issues = validate_reference_organizations(organizations)
-    rows = [organization.model_dump(mode="json") for organization in organizations]
-    write_jsonl(index_path, rows)
-    write_json(
-        references_dir / "manifest.json",
-        {
-            "source": "GetNkoList",
-            "http_status": result.status_code,
-            "content_type": result.content_type,
-            "size": len(result.raw_content),
-            "sha256": sha256_bytes(result.raw_content),
-            "downloaded_at": utc_now(),
-            "records": len(rows),
-            "issues": [issue.model_dump(mode="json") for issue in issues],
-        },
-    )
-    return index_path, nko_rows_by_id(rows)
 
 
 def download_one_current(
     settings: Any,
     client: ClinrecApiClient,
     catalog_record: dict[str, Any],
-    nko_index: dict[str, dict[str, Any]],
     options: BankRecordFilter,
+    *,
+    destination_root: Path | None = None,
 ) -> BankDownloadDocumentSummary:
     code_version = string_value(catalog_record.get("code_version"))
     if not code_version:
         raise BankError("Catalog record does not contain code_version")
-    target_dir = current_dir(settings, code_version)
+    target_dir = target_current_dir(settings, code_version, destination_root)
     target_dir.mkdir(parents=True, exist_ok=True)
     target_path = target_dir / "getclinrec.json"
     manifest_path = target_dir / "manifest.json"
@@ -196,19 +144,29 @@ def download_one_current(
         content = target_path.read_bytes()
         info, errors = minimal_validate_raw_document(content, expected_code_version=code_version)
         if info is not None and not errors:
-            write_current_sidecars(target_dir, bank_catalog_record, info, nko_index)
+            write_current_sidecars(target_dir, bank_catalog_record, info)
             write_json(
                 manifest_path,
-                {
-                    **manifest,
-                    "catalog_source_record_id": catalog_source_record_id,
-                    "document_db_id": info.db_id,
-                    "db_id_match": catalog_source_record_id == info.db_id
-                    if catalog_source_record_id is not None and info.db_id is not None
-                    else None,
-                },
+                add_catalog_status_fields(
+                    {
+                        **manifest,
+                        "catalog_source_record_id": catalog_source_record_id,
+                        "document_db_id": info.db_id,
+                        "db_id_match": catalog_source_record_id == info.db_id
+                        if catalog_source_record_id is not None and info.db_id is not None
+                        else None,
+                    },
+                    bank_catalog_record,
+                    info.payload,
+                ),
             )
-            refresh_bank_manifest(settings, code_version, current_status="valid")
+            write_bank_manifest(
+                settings,
+                code_version,
+                target_dir.parent,
+                "valid",
+                destination_root,
+            )
             return BankDownloadDocumentSummary(
                 code_version=code_version,
                 document_dir=target_dir.parent,
@@ -221,22 +179,25 @@ def download_one_current(
         status = "circuit_open" if result.kind.value == "circuit_open" else "failed"
         write_json(
             manifest_path,
-            {
-                "code_version": code_version,
-                "source": "GetClinrec2",
-                "http_status": result.status_code,
-                "content_type": result.content_type,
-                "size": 0,
-                "sha256": None,
-                "downloaded_at": utc_now(),
-                "validation": status,
-                "catalog_source_record_id": catalog_source_record_id,
-                "document_db_id": None,
-                "db_id_match": None,
-                "error": result.message,
-            },
+            add_catalog_status_fields(
+                {
+                    "code_version": code_version,
+                    "source": "GetClinrec2",
+                    "http_status": result.status_code,
+                    "content_type": result.content_type,
+                    "size": 0,
+                    "sha256": None,
+                    "downloaded_at": utc_now(),
+                    "validation": status,
+                    "catalog_source_record_id": catalog_source_record_id,
+                    "document_db_id": None,
+                    "db_id_match": None,
+                    "error": result.message,
+                },
+                bank_catalog_record,
+            ),
         )
-        refresh_bank_manifest(settings, code_version, current_status=status)
+        write_bank_manifest(settings, code_version, target_dir.parent, status, destination_root)
         return BankDownloadDocumentSummary(
             code_version=code_version,
             document_dir=target_dir.parent,
@@ -256,21 +217,24 @@ def download_one_current(
         error = "; ".join(errors)
         write_json(
             manifest_path,
-            manifest_for_raw_json(
-                code_version=code_version,
-                code=int(catalog_record.get("code") or 0),
-                version=int(catalog_record.get("version") or 0),
-                status=None,
-                source="GetClinrec2",
-                http_status=result.status_code,
-                content_type=result.content_type,
-                raw_content=result.raw_content,
-                validation="invalid",
-                catalog_source_record_id=catalog_source_record_id,
-                error=error,
+            add_catalog_status_fields(
+                manifest_for_raw_json(
+                    code_version=code_version,
+                    code=int(catalog_record.get("code") or 0),
+                    version=int(catalog_record.get("version") or 0),
+                    status=None,
+                    source="GetClinrec2",
+                    http_status=result.status_code,
+                    content_type=result.content_type,
+                    raw_content=result.raw_content,
+                    validation="invalid",
+                    catalog_source_record_id=catalog_source_record_id,
+                    error=error,
+                ),
+                bank_catalog_record,
             ),
         )
-        refresh_bank_manifest(settings, code_version, current_status="invalid")
+        write_bank_manifest(settings, code_version, target_dir.parent, "invalid", destination_root)
         return BankDownloadDocumentSummary(
             code_version=code_version,
             document_dir=target_dir.parent,
@@ -279,25 +243,46 @@ def download_one_current(
             error=error,
         )
 
+    history_path = preserve_silent_source_change(
+        settings,
+        target_path,
+        result.raw_content,
+        code_version,
+        options.force,
+    )
     part_path.replace(target_path)
     write_json(
         manifest_path,
-        manifest_for_raw_json(
-            code_version=code_version,
-            code=info.code,
-            version=info.version,
-            status=info.status,
-            source="GetClinrec2",
-            http_status=result.status_code,
-            content_type=result.content_type,
-            raw_content=result.raw_content,
-            validation="valid",
-            catalog_source_record_id=catalog_source_record_id,
-            document_db_id=info.db_id,
+        add_catalog_status_fields(
+            {
+                **manifest_for_raw_json(
+                    code_version=code_version,
+                    code=info.code,
+                    version=info.version,
+                    status=info.status,
+                    source="GetClinrec2",
+                    http_status=result.status_code,
+                    content_type=result.content_type,
+                    raw_content=result.raw_content,
+                    validation="valid",
+                    catalog_source_record_id=catalog_source_record_id,
+                    document_db_id=info.db_id,
+                ),
+                **(
+                    {
+                        "silent_source_change": True,
+                        "previous_raw_path": history_path.as_posix(),
+                    }
+                    if history_path is not None
+                    else {}
+                ),
+            },
+            bank_catalog_record,
+            info.payload,
         ),
     )
-    write_current_sidecars(target_dir, bank_catalog_record, info, nko_index)
-    refresh_bank_manifest(settings, code_version, current_status="valid")
+    write_current_sidecars(target_dir, bank_catalog_record, info)
+    write_bank_manifest(settings, code_version, target_dir.parent, "valid", destination_root)
     return BankDownloadDocumentSummary(
         code_version=code_version,
         document_dir=target_dir.parent,
@@ -310,27 +295,9 @@ def write_current_sidecars(
     target_dir: Path,
     catalog_record: dict[str, Any],
     info: Any,
-    nko_index: dict[str, dict[str, Any]],
 ) -> None:
+    _ = info
     write_json(target_dir / "catalog-record.json", catalog_record)
-    association_ids = info.association_ids
-    resolved: list[dict[str, Any]] = []
-    unresolved: list[Any] = []
-    for association_id in association_ids:
-        row = nko_index.get(str(association_id))
-        if row is None:
-            unresolved.append(association_id)
-        else:
-            resolved.append(row)
-    write_json(
-        target_dir / "developers.json",
-        {
-            "catalog_developers": list_value(catalog_record.get("developers")),
-            "association_ids": association_ids,
-            "resolved_associations": resolved,
-            "unresolved_association_ids": unresolved,
-        },
-    )
 
 
 def failed_current_summary(
@@ -361,13 +328,76 @@ def failed_current_summary(
     )
 
 
-def nko_rows_by_id(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
-    result: dict[str, dict[str, Any]] = {}
-    for row in rows:
-        organization_id = first_present(row, "id", "Id", "ID")
-        if organization_id is not None:
-            result[str(organization_id)] = row
-    return result
+def target_current_dir(
+    settings: Any,
+    code_version: str,
+    destination_root: Path | None,
+) -> Path:
+    if destination_root is None:
+        return current_dir(settings, code_version)
+    return destination_root / code_version / "current"
+
+
+def write_bank_manifest(
+    settings: Any,
+    code_version: str,
+    document_dir: Path,
+    current_status: str,
+    destination_root: Path | None,
+) -> None:
+    if destination_root is None:
+        refresh_bank_manifest(settings, code_version, current_status=current_status)
+        return
+    code, version = parse_code_version_or_raise(code_version)
+    write_json(
+        document_dir / "bank-manifest.json",
+        {
+            "code_version": code_version,
+            "code": code,
+            "version": version,
+            "current_status": current_status,
+            "previous_status": "not_checked",
+            "pdf_status": "not_requested",
+            "updated_at": utc_now(),
+        },
+    )
+
+
+def preserve_silent_source_change(
+    settings: Any,
+    target_path: Path,
+    new_content: bytes,
+    code_version: str,
+    force: bool,
+) -> Path | None:
+    if not force or not target_path.exists():
+        return None
+    old_content = target_path.read_bytes()
+    if old_content == new_content:
+        return None
+    old_info, old_errors = minimal_validate_raw_document(
+        old_content,
+        expected_code_version=code_version,
+    )
+    new_info, new_errors = minimal_validate_raw_document(
+        new_content,
+        expected_code_version=code_version,
+    )
+    if old_info is None or new_info is None or old_errors or new_errors:
+        return None
+    if old_info.db_id != new_info.db_id or old_info.code_version != new_info.code_version:
+        return None
+    history_path = (
+        settings.paths.data_root
+        / "bank"
+        / "history"
+        / code_version
+        / compact_timestamp()
+        / "getclinrec.json"
+    )
+    history_path.parent.mkdir(parents=True, exist_ok=True)
+    history_path.write_bytes(old_content)
+    return Path(history_path)
 
 
 def raw_result_from_fixture(

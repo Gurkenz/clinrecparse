@@ -25,6 +25,11 @@ concurrency:
 discovery:
   unavailable_retry_ttl_days: 7
 
+bank:
+  max_catalog_drop_percent: 5
+  max_identity_conflicts: 0
+  require_manual_apply_on_removed: true
+
 logging:
   level: INFO
   jsonl_path: data/logs/clinrec.jsonl

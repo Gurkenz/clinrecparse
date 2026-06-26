@@ -57,6 +57,12 @@ class DiscoverySettings(BaseModel):
     unavailable_retry_ttl_days: int = Field(default=7, ge=0)
 
 
+class BankSettings(BaseModel):
+    max_catalog_drop_percent: float = Field(default=5, ge=0, le=100)
+    max_identity_conflicts: int = Field(default=0, ge=0)
+    require_manual_apply_on_removed: bool = True
+
+
 class LoggingSettings(BaseModel):
     level: str
     jsonl_path: Path
@@ -68,6 +74,7 @@ class Settings(BaseModel):
     rate_limit: RateLimitSettings
     concurrency: ConcurrencySettings
     discovery: DiscoverySettings
+    bank: BankSettings = Field(default_factory=BankSettings)
     logging: LoggingSettings
 
 

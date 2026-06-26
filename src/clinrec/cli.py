@@ -20,7 +20,23 @@ from clinrec.bank.current import download_current_documents as run_bank_download
 from clinrec.bank.identities import analyze_identities as run_bank_analyze_identities
 from clinrec.bank.previous import check_previous_documents as run_bank_check_previous
 from clinrec.bank.qa import run_bank_qa
+from clinrec.bank.reconcile import (
+    apply_update_plan as run_bank_apply_update,
+)
+from clinrec.bank.reconcile import (
+    bank_bootstrap as run_bank_bootstrap,
+)
+from clinrec.bank.reconcile import (
+    bank_update as run_bank_update,
+)
+from clinrec.bank.references import (
+    enrich_developers as run_bank_enrich_developers,
+)
+from clinrec.bank.references import (
+    update_references as run_bank_update_references,
+)
 from clinrec.bank.run import run_bank_pipeline
+from clinrec.bank.statuses import analyze_statuses as run_bank_analyze_statuses
 from clinrec.config import DEFAULT_CONFIG_PATH, Settings, ensure_data_directories, load_settings
 from clinrec.logging import configure_logging
 from clinrec.parsing.document import ParseError, ParseOptions
@@ -107,6 +123,193 @@ def bank_sync_catalog(config: ConfigOption = DEFAULT_CONFIG_PATH) -> None:
     typer.echo(f"active_index: {summary.active_index_path}")
     typer.echo(f"all_statuses_index: {summary.all_statuses_index_path}")
     typer.echo(f"qa_report: {summary.qa_report_path}")
+
+
+@app.command("bank-bootstrap")
+def bank_bootstrap(
+    config: ConfigOption = DEFAULT_CONFIG_PATH,
+    force: Annotated[
+        bool,
+        typer.Option("--force", help="Redownload documents even when local manifests are valid."),
+    ] = False,
+) -> None:
+    """Create the initial active raw-bank from the current active catalog."""
+    settings = bootstrap(config)
+    try:
+        with ClinrecApiClient(settings.http, settings.rate_limit) as client:
+            summary = run_bank_bootstrap(settings, client, force=force)
+    except (BankError, SyncError) as exc:
+        typer.echo(f"bank-bootstrap failed: {exc}", err=True)
+        raise typer.Exit(1) from exc
+
+    typer.echo("bank-bootstrap completed")
+    typer.echo(f"catalog_active_records: {summary['catalog_active_records']}")
+    typer.echo(f"downloaded: {summary['downloaded']}")
+    typer.echo(f"plan: {summary['plan']}")
+    typer.echo(f"accepted_total: {summary['accepted']['total_records']}")
+    typer.echo(f"references: {summary['references']}")
+
+
+@app.command("bank-plan-update")
+def bank_plan_update(
+    config: ConfigOption = DEFAULT_CONFIG_PATH,
+    allow_large_delta: Annotated[
+        bool,
+        typer.Option(
+            "--allow-large-delta",
+            help="Allow catalog deltas above configured thresholds.",
+        ),
+    ] = False,
+) -> None:
+    """Synchronize a fresh active catalog and write an update plan without applying it."""
+    settings = bootstrap(config)
+    try:
+        with ClinrecApiClient(settings.http, settings.rate_limit) as client:
+            summary = run_bank_update(
+                settings,
+                client,
+                apply=False,
+                allow_large_delta=allow_large_delta,
+            )
+    except (BankError, SyncError) as exc:
+        typer.echo(f"bank-plan-update failed: {exc}", err=True)
+        raise typer.Exit(1) from exc
+
+    typer.echo("bank-plan-update completed")
+    typer.echo(f"plan: {summary['plan']}")
+    typer.echo(f"requires_manual_review: {summary['requires_manual_review']}")
+
+
+@app.command("bank-apply-update")
+def bank_apply_update(
+    plan: Annotated[
+        Path,
+        typer.Option(
+            "--plan",
+            help="Path to data/bank/plans/{TIMESTAMP}/plan.json.",
+            exists=True,
+            file_okay=True,
+            dir_okay=False,
+            readable=True,
+        ),
+    ],
+    config: ConfigOption = DEFAULT_CONFIG_PATH,
+) -> None:
+    """Apply a reviewed bank update plan."""
+    settings = bootstrap(config)
+    try:
+        summary = run_bank_apply_update(settings, plan, allow_manual_review=True)
+    except BankError as exc:
+        typer.echo(f"bank-apply-update failed: {exc}", err=True)
+        raise typer.Exit(1) from exc
+
+    typer.echo("bank-apply-update completed")
+    typer.echo(f"applied: {summary.applied}")
+    typer.echo(f"moved_to_legacy: {summary.moved_to_legacy}")
+    typer.echo(f"reactivated: {summary.reactivated}")
+
+
+@app.command("bank-update")
+def bank_update(
+    config: ConfigOption = DEFAULT_CONFIG_PATH,
+    apply_update: Annotated[
+        bool,
+        typer.Option("--apply", help="Apply the generated plan after staging new documents."),
+    ] = False,
+    verify_existing: Annotated[
+        bool,
+        typer.Option(
+            "--verify-existing",
+            help="Re-fetch unchanged documents and detect raw changes.",
+        ),
+    ] = False,
+    allow_large_delta: Annotated[
+        bool,
+        typer.Option(
+            "--allow-large-delta",
+            help="Allow catalog deltas above configured thresholds.",
+        ),
+    ] = False,
+) -> None:
+    """Plan or apply an incremental active raw-bank update."""
+    settings = bootstrap(config)
+    try:
+        with ClinrecApiClient(settings.http, settings.rate_limit) as client:
+            summary = run_bank_update(
+                settings,
+                client,
+                apply=apply_update,
+                verify_existing=verify_existing,
+                allow_large_delta=allow_large_delta,
+            )
+    except (BankError, SyncError) as exc:
+        typer.echo(f"bank-update failed: {exc}", err=True)
+        raise typer.Exit(1) from exc
+
+    typer.echo("bank-update completed")
+    typer.echo(f"plan: {summary['plan']}")
+    typer.echo(f"requires_manual_review: {summary['requires_manual_review']}")
+    if apply_update:
+        typer.echo(f"applied: {summary.get('applied', 0)}")
+        typer.echo(f"moved_to_legacy: {summary.get('moved_to_legacy', 0)}")
+        typer.echo(f"reactivated: {summary.get('reactivated', 0)}")
+        typer.echo(f"qa_fatal: {summary.get('qa_fatal', 0)}")
+        typer.echo(f"qa_errors: {summary.get('qa_errors', 0)}")
+
+
+@app.command("bank-update-references")
+def bank_update_references(config: ConfigOption = DEFAULT_CONFIG_PATH) -> None:
+    """Update the NKO organization reference snapshot outside the raw download path."""
+    settings = bootstrap(config)
+    with ClinrecApiClient(settings.http, settings.rate_limit) as client:
+        summary = run_bank_update_references(settings, client)
+
+    typer.echo("bank-update-references completed")
+    typer.echo(f"report: {summary.report_path}")
+    typer.echo(f"new: {summary.new}")
+    typer.echo(f"updated: {summary.updated}")
+    typer.echo(f"missing_from_latest_reference: {summary.missing_from_latest_reference}")
+    if summary.warnings:
+        typer.echo(f"warnings: {', '.join(summary.warnings)}")
+
+
+@app.command("bank-enrich-developers")
+def bank_enrich_developers(
+    config: ConfigOption = DEFAULT_CONFIG_PATH,
+    code_version: Annotated[
+        list[str] | None,
+        typer.Option("--code-version", help="Enrich one CodeVersion; can be repeated."),
+    ] = None,
+    code: Annotated[int | None, typer.Option("--code", help="Enrich one Code only.")] = None,
+    from_code: Annotated[
+        int | None,
+        typer.Option("--from-code", help="Enrich Codes greater than or equal to this value."),
+    ] = None,
+    to_code: Annotated[
+        int | None,
+        typer.Option("--to-code", help="Enrich Codes less than or equal to this value."),
+    ] = None,
+    all_records: Annotated[
+        bool,
+        typer.Option("--all", help="Enrich every active and legacy document."),
+    ] = False,
+) -> None:
+    """Create or refresh developers.json from catalog, raw associations, and NKO index."""
+    settings = bootstrap(config)
+    options = BankRecordFilter(
+        code_versions=code_version,
+        code=code,
+        from_code=from_code,
+        to_code=to_code,
+        all_records=all_records or not any((code_version, code, from_code, to_code)),
+    )
+    summary = run_bank_enrich_developers(settings, options)
+
+    typer.echo("bank-enrich-developers completed")
+    typer.echo(f"documents: {summary.documents}")
+    typer.echo(f"updated: {summary.updated}")
+    typer.echo(f"unresolved: {summary.unresolved}")
+    typer.echo(f"reference_status: {summary.reference_status}")
 
 
 @app.command("sync-references")
@@ -514,6 +717,21 @@ def bank_analyze_identities(
     typer.echo(f"mismatches: {summary.mismatches}")
     typer.echo(f"report: {summary.report_path}")
     typer.echo(f"pairs: {summary.pairs_path}")
+
+
+@app.command("bank-analyze-statuses")
+def bank_analyze_statuses(config: ConfigOption = DEFAULT_CONFIG_PATH) -> None:
+    """Count raw catalog/document status values without interpreting them."""
+    settings = bootstrap(config)
+    summary = run_bank_analyze_statuses(settings)
+
+    typer.echo("bank-analyze-statuses completed")
+    typer.echo(f"active_catalog_records: {summary.active_catalog_records}")
+    typer.echo(f"all_statuses_catalog_records: {summary.all_statuses_catalog_records}")
+    typer.echo(f"documents: {summary.documents}")
+    typer.echo(f"report: {summary.report_path}")
+    typer.echo(f"csv: {summary.csv_path}")
+    typer.echo(f"transitions: {summary.transitions_path}")
 
 
 @app.command("bank-run")

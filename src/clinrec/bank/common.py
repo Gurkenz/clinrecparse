@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
+import unicodedata
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -67,6 +69,26 @@ def bank_active_root(settings: Settings) -> Path:
     return bank_root(settings) / "active"
 
 
+def bank_legacy_root(settings: Settings) -> Path:
+    return bank_root(settings) / "legacy"
+
+
+def bank_staging_root(settings: Settings) -> Path:
+    return bank_root(settings) / "staging"
+
+
+def bank_state_root(settings: Settings) -> Path:
+    return bank_root(settings) / "state"
+
+
+def bank_plans_root(settings: Settings) -> Path:
+    return bank_root(settings) / "plans"
+
+
+def bank_history_root(settings: Settings) -> Path:
+    return bank_root(settings) / "history"
+
+
 def bank_references_root(settings: Settings) -> Path:
     return bank_root(settings) / "references"
 
@@ -81,6 +103,10 @@ def bank_checkpoints_root(settings: Settings) -> Path:
 
 def bank_document_root(settings: Settings, code_version: str) -> Path:
     return bank_active_root(settings) / code_version
+
+
+def legacy_document_root(settings: Settings, code_version: str) -> Path:
+    return bank_legacy_root(settings) / code_version
 
 
 def current_dir(settings: Settings, code_version: str) -> Path:
@@ -102,6 +128,10 @@ def previous_candidate_dir(
 def catalog_index_path(settings: Settings, *, active: bool) -> Path:
     name = "catalog-active.jsonl" if active else "catalog-all-statuses.jsonl"
     return settings.paths.indexes / name
+
+
+def accepted_catalog_path(settings: Settings) -> Path:
+    return bank_state_root(settings) / "accepted-catalog.json"
 
 
 def read_json_file(path: Path) -> dict[str, Any]:
@@ -363,6 +393,11 @@ def manifest_for_raw_json(
         "code": code,
         "version": version,
         "status": status,
+        "catalog_status_raw": None,
+        "document_status_raw": status,
+        "apply_status_raw": None,
+        "apply_status_calculated_raw": None,
+        "status_interpretation": "unknown",
         "source": source,
         "http_status": http_status,
         "content_type": content_type,
@@ -376,6 +411,37 @@ def manifest_for_raw_json(
     }
     if error:
         payload["error"] = error
+    return payload
+
+
+def add_catalog_status_fields(
+    manifest: dict[str, Any],
+    catalog_record: dict[str, Any],
+    raw_payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    payload = dict(manifest)
+    raw = raw_payload or {}
+    raw_obj = mapping_value(first_present(raw, "obj", "Obj", "data", "Data"))
+    payload["catalog_status_raw"] = first_non_empty(
+        first_present(catalog_record, "status", "Status"),
+        first_present(catalog_record, "catalog_status_raw"),
+    )
+    payload["document_status_raw"] = first_non_empty(
+        first_present(raw, "status", "Status"),
+        first_present(raw_obj, "status", "Status"),
+        payload.get("document_status_raw"),
+    )
+    payload["apply_status_raw"] = first_non_empty(
+        first_present(catalog_record, "apply_status", "ApplyStatus"),
+        first_present(raw, "apply_status", "ApplyStatus"),
+        first_present(raw_obj, "apply_status", "ApplyStatus"),
+    )
+    payload["apply_status_calculated_raw"] = first_non_empty(
+        first_present(catalog_record, "apply_status_calculated", "ApplyStatusCalculated"),
+        first_present(raw, "apply_status_calculated", "ApplyStatusCalculated"),
+        first_present(raw_obj, "apply_status_calculated", "ApplyStatusCalculated"),
+    )
+    payload["status_interpretation"] = "unknown"
     return payload
 
 
@@ -396,6 +462,21 @@ def catalog_record_for_bank(catalog_record: dict[str, Any]) -> dict[str, Any]:
     for legacy_key in ("Id", "ID"):
         normalized.pop(legacy_key, None)
     return normalized
+
+
+def normalize_title(value: Any) -> str:
+    text = unicodedata.normalize("NFKC", string_value(value))
+    for quote in ("\u00ab", "\u00bb", "\u201c", "\u201d", "\u201e", "\u201f"):
+        text = text.replace(quote, '"')
+    text = re.sub(r"\s+", " ", text).strip().casefold()
+    return text[:-1] if text.endswith(".") else text
+
+
+def relative_to_data_root(settings: Settings, path: Path) -> str:
+    try:
+        return path.resolve().relative_to(settings.paths.data_root.resolve()).as_posix()
+    except ValueError:
+        return path.as_posix()
 
 
 def ids_match(left: int | None, right: int | None) -> bool | None:

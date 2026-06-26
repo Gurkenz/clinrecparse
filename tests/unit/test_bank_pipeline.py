@@ -8,7 +8,11 @@ from clinrec.api.catalog_sync import write_json
 from clinrec.api.client import JsonPayloadResult
 from clinrec.bank.common import (
     BankRecordFilter,
+    accepted_catalog_path,
+    bank_active_root,
+    bank_legacy_root,
     manifest_for_raw_json,
+    read_jsonl,
     sha256_bytes,
     write_jsonl,
 )
@@ -16,6 +20,14 @@ from clinrec.bank.current import download_current_documents
 from clinrec.bank.identities import analyze_identities
 from clinrec.bank.previous import check_previous_documents, relation_status_for_error
 from clinrec.bank.qa import run_bank_qa
+from clinrec.bank.reconcile import (
+    accept_current_catalog,
+    apply_update_plan,
+    build_update_plan,
+    reconcile_catalogs,
+)
+from clinrec.bank.references import enrich_developers, update_references
+from clinrec.bank.statuses import analyze_statuses
 from clinrec.config import (
     ConcurrencySettings,
     DiscoverySettings,
@@ -177,13 +189,16 @@ def test_bank_download_current_preserves_raw_and_creates_no_parsed_outputs(
     assert not (document_dir / "current" / "document.json").exists()
     assert not (document_dir / "current" / "search_chunks.jsonl").exists()
     assert (document_dir / "current" / "catalog-record.json").exists()
-    assert (document_dir / "current" / "developers.json").exists()
+    assert not (document_dir / "current" / "developers.json").exists()
     manifest = json.loads((document_dir / "current" / "manifest.json").read_text("utf-8"))
     assert manifest["validation"] == "valid"
     assert manifest["sha256"] == sha256_bytes(raw)
     assert manifest["catalog_source_record_id"] == 1737
     assert manifest["document_db_id"] == 1737
     assert manifest["db_id_match"] is True
+    assert manifest["catalog_status_raw"] == 0
+    assert manifest["document_status_raw"] == 0
+    assert manifest["status_interpretation"] == "unknown"
     catalog_record = json.loads(
         (document_dir / "current" / "catalog-record.json").read_text("utf-8")
     )
@@ -235,7 +250,7 @@ def test_bank_download_current_uses_real_773_2_fixture_byte_for_byte(
     assert manifest["document_db_id"] == 2191
     assert manifest["db_id_match"] is True
     assert (document_dir / "current" / "catalog-record.json").exists()
-    assert (document_dir / "current" / "developers.json").exists()
+    assert not (document_dir / "current" / "developers.json").exists()
     assert not (document_dir / "parsed").exists()
     assert not (document_dir / "assets").exists()
     assert previous_preview.candidates_preview == ["773_1"]
@@ -386,6 +401,7 @@ def test_bank_qa_writes_completeness_reports(tmp_path: Path) -> None:
             "pdf_status": "not_requested",
         },
     )
+    accept_current_catalog(settings, timestamp="20260101T000000Z")
 
     summary = run_bank_qa(settings)
 
@@ -393,8 +409,13 @@ def test_bank_qa_writes_completeness_reports(tmp_path: Path) -> None:
     assert summary.errors == 0
     completeness = json.loads(summary.completeness_path.read_text("utf-8"))
     assert completeness["expected_unique"] == 1
+    assert completeness["active_expected"] == 1
+    assert completeness["active_present"] == 1
+    assert completeness["reference_status"] == "missing_optional"
     assert completeness["valid_current_json"] == 1
     assert completeness["identity_conflicts"] == 0
+    assert summary.completeness_path.parent.parent.name == "full"
+    assert (settings.paths.data_root / "bank" / "reports" / "latest-full.json").exists()
 
 
 def test_bank_qa_reports_catalog_db_id_mismatch(tmp_path: Path) -> None:
@@ -448,6 +469,7 @@ def test_bank_qa_reports_catalog_db_id_mismatch(tmp_path: Path) -> None:
             "pdf_status": "not_requested",
         },
     )
+    accept_current_catalog(settings, timestamp="20260101T000000Z")
 
     summary = run_bank_qa(settings)
 
@@ -457,6 +479,259 @@ def test_bank_qa_reports_catalog_db_id_mismatch(tmp_path: Path) -> None:
     assert completeness["catalog_db_id_mismatch"][0]["kind"] == "identity_conflict"
     anomalies = summary.anomalies_path.read_text("utf-8")
     assert "catalog_db_id_mismatch" in anomalies
+
+
+def test_bank_reconcile_categories_and_identity_conflicts(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    previous = [
+        catalog_row("100_1", 100, 1, 0, source_record_id=1),
+        catalog_row("200_1", 200, 1, 0, source_record_id=2),
+        catalog_row("300_1", 300, 1, 0, source_record_id=3),
+    ]
+    current = [
+        catalog_row("100_1", 100, 1, 0, source_record_id=1),
+        catalog_row("200_1", 200, 1, 0, source_record_id=2),
+        catalog_row("400_1", 400, 1, 0, source_record_id=4),
+        catalog_row("500_1", 500, 1, 0, source_record_id=2),
+        catalog_row("600_2", 600, 1, 0, source_record_id=6),
+    ]
+    current[1]["name"] = "Fixture 200_1 changed"
+    (bank_active_root(settings) / "100_1").mkdir(parents=True)
+    (bank_active_root(settings) / "200_1").mkdir(parents=True)
+    (bank_legacy_root(settings) / "400_1").mkdir(parents=True)
+
+    plan = reconcile_catalogs(settings, previous, current)
+
+    assert "100_1" in plan["unchanged"]
+    assert "200_1" in plan["metadata_changed"]
+    assert "400_1" in plan["added"]
+    assert "300_1" in plan["removed_from_catalog"]
+    assert "400_1" in plan["reactivated"]
+    assert "500_1" in plan["missing_locally"]
+    assert {issue["code"] for issue in plan["identity_conflicts"]} >= {
+        "source_record_id_multiple_code_versions",
+        "code_version_mismatch",
+    }
+
+
+def test_bank_plan_large_drop_requires_review(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    previous = [
+        catalog_row(f"{code}_1", code, 1, 0, source_record_id=code)
+        for code in range(100, 110)
+    ]
+    write_catalog_indexes(settings, active=previous[:7])
+    accepted_records = (
+        settings.paths.data_root / "bank" / "state" / "accepted-catalog-records.jsonl"
+    )
+    write_jsonl(accepted_records, previous)
+
+    summary = build_update_plan(settings, timestamp="20260101T000000Z")
+    plan = json.loads(summary.plan_path.read_text("utf-8"))
+
+    assert summary.requires_manual_review is True
+    assert "catalog_change_requires_manual_review" in plan["warnings"]
+
+
+def test_bank_apply_moves_removed_to_legacy_and_reactivates(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    write_catalog_indexes(settings, active=[catalog_row("200_1", 200, 1, 0)])
+    active_doc = bank_active_root(settings) / "100_1"
+    legacy_doc = bank_legacy_root(settings) / "200_1"
+    active_doc.mkdir(parents=True)
+    legacy_doc.mkdir(parents=True)
+    plan_dir = settings.paths.data_root / "bank" / "plans" / "20260101T000000Z"
+    plan_path = plan_dir / "plan.json"
+    write_json(
+        plan_path,
+        {
+            "timestamp": "20260101T000000Z",
+            "removed_from_catalog": ["100_1"],
+            "removed": ["100_1"],
+            "reactivated": ["200_1"],
+            "added": [],
+            "missing_locally": [],
+            "requires_manual_review": True,
+            "replacement_candidates": {},
+        },
+    )
+
+    summary = apply_update_plan(settings, plan_path, allow_manual_review=True)
+
+    assert summary.moved_to_legacy == 1
+    assert summary.reactivated == 1
+    assert (bank_legacy_root(settings) / "100_1" / "lifecycle.json").exists()
+    assert (bank_active_root(settings) / "200_1").exists()
+    assert accepted_catalog_path(settings).exists()
+
+
+def test_bank_update_references_failure_does_not_raise(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+
+    class Client:
+        def fetch_nko_list_payload(self) -> ExternalApiError:
+            return ExternalApiError(
+                endpoint="GetNkoList",
+                kind=ApiErrorKind.HTTP_STATUS,
+                message="Service unavailable",
+                status_code=503,
+            )
+
+    summary = update_references(settings, Client())  # type: ignore[arg-type]
+
+    assert summary.warnings == ["nko_fetch_failed"]
+    assert summary.report_path.exists()
+
+
+def test_bank_update_references_tracks_updated_and_missing_orgs(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    history_path = settings.paths.data_root / "bank" / "references" / "nko-history.jsonl"
+    current_path = settings.paths.data_root / "bank" / "references" / "nko-current.jsonl"
+    write_jsonl(
+        history_path,
+        [
+            {
+                "nko_id": "1",
+                "first_seen_at": "2025-01-01T00:00:00Z",
+                "last_seen_at": "2025-01-01T00:00:00Z",
+                "missing_from_latest": False,
+                "raw_current": {"id": 1, "name": "Old"},
+                "previous_values": [],
+            },
+            {
+                "nko_id": "2",
+                "first_seen_at": "2025-01-01T00:00:00Z",
+                "last_seen_at": "2025-01-01T00:00:00Z",
+                "missing_from_latest": False,
+                "raw_current": {"id": 2, "name": "Gone"},
+                "previous_values": [],
+            },
+        ],
+    )
+    write_jsonl(current_path, [{"id": 1, "name": "Old"}, {"id": 2, "name": "Gone"}])
+    payload = {"d": {"data": [{"id": 1, "name": "New"}]}}
+    raw = json.dumps(payload).encode("utf-8")
+
+    class Client:
+        def fetch_nko_list_payload(self) -> JsonPayloadResult:
+            return JsonPayloadResult(
+                endpoint="GetNkoList",
+                status_code=200,
+                content_type="application/json",
+                payload=payload,
+                raw_content=raw,
+                response_size_bytes=len(raw),
+                duration_seconds=0,
+            )
+
+    summary = update_references(settings, Client())  # type: ignore[arg-type]
+    history = {row["nko_id"]: row for row in read_jsonl(history_path)}
+
+    assert summary.updated == 1
+    assert summary.missing_from_latest_reference == 1
+    assert history["2"]["missing_from_latest"] is True
+
+
+def test_bank_enrich_developers_resolves_nko_after_download(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    write_catalog_indexes(settings, active=[catalog_row("843_1", 843, 1, 0)])
+    write_jsonl(
+        settings.paths.data_root / "bank" / "references" / "nko-current.jsonl",
+        [{"id": 10, "name": "Association"}],
+    )
+    raw = document_bytes("843_1", code=843, version=1, status=0)
+    current_root = bank_active_root(settings) / "843_1" / "current"
+    current_root.mkdir(parents=True)
+    (current_root / "getclinrec.json").write_bytes(raw)
+    write_json(current_root / "catalog-record.json", catalog_row("843_1", 843, 1, 0))
+
+    summary = enrich_developers(settings, BankRecordFilter(all_records=True))
+    developers = json.loads((current_root / "developers.json").read_text("utf-8"))
+
+    assert summary.updated == 1
+    assert developers["resolved_associations"][0]["name"] == "Association"
+
+
+def test_bank_analyze_statuses_preserves_raw_values(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    write_catalog_indexes(
+        settings,
+        active=[catalog_row("100_1", 100, 1, 7)],
+        all_statuses=[
+            catalog_row("100_1", 100, 1, 7),
+            catalog_row("100_2", 100, 2, 9),
+        ],
+    )
+    current_root = bank_active_root(settings) / "100_1" / "current"
+    current_root.mkdir(parents=True)
+    write_json(
+        current_root / "manifest.json",
+        {
+            "catalog_status_raw": 7,
+            "document_status_raw": 4,
+            "apply_status_raw": None,
+            "apply_status_calculated_raw": 1,
+        },
+    )
+
+    summary = analyze_statuses(settings)
+    report = json.loads(summary.report_path.read_text("utf-8"))
+
+    assert report["status_interpretation"] == "unknown"
+    assert report["catalog_status_frequency_active"]["7"] == 1
+    assert report["document_status_frequency"]["4"] == 1
+
+
+def test_bank_qa_scoped_does_not_overwrite_latest_full(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    write_catalog_indexes(settings, active=[catalog_row("843_1", 843, 1, 0)])
+    raw = (FIXTURES / "clinrec_843_1_real_shape.json").read_bytes()
+    document_dir = bank_active_root(settings) / "843_1"
+    current_root = document_dir / "current"
+    current_root.mkdir(parents=True)
+    (current_root / "getclinrec.json").write_bytes(raw)
+    write_json(
+        current_root / "manifest.json",
+        manifest_for_raw_json(
+            code_version="843_1",
+            code=843,
+            version=1,
+            status=0,
+            source="GetClinrec2",
+            http_status=200,
+            content_type="application/json",
+            raw_content=raw,
+            validation="valid",
+            catalog_source_record_id=1737,
+            document_db_id=1737,
+        ),
+    )
+    write_json(current_root / "catalog-record.json", catalog_row("843_1", 843, 1, 0))
+    write_json(
+        document_dir / "bank-manifest.json",
+        {
+            "code_version": "843_1",
+            "code": 843,
+            "version": 1,
+            "current_status": "valid",
+            "previous_status": "not_checked",
+            "pdf_status": "not_requested",
+        },
+    )
+    accept_current_catalog(settings, timestamp="20260101T000000Z")
+
+    full = run_bank_qa(settings, BankRecordFilter(all_records=True, timestamp="20260101T000000Z"))
+    latest = settings.paths.data_root / "bank" / "reports" / "latest-full.json"
+    before = latest.read_text("utf-8")
+    scoped = run_bank_qa(
+        settings,
+        BankRecordFilter(code_versions=["843_1"], timestamp="20260101T010000Z"),
+    )
+
+    assert full.fatal == 0
+    assert scoped.fatal == 0
+    assert latest.read_text("utf-8") == before
+    assert scoped.completeness_path.parent.parent.parent.name == "scoped"
 
 
 def test_bank_analyze_identities_reports_duplicates_and_pairs(tmp_path: Path) -> None:

@@ -8,11 +8,17 @@ from typing import Any
 from clinrec.api.catalog_sync import write_json
 from clinrec.bank.common import (
     BankRecordFilter,
+    accepted_catalog_path,
     bank_active_root,
     bank_document_root,
+    bank_legacy_root,
     bank_reports_root,
+    bank_root,
+    bank_staging_root,
+    compact_timestamp,
     current_dir,
     filter_catalog_records,
+    first_present,
     has_selection,
     load_catalog_records,
     minimal_validate_raw_document,
@@ -40,28 +46,37 @@ class BankQaSummary:
 
 def run_bank_qa(settings: Any, options: BankRecordFilter | None = None) -> BankQaSummary:
     effective_options = options or BankRecordFilter(all_records=True)
+    full_run = is_full_qa(effective_options)
     active_rows = load_catalog_records(settings, active=True)
     selected_rows = (
         filter_catalog_records(active_rows, effective_options)
-        if has_selection(effective_options)
+        if has_selection(effective_options) and not full_run
         else active_rows
     )
     expected = {string_value(row.get("code_version")) for row in selected_rows}
     expected.discard("")
 
     active_root = bank_active_root(settings)
-    folders = {
+    active_folders = {
         path.name
         for path in active_root.iterdir()
         if path.is_dir()
     } if active_root.exists() else set()
-    if has_selection(effective_options):
-        folders = folders & expected
+    folders = active_folders if full_run else active_folders & expected
+    legacy_folders = local_folders(bank_legacy_root(settings))
+    active_legacy_duplicates = sorted(active_folders & legacy_folders)
+    staging_root = bank_staging_root(settings)
+    staging_entries = list(staging_root.iterdir()) if staging_root.exists() else []
+    part_files = [
+        path.as_posix()
+        for path in sorted(bank_root(settings).rglob("*.part"))
+        if path.is_file()
+    ] if bank_root(settings).exists() else []
+    accepted_exists = accepted_catalog_path(settings).exists()
 
     valid_current: set[str] = set()
     failed_current: list[str] = []
     valid_catalog_records: set[str] = set()
-    valid_developers: set[str] = set()
     valid_manifests: set[str] = set()
     identity_conflicts: list[dict[str, Any]] = []
     relation_rows: list[dict[str, Any]] = []
@@ -82,8 +97,6 @@ def run_bank_qa(settings: Any, options: BankRecordFilter | None = None) -> BankQ
             code_version,
         ):
             valid_catalog_records.add(code_version)
-        if validate_developers(current_dir(settings, code_version) / "developers.json"):
-            valid_developers.add(code_version)
         bank_manifest = read_json_file(document_dir / "bank-manifest.json")
         if validate_bank_manifest(bank_manifest, code_version):
             valid_manifests.add(code_version)
@@ -116,17 +129,34 @@ def run_bank_qa(settings: Any, options: BankRecordFilter | None = None) -> BankQ
                     }
                 )
 
+    legacy_missing_lifecycle = [
+        code_version
+        for code_version in sorted(legacy_folders)
+        if not (bank_legacy_root(settings) / code_version / "lifecycle.json").exists()
+    ]
     missing_folders = sorted(expected - folders)
-    unexpected_folders = sorted(folders - expected)
+    unexpected_folders = sorted(active_folders - expected) if full_run else []
     missing_current_json = sorted(expected - valid_current)
     relation_counts = Counter(string_value(row.get("relation_status")) for row in relation_rows)
+    reference_status = (
+        "available"
+        if (settings.paths.data_root / "bank" / "references" / "nko-current.jsonl").exists()
+        else "missing_optional"
+    )
     completeness = {
         "catalog_total_records": len(active_rows),
+        "active_expected": len(expected),
+        "active_present": len(folders),
+        "legacy_count": len(legacy_folders),
+        "added": [],
+        "removed": [],
+        "reactivated": [],
+        "metadata_changed": [],
         "expected_unique": len(expected),
         "folders": len(folders),
         "valid_current_json": len(valid_current),
         "valid_catalog_records": len(valid_catalog_records),
-        "valid_developers": len(valid_developers),
+        "valid_developers": None,
         "valid_manifests": len(valid_manifests),
         "checked_previous": len(relation_rows),
         "confirmed_predecessors": relation_counts.get("confirmed_predecessor", 0),
@@ -138,8 +168,17 @@ def run_bank_qa(settings: Any, options: BankRecordFilter | None = None) -> BankQ
         "catalog_db_id_mismatch": identity_conflicts,
         "missing_folders": missing_folders,
         "unexpected_folders": unexpected_folders,
+        "unexpected_active_folders": unexpected_folders,
         "missing_current_json": missing_current_json,
         "failed_current_json": sorted(failed_current),
+        "active_legacy_duplicates": active_legacy_duplicates,
+        "staging_empty": not staging_entries,
+        "staging_entries": [path.as_posix() for path in staging_entries],
+        "part_files": part_files,
+        "accepted_catalog_exists": accepted_exists,
+        "legacy_missing_lifecycle": legacy_missing_lifecycle,
+        "reference_status": reference_status,
+        "full_run": full_run,
     }
     fatal = sum(
         1
@@ -148,6 +187,10 @@ def run_bank_qa(settings: Any, options: BankRecordFilter | None = None) -> BankQ
             bool(unexpected_folders),
             expected != valid_current,
             expected != valid_manifests,
+            bool(active_legacy_duplicates),
+            bool(staging_entries),
+            bool(part_files),
+            full_run and not accepted_exists,
         )
         if condition
     )
@@ -155,25 +198,32 @@ def run_bank_qa(settings: Any, options: BankRecordFilter | None = None) -> BankQ
         1
         for condition in (
             expected != valid_catalog_records,
-            expected != valid_developers,
             bool(identity_conflicts),
+            bool(legacy_missing_lifecycle),
         )
         if condition
     )
 
     reports_root = bank_reports_root(settings)
-    reports_root.mkdir(parents=True, exist_ok=True)
-    completeness_path = reports_root / "completeness.json"
-    report_markdown_path = reports_root / "completeness.md"
-    previous_relations_path = reports_root / "previous-relations.jsonl"
-    anomalies_path = reports_root / "anomalies.jsonl"
-    bank_manifest_path = bank_reports_root(settings).parent / "bank-manifest.jsonl"
+    report_dir = qa_report_dir(reports_root, effective_options, full_run)
+    report_dir.mkdir(parents=True, exist_ok=True)
+    completeness_path = report_dir / "completeness.json"
+    report_markdown_path = report_dir / "completeness.md"
+    previous_relations_path = report_dir / "previous-relations.jsonl"
+    anomalies_path = report_dir / "anomalies.jsonl"
+    bank_manifest_path = (
+        reports_root.parent / "bank-manifest.jsonl"
+        if full_run
+        else report_dir / "bank-manifest.jsonl"
+    )
 
     write_json(completeness_path, completeness)
     report_markdown_path.write_text(render_completeness_markdown(completeness), encoding="utf-8")
     write_jsonl(previous_relations_path, relation_rows)
     write_jsonl(anomalies_path, anomaly_rows)
     write_jsonl(bank_manifest_path, bank_manifest_rows)
+    if full_run:
+        write_json(reports_root / "latest-full.json", completeness)
 
     return BankQaSummary(
         expected=len(expected),
@@ -204,19 +254,10 @@ def validate_current_json(path: Path, manifest: dict[str, Any], code_version: st
 
 def validate_catalog_record(path: Path, code_version: str) -> bool:
     payload = read_json_file(path)
-    return payload.get("code_version") == code_version
-
-
-def validate_developers(path: Path) -> bool:
-    payload = read_json_file(path)
-    return all(
-        key in payload
-        for key in (
-            "catalog_developers",
-            "association_ids",
-            "resolved_associations",
-            "unresolved_association_ids",
-        )
+    source_record_id = first_present(payload, "source_record_id", "SourceRecordId")
+    return (
+        payload.get("code_version") == code_version
+        and source_record_id is not None
     )
 
 
@@ -254,6 +295,9 @@ def render_completeness_markdown(completeness: dict[str, Any]) -> str:
         "# Bank completeness",
         "",
         f"- catalog_total_records: {completeness['catalog_total_records']}",
+        f"- active_expected: {completeness['active_expected']}",
+        f"- active_present: {completeness['active_present']}",
+        f"- legacy_count: {completeness['legacy_count']}",
         f"- expected_unique: {completeness['expected_unique']}",
         f"- folders: {completeness['folders']}",
         f"- valid_current_json: {completeness['valid_current_json']}",
@@ -266,6 +310,35 @@ def render_completeness_markdown(completeness: dict[str, Any]) -> str:
         f"- identity_conflicts: {completeness['identity_conflicts']}",
     ]
     return "\n".join(lines) + "\n"
+
+
+def is_full_qa(options: BankRecordFilter) -> bool:
+    return options.all_records and not any(
+        (options.code_versions, options.code, options.from_code, options.to_code)
+    )
+
+
+def local_folders(root: Path) -> set[str]:
+    if not root.exists():
+        return set()
+    return {path.name for path in root.iterdir() if path.is_dir()}
+
+
+def qa_report_dir(reports_root: Path, options: BankRecordFilter, full_run: bool) -> Path:
+    timestamp = compact_timestamp(options.timestamp)
+    if full_run:
+        return reports_root / "full" / timestamp
+    return reports_root / "scoped" / qa_scope(options) / timestamp
+
+
+def qa_scope(options: BankRecordFilter) -> str:
+    if options.code_versions:
+        return "code-version-" + "-".join(sorted(options.code_versions))
+    if options.code is not None:
+        return f"code-{options.code}"
+    if options.from_code is not None or options.to_code is not None:
+        return f"code-range-{options.from_code or 'start'}-{options.to_code or 'end'}"
+    return "selection"
 
 
 def sha256(content: bytes) -> str:

@@ -10,8 +10,15 @@ be downloaded together with the JSON bank.
 
 - `sync-catalog` and `bank-sync-catalog` save raw catalog snapshots plus separate
   `catalog-active.jsonl` and `catalog-all-statuses.jsonl` indexes.
+- `bank-bootstrap` creates the initial `data/bank/active/{CODE_VERSION}` set from
+  the accepted active catalog.
+- `bank-plan-update`, `bank-apply-update`, and `bank-update --apply` reconcile the
+  accepted catalog, local `active`, local `legacy`, and staged downloads.
 - `bank-download-current` downloads byte-for-byte raw `GetClinrec2` JSON into
   `data/bank/active/{CODE_VERSION}/current/`.
+- `bank-update-references` updates the NKO reference history after raw-bank sync.
+- `bank-enrich-developers` creates `developers.json` after references are available.
+- `bank-analyze-statuses` counts raw status values without interpreting them.
 - `bank-check-previous` checks only the nearest `Version - 1` candidate.
 - `bank-qa` verifies active-bank completeness and writes bank reports.
 - `bank-analyze-identities` reports `catalog.source_record_id` / `GetClinrec2.db_id`
@@ -40,24 +47,27 @@ Pinned direct dependencies live in `pyproject.toml`. A full local lock is commit
 ## Recommended Order
 
 ```powershell
-clinrec bank-sync-catalog
-clinrec bank-download-current --code-version 843_1 --force
-clinrec bank-download-current --code-version 270_2 --force
-clinrec bank-download-current --code-version 270_3 --force
-clinrec bank-check-previous --code-version 843_1 --force
-clinrec bank-check-previous --code-version 270_3 --force
-clinrec bank-qa --code 843
-clinrec bank-qa --code 270
+clinrec bank-bootstrap
+clinrec bank-plan-update
+clinrec bank-update
+clinrec bank-update --apply
+clinrec bank-update-references
+clinrec bank-enrich-developers --all
+clinrec bank-qa
+clinrec bank-analyze-statuses
 ```
 
-For an intentional full active-bank JSON run:
+For a controlled pilot before a full active-bank run:
 
 ```powershell
 clinrec bank-sync-catalog
-clinrec bank-download-current --all
-clinrec bank-check-previous --all
-clinrec bank-analyze-identities
-clinrec bank-qa
+clinrec bank-download-current --code-version 773_2 --force
+clinrec bank-download-current --code-version 843_1 --force
+clinrec bank-download-current --code-version 270_2 --force
+clinrec bank-download-current --code-version 270_3 --force
+clinrec bank-qa --code 773
+clinrec bank-qa --code 843
+clinrec bank-qa --code 270
 ```
 
 Do not run `clinrec parse`, old `clinrec qa`, `clinrec build-families`, or old
@@ -87,6 +97,8 @@ API responses, PDFs, normalized documents, indexes, logs, and reports.
 
 The active raw JSON bank lives under `data/bank/active/{CODE_VERSION}/` and does not
 create `parsed/`, `assets/`, `content.md`, `document.json`, or `search_chunks.jsonl`.
+Documents removed from the latest accepted active catalog are moved to
+`data/bank/legacy/{CODE_VERSION}/` with `lifecycle.json`; they are not deleted.
 Mass PDF download is intentionally outside the bank; bank manifests record
 `pdf_status: not_requested`.
 
@@ -94,6 +106,10 @@ The bank folder key remains `CodeVersion`. `db_id` from raw `GetClinrec2` and
 `source_record_id` from the catalog are stored in manifests as strong identity checks
 only; they are not used as the only lifecycle key until full-corpus identity statistics
 are reviewed.
+
+Raw status fields such as `status`, `ApplyStatus`, and `ApplyStatusCalculated` are
+preserved as opaque source values. They do not decide active/legacy placement,
+predecessor confirmation, or automatic replacement links in the raw-bank lifecycle.
 
 ## Development Checks
 
