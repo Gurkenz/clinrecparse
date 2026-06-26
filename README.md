@@ -10,27 +10,35 @@ be downloaded together with the JSON bank.
 
 - `sync-catalog` and `bank-sync-catalog` save raw catalog snapshots plus separate
   `catalog-active.jsonl` and `catalog-all-statuses.jsonl` indexes.
-- `bank-bootstrap` creates the initial `data/bank/active/{CODE_VERSION}` set from
-  the accepted active catalog.
-- `bank-plan-update`, `bank-apply-update`, and `bank-update --apply` reconcile the
-  accepted catalog, local `active`, local `legacy`, and staged downloads.
+- `bank-fetch-candidate` creates an immutable candidate catalog under
+  `data/bank/candidates/{TRANSACTION_ID}/`.
+- `bank-plan-update --candidate ...` creates a hash-bound plan under
+  `data/bank/plans/{TRANSACTION_ID}/`.
+- `bank-stage-update --plan ...` downloads required raw JSON into
+  `data/bank/staging/{TRANSACTION_ID}/` and validates it before active is touched.
+- `bank-apply-update --plan ...` transactionally applies a staged plan, runs
+  candidate QA, accepts the candidate catalog last, and records a transaction journal.
+- `bank-rollback` and `bank-transaction-status` inspect or recover transactions.
+- `bank-bootstrap --apply` creates the initial bank through the same candidate,
+  plan, stage, apply, QA, accept workflow.
 - `bank-download-current` downloads byte-for-byte raw `GetClinrec2` JSON into
   `data/bank/active/{CODE_VERSION}/current/`.
 - `bank-update-references` updates the NKO reference history after raw-bank sync.
 - `bank-enrich-developers` creates `developers.json` after references are available.
 - `bank-analyze-statuses` counts raw status values without interpreting them.
 - `bank-check-previous` checks only the nearest `Version - 1` candidate.
-- `bank-qa` verifies active-bank completeness and writes bank reports.
+- `bank-qa --against accepted` verifies the accepted catalog against active.
+- `bank-qa --against candidate --plan ...` verifies a plan-bound candidate state.
 - `bank-analyze-identities` reports `catalog.source_record_id` / `GetClinrec2.db_id`
   consistency, duplicate ids, and db id to `CodeVersion` pairs.
-- `bank-run` orchestrates the new raw JSON bank pipeline only.
+- `bank-run` is disabled for this transactional stage.
 - `discover-versions` independently checks candidate `CodeVersion` values.
 - `download` downloads only raw `GetClinrec2` JSON.
 - `download-pdf` downloads official PDF files separately.
 - `parse` converts downloaded JSON into normalized document artifacts.
 - `qa` performs source, parsed artifact, manifest, chunk, table, markdown, and optional PDF checks.
 - `build-families` is still a placeholder.
-- `run-all` is not recommended until the individual stages are clean on a controlled sample.
+- `run-all` is disabled for this transactional stage.
 
 Do not run a full corpus or mass PDF layer accidentally. Use `--all` only when that is
 intentional.
@@ -47,31 +55,45 @@ Pinned direct dependencies live in `pyproject.toml`. A full local lock is commit
 ## Recommended Order
 
 ```powershell
-clinrec bank-bootstrap
-clinrec bank-plan-update
-clinrec bank-update
-clinrec bank-update --apply
+clinrec bank-fetch-candidate
+clinrec bank-plan-update --candidate data/bank/candidates/{TRANSACTION_ID}
+clinrec bank-stage-update --plan data/bank/plans/{TRANSACTION_ID}/plan.json
+clinrec bank-apply-update --plan data/bank/plans/{TRANSACTION_ID}/plan.json
+clinrec bank-qa --against accepted
 clinrec bank-update-references
 clinrec bank-enrich-developers --all
-clinrec bank-qa
+clinrec bank-analyze-identities
 clinrec bank-analyze-statuses
+```
+
+For an initial bank, use the same lifecycle through bootstrap:
+
+```powershell
+clinrec bank-bootstrap --apply
+clinrec bank-qa --against accepted
+```
+
+If apply is interrupted or fails after mutating active/legacy, inspect and recover with:
+
+```powershell
+clinrec bank-transaction-status --transaction-id {TRANSACTION_ID}
+clinrec bank-apply-update --plan data/bank/plans/{TRANSACTION_ID}/plan.json --resume
+clinrec bank-rollback --transaction-id {TRANSACTION_ID}
 ```
 
 For a controlled pilot before a full active-bank run:
 
 ```powershell
-clinrec bank-sync-catalog
-clinrec bank-download-current --code-version 773_2 --force
-clinrec bank-download-current --code-version 843_1 --force
-clinrec bank-download-current --code-version 270_2 --force
-clinrec bank-download-current --code-version 270_3 --force
-clinrec bank-qa --code 773
-clinrec bank-qa --code 843
-clinrec bank-qa --code 270
+clinrec bank-fetch-candidate --pilot --code-version 773_2 --code-version 843_1 --code-version 270_2 --code-version 270_3
+clinrec bank-plan-update --candidate data/bank/candidates/{TRANSACTION_ID}
+clinrec bank-stage-update --plan data/bank/plans/{TRANSACTION_ID}/plan.json
+clinrec bank-qa --against candidate --plan data/bank/plans/{TRANSACTION_ID}/plan.json
 ```
 
 Do not run `clinrec parse`, old `clinrec qa`, `clinrec build-families`, or old
-`clinrec run-all` as part of this raw-bank stage.
+`clinrec run-all` as part of this raw-bank stage. Do not run `bank-check-previous --all`,
+mass PDF, or a full active-corpus download until the controlled fixture and isolated
+pilot flows have been reviewed.
 
 ## PDF Layer
 
@@ -95,10 +117,28 @@ may keep timestamps.
 The `data/` directory is local working storage and excluded from Git. It may contain raw
 API responses, PDFs, normalized documents, indexes, logs, and reports.
 
-The active raw JSON bank lives under `data/bank/active/{CODE_VERSION}/` and does not
-create `parsed/`, `assets/`, `content.md`, `document.json`, or `search_chunks.jsonl`.
-Documents removed from the latest accepted active catalog are moved to
-`data/bank/legacy/{CODE_VERSION}/` with `lifecycle.json`; they are not deleted.
+The accepted raw JSON bank lives under `data/bank/active/{CODE_VERSION}/` and does
+not create `parsed/`, `assets/`, `content.md`, `document.json`, or
+`search_chunks.jsonl`. Documents removed from the latest accepted active catalog are
+moved to `data/bank/legacy/{CODE_VERSION}/` with `lifecycle.json`; they are not
+deleted.
+
+Candidate catalogs, plans, staging, and journals are transaction scoped:
+
+- `data/bank/candidates/{TRANSACTION_ID}/`
+- `data/bank/plans/{TRANSACTION_ID}/`
+- `data/bank/staging/{TRANSACTION_ID}/`
+- `data/bank/transactions/{TRANSACTION_ID}/`
+
+The accepted catalog in `data/bank/state/` is the membership source of truth. It is
+updated only after staged documents have been promoted, candidate QA has passed, and
+the transaction is ready to complete.
+
+Raw `current/manifest.json` files use schema version `2.0` and must contain a valid
+SHA-256, byte size, validation state, opaque raw status fields, and `db_id_state`.
+Failed HTTP, timeout, invalid JSON, or validation attempts are written under
+`current/attempts/{TIMESTAMP}.json`; a failed forced download must not overwrite the
+last valid raw JSON or manifest.
 Mass PDF download is intentionally outside the bank; bank manifests record
 `pdf_status: not_requested`.
 

@@ -15,6 +15,7 @@ from clinrec.bank.common import (
     catalog_record_for_bank,
     compact_timestamp,
     current_dir,
+    db_id_state,
     existing_manifest_matches,
     load_catalog_records,
     manifest_for_raw_json,
@@ -58,9 +59,14 @@ def download_current_documents(
     options: BankRecordFilter,
     *,
     destination_root: Path | None = None,
+    records_override: list[dict[str, Any]] | None = None,
 ) -> BankDownloadSummary:
     timestamp = compact_timestamp(options.timestamp)
-    records = selected_active_records(settings, options)
+    records = (
+        records_override
+        if records_override is not None
+        else selected_active_records(settings, options)
+    )
     preview = [string_value(record.get("code_version")) for record in records[:20]]
     if options.dry_run:
         return BankDownloadSummary(
@@ -90,7 +96,12 @@ def download_current_documents(
         except (KeyboardInterrupt, SystemExit):
             raise
         except Exception as exc:
-            document = failed_current_summary(settings, code_version, str(exc))
+            document = failed_current_summary(
+                settings,
+                code_version,
+                str(exc),
+                destination_root=destination_root,
+            )
         documents.append(document)
         append_checkpoint(
             settings,
@@ -152,6 +163,7 @@ def download_one_current(
                         **manifest,
                         "catalog_source_record_id": catalog_source_record_id,
                         "document_db_id": info.db_id,
+                        "db_id_state": db_id_state(catalog_source_record_id, info.db_id),
                         "db_id_match": catalog_source_record_id == info.db_id
                         if catalog_source_record_id is not None and info.db_id is not None
                         else None,
@@ -177,27 +189,18 @@ def download_one_current(
     result = client.fetch_clinrec_payload(code_version)
     if isinstance(result, ExternalApiError):
         status = "circuit_open" if result.kind.value == "circuit_open" else "failed"
-        write_json(
-            manifest_path,
-            add_catalog_status_fields(
-                {
-                    "code_version": code_version,
-                    "source": "GetClinrec2",
-                    "http_status": result.status_code,
-                    "content_type": result.content_type,
-                    "size": 0,
-                    "sha256": None,
-                    "downloaded_at": utc_now(),
-                    "validation": status,
-                    "catalog_source_record_id": catalog_source_record_id,
-                    "document_db_id": None,
-                    "db_id_match": None,
-                    "error": result.message,
-                },
-                bank_catalog_record,
-            ),
+        write_attempt(
+            target_dir,
+            endpoint=result.endpoint,
+            http_status=result.status_code,
+            error_kind=result.kind.value,
+            message=result.message,
+            content_type=result.content_type,
+            response_size=result.response_size_bytes,
+            attempts=result.attempts,
+            retry_after=result.retry_after,
+            safe_body_preview=result.safe_body_preview,
         )
-        write_bank_manifest(settings, code_version, target_dir.parent, status, destination_root)
         return BankDownloadDocumentSummary(
             code_version=code_version,
             document_dir=target_dir.parent,
@@ -215,26 +218,18 @@ def download_one_current(
     if info is None:
         part_path.unlink(missing_ok=True)
         error = "; ".join(errors)
-        write_json(
-            manifest_path,
-            add_catalog_status_fields(
-                manifest_for_raw_json(
-                    code_version=code_version,
-                    code=int(catalog_record.get("code") or 0),
-                    version=int(catalog_record.get("version") or 0),
-                    status=None,
-                    source="GetClinrec2",
-                    http_status=result.status_code,
-                    content_type=result.content_type,
-                    raw_content=result.raw_content,
-                    validation="invalid",
-                    catalog_source_record_id=catalog_source_record_id,
-                    error=error,
-                ),
-                bank_catalog_record,
-            ),
+        write_attempt(
+            target_dir,
+            endpoint=result.endpoint,
+            http_status=result.status_code,
+            error_kind="validation_failure",
+            message=error,
+            content_type=result.content_type,
+            response_size=result.response_size_bytes,
+            attempts=result.attempts,
+            retry_after=None,
+            safe_body_preview=result.raw_content[:4096].decode("utf-8", errors="replace"),
         )
-        write_bank_manifest(settings, code_version, target_dir.parent, "invalid", destination_root)
         return BankDownloadDocumentSummary(
             code_version=code_version,
             document_dir=target_dir.parent,
@@ -304,21 +299,24 @@ def failed_current_summary(
     settings: Any,
     code_version: str,
     error: str,
+    *,
+    destination_root: Path | None = None,
 ) -> BankDownloadDocumentSummary:
-    target_dir = current_dir(settings, code_version)
+    target_dir = target_current_dir(settings, code_version, destination_root)
     target_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = target_dir / "manifest.json"
-    write_json(
-        manifest_path,
-        {
-            "code_version": code_version,
-            "source": "GetClinrec2",
-            "downloaded_at": utc_now(),
-            "validation": "failed",
-            "error": error,
-        },
+    write_attempt(
+        target_dir,
+        endpoint="GetClinrec2",
+        http_status=None,
+        error_kind="exception",
+        message=error,
+        content_type=None,
+        response_size=0,
+        attempts=0,
+        retry_after=None,
+        safe_body_preview=None,
     )
-    refresh_bank_manifest(settings, code_version, current_status="failed")
     return BankDownloadDocumentSummary(
         code_version=code_version,
         document_dir=target_dir.parent,
@@ -326,6 +324,40 @@ def failed_current_summary(
         status="failed",
         error=error,
     )
+
+
+def write_attempt(
+    target_dir: Path,
+    *,
+    endpoint: str,
+    http_status: int | None,
+    error_kind: str,
+    message: str,
+    content_type: str | None,
+    response_size: int,
+    attempts: int,
+    retry_after: str | None,
+    safe_body_preview: str | None,
+) -> Path:
+    attempts_dir = target_dir / "attempts"
+    attempts_dir.mkdir(parents=True, exist_ok=True)
+    attempt_path = attempts_dir / f"{compact_timestamp()}.json"
+    write_json(
+        attempt_path,
+        {
+            "attempted_at": utc_now(),
+            "endpoint": endpoint,
+            "http_status": http_status,
+            "error_kind": error_kind,
+            "message": message,
+            "content_type": content_type,
+            "response_size": response_size,
+            "attempts": attempts,
+            "retry_after": retry_after,
+            "safe_body_preview": safe_body_preview,
+        },
+    )
+    return attempt_path
 
 
 def target_current_dir(

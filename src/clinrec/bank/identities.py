@@ -10,6 +10,7 @@ from clinrec.bank.common import (
     BankRecordFilter,
     bank_reports_root,
     current_dir,
+    db_id_state,
     filter_catalog_records,
     has_selection,
     load_catalog_records,
@@ -86,6 +87,7 @@ def identity_pair(settings: Any, catalog_row: dict[str, Any]) -> dict[str, Any]:
         "version": to_int(catalog_row.get("version")),
         "catalog_source_record_id": catalog_source_record_id,
         "document_db_id": document_db_id,
+        "db_id_state": db_id_state(catalog_source_record_id, document_db_id),
         "db_id_match": (
             catalog_source_record_id == document_db_id
             if catalog_source_record_id is not None and document_db_id is not None
@@ -115,10 +117,11 @@ def build_identity_report(pairs: list[dict[str, Any]]) -> dict[str, Any]:
                 "db_id": document_db_id,
                 "code_version": code_version,
                 "catalog_source_record_id": pair.get("catalog_source_record_id"),
+                "db_id_state": pair.get("db_id_state"),
                 "db_id_match": pair.get("db_id_match"),
             }
         )
-        if pair.get("db_id_match") is not True:
+        if pair.get("db_id_state") == "mismatch":
             mismatches.append(pair)
 
     duplicate_db_ids = {

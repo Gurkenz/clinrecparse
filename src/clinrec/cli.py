@@ -15,6 +15,7 @@ from clinrec.api.document_download import download_documents as run_download_doc
 from clinrec.api.document_download import download_pdfs as run_download_pdfs
 from clinrec.api.version_discovery import DiscoveryError, DiscoveryOptions
 from clinrec.api.version_discovery import discover_versions as run_discover_versions
+from clinrec.bank.candidate import fetch_candidate_catalog as run_bank_fetch_candidate
 from clinrec.bank.common import BankError, BankRecordFilter
 from clinrec.bank.current import download_current_documents as run_bank_download_current
 from clinrec.bank.identities import analyze_identities as run_bank_analyze_identities
@@ -29,6 +30,12 @@ from clinrec.bank.reconcile import (
 from clinrec.bank.reconcile import (
     bank_update as run_bank_update,
 )
+from clinrec.bank.reconcile import (
+    build_update_plan as run_bank_build_update_plan,
+)
+from clinrec.bank.reconcile import (
+    stage_update as run_bank_stage_update,
+)
 from clinrec.bank.references import (
     enrich_developers as run_bank_enrich_developers,
 )
@@ -37,6 +44,7 @@ from clinrec.bank.references import (
 )
 from clinrec.bank.run import run_bank_pipeline
 from clinrec.bank.statuses import analyze_statuses as run_bank_analyze_statuses
+from clinrec.bank.transaction import read_journal, rollback_transaction
 from clinrec.config import DEFAULT_CONFIG_PATH, Settings, ensure_data_directories, load_settings
 from clinrec.logging import configure_logging
 from clinrec.parsing.document import ParseError, ParseOptions
@@ -128,6 +136,10 @@ def bank_sync_catalog(config: ConfigOption = DEFAULT_CONFIG_PATH) -> None:
 @app.command("bank-bootstrap")
 def bank_bootstrap(
     config: ConfigOption = DEFAULT_CONFIG_PATH,
+    apply: Annotated[
+        bool,
+        typer.Option("--apply", help="Required: apply the bootstrap transaction."),
+    ] = False,
     force: Annotated[
         bool,
         typer.Option("--force", help="Redownload documents even when local manifests are valid."),
@@ -137,12 +149,13 @@ def bank_bootstrap(
     settings = bootstrap(config)
     try:
         with ClinrecApiClient(settings.http, settings.rate_limit) as client:
-            summary = run_bank_bootstrap(settings, client, force=force)
+            summary = run_bank_bootstrap(settings, client, force=force, apply=apply)
     except (BankError, SyncError) as exc:
         typer.echo(f"bank-bootstrap failed: {exc}", err=True)
         raise typer.Exit(1) from exc
 
     typer.echo("bank-bootstrap completed")
+    typer.echo(f"transaction_id: {summary['transaction_id']}")
     typer.echo(f"catalog_active_records: {summary['catalog_active_records']}")
     typer.echo(f"downloaded: {summary['downloaded']}")
     typer.echo(f"plan: {summary['plan']}")
@@ -150,9 +163,58 @@ def bank_bootstrap(
     typer.echo(f"references: {summary['references']}")
 
 
+@app.command("bank-fetch-candidate")
+def bank_fetch_candidate(
+    config: ConfigOption = DEFAULT_CONFIG_PATH,
+    transaction_id: Annotated[
+        str | None,
+        typer.Option("--transaction-id", help="Explicit transaction id."),
+    ] = None,
+    code_version: Annotated[
+        list[str] | None,
+        typer.Option("--code-version", help="Pilot/filter CodeVersion; can be repeated."),
+    ] = None,
+    pilot: Annotated[
+        bool,
+        typer.Option("--pilot", help="Mark this candidate snapshot as an isolated pilot."),
+    ] = False,
+) -> None:
+    """Fetch an immutable candidate catalog snapshot."""
+    settings = bootstrap(config)
+    try:
+        with ClinrecApiClient(settings.http, settings.rate_limit) as client:
+            summary = run_bank_fetch_candidate(
+                settings,
+                client,
+                transaction_id=transaction_id,
+                include_code_versions=set(code_version) if code_version else None,
+                pilot=pilot,
+            )
+    except (BankError, SyncError) as exc:
+        typer.echo(f"bank-fetch-candidate failed: {exc}", err=True)
+        raise typer.Exit(1) from exc
+
+    typer.echo("bank-fetch-candidate completed")
+    typer.echo(f"transaction_id: {summary.transaction_id}")
+    typer.echo(f"candidate: {summary.root}")
+    typer.echo(f"active_records: {summary.active_total_records}")
+    typer.echo(f"active_sha256: {summary.active_index_sha256}")
+
+
 @app.command("bank-plan-update")
 def bank_plan_update(
     config: ConfigOption = DEFAULT_CONFIG_PATH,
+    candidate: Annotated[
+        Path | None,
+        typer.Option(
+            "--candidate",
+            help="Path to data/bank/candidates/{TRANSACTION_ID}.",
+            exists=True,
+            file_okay=False,
+            dir_okay=True,
+            readable=True,
+        ),
+    ] = None,
     allow_large_delta: Annotated[
         bool,
         typer.Option(
@@ -164,13 +226,26 @@ def bank_plan_update(
     """Synchronize a fresh active catalog and write an update plan without applying it."""
     settings = bootstrap(config)
     try:
-        with ClinrecApiClient(settings.http, settings.rate_limit) as client:
-            summary = run_bank_update(
+        if candidate is not None:
+            plan_summary = run_bank_build_update_plan(
                 settings,
-                client,
-                apply=False,
+                transaction_id=candidate.name,
+                candidate_records_path=candidate / "catalog-active.jsonl",
+                candidate_snapshot_path=candidate,
                 allow_large_delta=allow_large_delta,
             )
+            summary = {
+                "plan": str(plan_summary.plan_path),
+                "requires_manual_review": plan_summary.requires_manual_review,
+            }
+        else:
+            with ClinrecApiClient(settings.http, settings.rate_limit) as client:
+                summary = run_bank_update(
+                    settings,
+                    client,
+                    apply=False,
+                    allow_large_delta=allow_large_delta,
+                )
     except (BankError, SyncError) as exc:
         typer.echo(f"bank-plan-update failed: {exc}", err=True)
         raise typer.Exit(1) from exc
@@ -194,19 +269,139 @@ def bank_apply_update(
         ),
     ],
     config: ConfigOption = DEFAULT_CONFIG_PATH,
+    allow_manual_review: Annotated[
+        bool,
+        typer.Option("--allow-manual-review", help="Apply a plan marked as manual review."),
+    ] = False,
+    allow_identity_conflict: Annotated[
+        bool,
+        typer.Option("--allow-identity-conflict", help="Override identity conflict block."),
+    ] = False,
+    resume: Annotated[
+        bool,
+        typer.Option("--resume", help="Resume an interrupted transaction."),
+    ] = False,
+    rollback_on_error: Annotated[
+        bool,
+        typer.Option("--rollback-on-error/--no-rollback-on-error"),
+    ] = True,
 ) -> None:
     """Apply a reviewed bank update plan."""
     settings = bootstrap(config)
     try:
-        summary = run_bank_apply_update(settings, plan, allow_manual_review=True)
+        summary = run_bank_apply_update(
+            settings,
+            plan,
+            allow_manual_review=allow_manual_review,
+            allow_identity_conflict=allow_identity_conflict,
+            resume=resume,
+            rollback_on_error=rollback_on_error,
+        )
     except BankError as exc:
         typer.echo(f"bank-apply-update failed: {exc}", err=True)
         raise typer.Exit(1) from exc
 
     typer.echo("bank-apply-update completed")
+    typer.echo(f"transaction_id: {summary.transaction_id}")
     typer.echo(f"applied: {summary.applied}")
     typer.echo(f"moved_to_legacy: {summary.moved_to_legacy}")
     typer.echo(f"reactivated: {summary.reactivated}")
+
+
+@app.command("bank-stage-update")
+def bank_stage_update(
+    plan: Annotated[
+        Path,
+        typer.Option(
+            "--plan",
+            help="Path to data/bank/plans/{TRANSACTION_ID}/plan.json.",
+            exists=True,
+            file_okay=True,
+            dir_okay=False,
+            readable=True,
+        ),
+    ],
+    config: ConfigOption = DEFAULT_CONFIG_PATH,
+    force: Annotated[bool, typer.Option("--force", help="Redownload staged documents.")] = False,
+    retry_failed: Annotated[
+        bool,
+        typer.Option("--retry-failed", help="Retry documents with previous failed attempts."),
+    ] = False,
+    allow_identity_conflict: Annotated[
+        bool,
+        typer.Option("--allow-identity-conflict", help="Stage despite identity conflicts."),
+    ] = False,
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="Write a dry-run staging summary only."),
+    ] = False,
+    verify_existing: Annotated[
+        bool,
+        typer.Option("--verify-existing", help="Also stage unchanged records for verification."),
+    ] = False,
+) -> None:
+    """Download and strictly validate documents required by an immutable plan."""
+    settings = bootstrap(config)
+    try:
+        with ClinrecApiClient(settings.http, settings.rate_limit) as client:
+            summary = run_bank_stage_update(
+                settings,
+                client,
+                plan,
+                force=force,
+                retry_failed=retry_failed,
+                allow_identity_conflict=allow_identity_conflict,
+                dry_run=dry_run,
+                verify_existing=verify_existing,
+            )
+    except BankError as exc:
+        typer.echo(f"bank-stage-update failed: {exc}", err=True)
+        raise typer.Exit(1) from exc
+
+    typer.echo("bank-stage-update completed")
+    typer.echo(f"transaction_id: {summary.transaction_id}")
+    typer.echo(f"planned: {summary.planned}")
+    typer.echo(f"downloaded: {summary.downloaded}")
+    typer.echo(f"already_valid: {summary.already_valid}")
+    typer.echo(f"failed: {summary.failed}")
+    typer.echo(f"not_attempted: {summary.not_attempted}")
+    typer.echo(f"summary: {summary.summary_path}")
+
+
+@app.command("bank-rollback")
+def bank_rollback(
+    transaction_id: Annotated[str, typer.Option("--transaction-id")],
+    config: ConfigOption = DEFAULT_CONFIG_PATH,
+) -> None:
+    """Rollback an interrupted or failed raw-bank transaction."""
+    settings = bootstrap(config)
+    try:
+        journal = rollback_transaction(settings, transaction_id)
+    except BankError as exc:
+        typer.echo(f"bank-rollback failed: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    typer.echo("bank-rollback completed")
+    typer.echo(f"transaction_id: {journal['transaction_id']}")
+    typer.echo(f"state: {journal['state']}")
+
+
+@app.command("bank-transaction-status")
+def bank_transaction_status(
+    transaction_id: Annotated[str, typer.Option("--transaction-id")],
+    config: ConfigOption = DEFAULT_CONFIG_PATH,
+) -> None:
+    """Show a raw-bank transaction journal."""
+    settings = bootstrap(config)
+    try:
+        journal = read_journal(settings, transaction_id)
+    except BankError as exc:
+        typer.echo(f"bank-transaction-status failed: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    typer.echo("bank-transaction-status completed")
+    typer.echo(f"transaction_id: {journal['transaction_id']}")
+    typer.echo(f"state: {journal['state']}")
+    typer.echo(f"operations: {len(journal.get('operations') or [])}")
+    typer.echo(f"errors: {len(journal.get('errors') or [])}")
 
 
 @app.command("bank-update")
@@ -571,6 +766,12 @@ def bank_check_previous(
     ] = False,
 ) -> None:
     """Check only Version - 1 for active bank records."""
+    if all_records:
+        typer.echo(
+            "bank-check-previous --all is disabled for the transactional raw bank.",
+            err=True,
+        )
+        raise typer.Exit(1)
     settings = bootstrap(config)
     options = BankRecordFilter(
         code_versions=code_version,
@@ -612,6 +813,21 @@ def bank_check_previous(
 @app.command("bank-qa")
 def bank_qa(
     config: ConfigOption = DEFAULT_CONFIG_PATH,
+    against: Annotated[
+        str,
+        typer.Option("--against", help="QA target: accepted or candidate."),
+    ] = "accepted",
+    plan: Annotated[
+        Path | None,
+        typer.Option(
+            "--plan",
+            help="Required for --against candidate.",
+            exists=True,
+            file_okay=True,
+            dir_okay=False,
+            readable=True,
+        ),
+    ] = None,
     code_version: Annotated[
         list[str] | None,
         typer.Option("--code-version", help="Check one active bank CodeVersion; can be repeated."),
@@ -650,7 +866,7 @@ def bank_qa(
         all_records=all_records or not any((code_version, code, from_code, to_code)),
     )
     try:
-        summary = run_bank_qa(settings, options)
+        summary = run_bank_qa(settings, options, against=against, plan_path=plan)
     except BankError as exc:
         typer.echo(f"bank-qa failed: {exc}", err=True)
         raise typer.Exit(1) from exc
@@ -771,6 +987,9 @@ def bank_run(
     ] = False,
 ) -> None:
     """Run the new raw JSON bank pipeline only."""
+    typer.echo("bank-run is disabled; use bank-fetch-candidate, bank-plan-update, "
+               "bank-stage-update, and bank-apply-update.", err=True)
+    raise typer.Exit(1)
     settings = bootstrap(config)
     options = BankRecordFilter(
         code_versions=code_version,
@@ -978,7 +1197,9 @@ def qa(
 @app.command("run-all")
 def run_all(config: ConfigOption = DEFAULT_CONFIG_PATH) -> None:
     """Prepare full pipeline orchestration command."""
-    placeholder("run-all", config, http_planned=True)
+    bootstrap(config)
+    typer.echo("run-all is disabled for the transactional raw-bank stage.", err=True)
+    raise typer.Exit(1)
 
 
 if __name__ == "__main__":

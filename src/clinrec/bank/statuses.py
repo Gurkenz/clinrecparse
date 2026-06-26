@@ -41,7 +41,7 @@ def analyze_statuses(settings: Settings) -> BankStatusAnalysisSummary:
     active_catalog = read_jsonl(catalog_index_path(settings, active=True))
     all_statuses_catalog = read_jsonl(catalog_index_path(settings, active=False))
     documents = document_status_rows(settings)
-    transition_rows = neighboring_status_rows(active_catalog + all_statuses_catalog)
+    transition_rows = neighboring_status_rows(all_statuses_catalog)
 
     catalog_active_status = Counter(status_key(row.get("status")) for row in active_catalog)
     catalog_all_status = Counter(status_key(row.get("status")) for row in all_statuses_catalog)
@@ -124,7 +124,12 @@ def document_status_rows(settings: Settings) -> list[dict[str, str]]:
 
 def neighboring_status_rows(catalog_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     by_code: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    by_code_version: dict[str, dict[str, Any]] = {}
     for row in catalog_rows:
+        code_version = string_value(row.get("code_version"))
+        if code_version and code_version not in by_code_version:
+            by_code_version[code_version] = row
+    for row in by_code_version.values():
         code = string_value(row.get("code"))
         if code:
             by_code[code].append(row)
@@ -135,6 +140,8 @@ def neighboring_status_rows(catalog_rows: list[dict[str, Any]]) -> list[dict[str
         for previous, current in zip(ordered, ordered[1:], strict=False):
             previous_code_version = string_value(previous.get("code_version"))
             current_code_version = string_value(current.get("code_version"))
+            if previous_code_version == current_code_version:
+                continue
             pair_key = (previous_code_version, current_code_version)
             if pair_key in seen_pairs:
                 continue

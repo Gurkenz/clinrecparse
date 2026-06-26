@@ -4,9 +4,12 @@ import json
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from clinrec.api.catalog_sync import write_json
 from clinrec.api.client import JsonPayloadResult
 from clinrec.bank.common import (
+    BankError,
     BankRecordFilter,
     accepted_catalog_path,
     bank_active_root,
@@ -25,6 +28,8 @@ from clinrec.bank.reconcile import (
     apply_update_plan,
     build_update_plan,
     reconcile_catalogs,
+    stage_update,
+    update_plan_state,
 )
 from clinrec.bank.references import enrich_developers, update_references
 from clinrec.bank.statuses import analyze_statuses
@@ -144,6 +149,58 @@ def document_bytes(
         "obj": {"sections": [{"id": "s1", "content": "<p>HTML stays raw.</p>"}]},
     }
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
+def write_valid_bank_document(
+    document_root: Path,
+    code_version: str,
+    *,
+    code: int,
+    version: int,
+    source_record_id: int | None = None,
+    db_id: int | None = None,
+) -> None:
+    raw = document_bytes(
+        code_version,
+        code=code,
+        version=version,
+        status=0,
+        db_id=db_id if db_id is not None else source_record_id,
+    )
+    current_root = document_root / "current"
+    current_root.mkdir(parents=True, exist_ok=True)
+    (current_root / "getclinrec.json").write_bytes(raw)
+    write_json(
+        current_root / "manifest.json",
+        manifest_for_raw_json(
+            code_version=code_version,
+            code=code,
+            version=version,
+            status=0,
+            source="GetClinrec2",
+            http_status=200,
+            content_type="application/json",
+            raw_content=raw,
+            validation="valid",
+            catalog_source_record_id=source_record_id,
+            document_db_id=db_id if db_id is not None else source_record_id,
+        ),
+    )
+    write_json(
+        current_root / "catalog-record.json",
+        catalog_row(code_version, code, version, 0, source_record_id=source_record_id),
+    )
+    write_json(
+        document_root / "bank-manifest.json",
+        {
+            "code_version": code_version,
+            "code": code,
+            "version": version,
+            "current_status": "valid",
+            "previous_status": "not_checked",
+            "pdf_status": "not_requested",
+        },
+    )
 
 
 def nko_result() -> JsonPayloadResult:
@@ -481,6 +538,119 @@ def test_bank_qa_reports_catalog_db_id_mismatch(tmp_path: Path) -> None:
     assert "catalog_db_id_mismatch" in anomalies
 
 
+def test_strict_manifest_requires_v2_valid_sha_and_size(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    row = catalog_row("843_1", 843, 1, 0, source_record_id=1737)
+    write_valid_bank_document(
+        bank_active_root(settings) / "843_1",
+        "843_1",
+        code=843,
+        version=1,
+        source_record_id=1737,
+        db_id=1737,
+    )
+    accept_current_catalog(settings, timestamp="20260101T000000Z", records=[row])
+
+    assert run_bank_qa(settings, BankRecordFilter(all_records=True)).fatal == 0
+
+    manifest_path = bank_active_root(settings) / "843_1" / "current" / "manifest.json"
+    manifest = json.loads(manifest_path.read_text("utf-8"))
+    manifest["validation"] = "invalid"
+    write_json(manifest_path, manifest)
+
+    summary = run_bank_qa(settings, BankRecordFilter(all_records=True))
+
+    assert summary.fatal >= 1
+    completeness = json.loads(summary.completeness_path.read_text("utf-8"))
+    assert completeness["valid_current_json"] == 0
+
+
+def test_failed_force_attempt_preserves_last_known_good_manifest(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    write_catalog_indexes(settings, active=[catalog_row("843_1", 843, 1, 0)])
+    raw = (FIXTURES / "clinrec_843_1_real_shape.json").read_bytes()
+
+    class GoodClient:
+        def fetch_clinrec_payload(self, code_version: str) -> JsonPayloadResult:
+            return json_result(code_version, raw)
+
+    download_current_documents(
+        settings,
+        GoodClient(),  # type: ignore[arg-type]
+        BankRecordFilter(code_versions=["843_1"]),
+    )
+    current_root = bank_active_root(settings) / "843_1" / "current"
+    raw_before = (current_root / "getclinrec.json").read_bytes()
+    manifest_before = (current_root / "manifest.json").read_text("utf-8")
+
+    class FailingClient:
+        def fetch_clinrec_payload(self, code_version: str) -> ExternalApiError:
+            return ExternalApiError(
+                endpoint="GetClinrec2",
+                kind=ApiErrorKind.HTTP_STATUS,
+                message="Service unavailable",
+                status_code=503,
+                code_version=code_version,
+            )
+
+    summary = download_current_documents(
+        settings,
+        FailingClient(),  # type: ignore[arg-type]
+        BankRecordFilter(code_versions=["843_1"], force=True),
+    )
+
+    assert summary.failed == 1
+    assert (current_root / "getclinrec.json").read_bytes() == raw_before
+    assert (current_root / "manifest.json").read_text("utf-8") == manifest_before
+    assert list((current_root / "attempts").glob("*.json"))
+
+
+def test_db_id_state_distinguishes_missing_from_mismatch() -> None:
+    match = manifest_for_raw_json(
+        code_version="100_1",
+        code=100,
+        version=1,
+        status=0,
+        source="GetClinrec2",
+        http_status=200,
+        content_type="application/json",
+        raw_content=document_bytes("100_1", code=100, version=1, status=0, db_id=10),
+        validation="valid",
+        catalog_source_record_id=10,
+        document_db_id=10,
+    )
+    missing = manifest_for_raw_json(
+        code_version="100_1",
+        code=100,
+        version=1,
+        status=0,
+        source="GetClinrec2",
+        http_status=200,
+        content_type="application/json",
+        raw_content=document_bytes("100_1", code=100, version=1, status=0, db_id=10),
+        validation="valid",
+        catalog_source_record_id=None,
+        document_db_id=10,
+    )
+    mismatch = manifest_for_raw_json(
+        code_version="100_1",
+        code=100,
+        version=1,
+        status=0,
+        source="GetClinrec2",
+        http_status=200,
+        content_type="application/json",
+        raw_content=document_bytes("100_1", code=100, version=1, status=0, db_id=11),
+        validation="valid",
+        catalog_source_record_id=10,
+        document_db_id=11,
+    )
+
+    assert match["db_id_state"] == "match"
+    assert missing["db_id_state"] == "catalog_id_missing"
+    assert mismatch["db_id_state"] == "mismatch"
+
+
 def test_bank_reconcile_categories_and_identity_conflicts(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
     previous = [
@@ -533,30 +703,202 @@ def test_bank_plan_large_drop_requires_review(tmp_path: Path) -> None:
     assert "catalog_change_requires_manual_review" in plan["warnings"]
 
 
+def test_plan_contains_hashes_and_rejects_modified_plan(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    candidate_dir = settings.paths.data_root / "bank" / "candidates" / "tx-plan"
+    candidate_records = candidate_dir / "catalog-active.jsonl"
+    write_jsonl(candidate_records, [catalog_row("843_1", 843, 1, 0)])
+
+    summary = build_update_plan(
+        settings,
+        transaction_id="tx-plan",
+        candidate_records_path=candidate_records,
+        candidate_snapshot_path=candidate_dir,
+    )
+    plan = json.loads(summary.plan_path.read_text("utf-8"))
+
+    assert plan["schema_version"] == "2.0"
+    assert plan["candidate_catalog_sha256"]
+    assert plan["plan_sha256"]
+
+    plan["candidate_total"] = 999
+    write_json(summary.plan_path, plan)
+
+    with pytest.raises(BankError, match="Plan hash mismatch"):
+        apply_update_plan(settings, summary.plan_path, allow_manual_review=True)
+
+
+def test_stale_candidate_catalog_is_rejected(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    candidate_dir = settings.paths.data_root / "bank" / "candidates" / "tx-stale"
+    candidate_records = candidate_dir / "catalog-active.jsonl"
+    write_jsonl(candidate_records, [catalog_row("843_1", 843, 1, 0)])
+    summary = build_update_plan(
+        settings,
+        transaction_id="tx-stale",
+        candidate_records_path=candidate_records,
+        candidate_snapshot_path=candidate_dir,
+    )
+    update_plan_state(summary.plan_path, "staged")
+    write_jsonl(
+        candidate_records,
+        [
+            catalog_row("843_1", 843, 1, 0),
+            catalog_row("773_2", 773, 2, 0),
+        ],
+    )
+
+    with pytest.raises(BankError, match="Candidate catalog hash mismatch"):
+        apply_update_plan(settings, summary.plan_path, allow_manual_review=True)
+
+
+def test_apply_without_complete_staging_is_rejected(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    candidate_dir = settings.paths.data_root / "bank" / "candidates" / "tx-missing-stage"
+    candidate_records = candidate_dir / "catalog-active.jsonl"
+    write_jsonl(candidate_records, [catalog_row("843_1", 843, 1, 0)])
+    summary = build_update_plan(
+        settings,
+        transaction_id="tx-missing-stage",
+        candidate_records_path=candidate_records,
+        candidate_snapshot_path=candidate_dir,
+    )
+    update_plan_state(summary.plan_path, "staged")
+
+    with pytest.raises(BankError, match="Required staging"):
+        apply_update_plan(settings, summary.plan_path, allow_manual_review=True)
+
+
+def test_stage_circuit_breaker_reports_not_attempted(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    candidate_dir = settings.paths.data_root / "bank" / "candidates" / "tx-circuit"
+    candidate_records = candidate_dir / "catalog-active.jsonl"
+    write_jsonl(
+        candidate_records,
+        [
+            catalog_row("843_1", 843, 1, 0),
+            catalog_row("773_2", 773, 2, 0),
+        ],
+    )
+    summary = build_update_plan(
+        settings,
+        transaction_id="tx-circuit",
+        candidate_records_path=candidate_records,
+        candidate_snapshot_path=candidate_dir,
+    )
+
+    class CircuitClient:
+        def fetch_clinrec_payload(self, code_version: str) -> ExternalApiError:
+            return ExternalApiError(
+                endpoint="GetClinrec2",
+                kind=ApiErrorKind.CIRCUIT_OPEN,
+                message="Circuit open",
+                code_version=code_version,
+            )
+
+    stage = stage_update(settings, CircuitClient(), summary.plan_path)  # type: ignore[arg-type]
+
+    assert stage.failed == 1
+    assert stage.not_attempted == 1
+    assert stage.circuit_open is True
+
+
+def test_candidate_qa_uses_plan_snapshot_and_staging(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    candidate_dir = settings.paths.data_root / "bank" / "candidates" / "tx-candidate-qa"
+    candidate_records = candidate_dir / "catalog-active.jsonl"
+    row = catalog_row("843_1", 843, 1, 0, source_record_id=1737)
+    write_jsonl(candidate_records, [row])
+    plan = build_update_plan(
+        settings,
+        transaction_id="tx-candidate-qa",
+        candidate_records_path=candidate_records,
+        candidate_snapshot_path=candidate_dir,
+    )
+    write_valid_bank_document(
+        settings.paths.data_root / "bank" / "staging" / "tx-candidate-qa" / "843_1",
+        "843_1",
+        code=843,
+        version=1,
+        source_record_id=1737,
+        db_id=1737,
+    )
+    update_plan_state(plan.plan_path, "staged")
+
+    summary = run_bank_qa(
+        settings,
+        BankRecordFilter(all_records=True),
+        against="candidate",
+        plan_path=plan.plan_path,
+    )
+
+    assert summary.fatal == 0
+    assert summary.completeness_path.parent.parent.name == "tx-candidate-qa"
+
+
 def test_bank_apply_moves_removed_to_legacy_and_reactivates(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
-    write_catalog_indexes(settings, active=[catalog_row("200_1", 200, 1, 0)])
+    accept_current_catalog(
+        settings,
+        timestamp="20251231T000000Z",
+        records=[catalog_row("100_1", 100, 1, 0, source_record_id=1001)],
+    )
     active_doc = bank_active_root(settings) / "100_1"
     legacy_doc = bank_legacy_root(settings) / "200_1"
     active_doc.mkdir(parents=True)
     legacy_doc.mkdir(parents=True)
-    plan_dir = settings.paths.data_root / "bank" / "plans" / "20260101T000000Z"
-    plan_path = plan_dir / "plan.json"
+    staging_current = (
+        settings.paths.data_root
+        / "bank"
+        / "staging"
+        / "20260101T000000Z"
+        / "200_1"
+        / "current"
+    )
+    staging_current.mkdir(parents=True)
+    raw = document_bytes("200_1", code=200, version=1, status=0, db_id=2001)
+    (staging_current / "getclinrec.json").write_bytes(raw)
+    candidate_record = catalog_row("200_1", 200, 1, 0, source_record_id=2001)
     write_json(
-        plan_path,
+        staging_current / "manifest.json",
+        manifest_for_raw_json(
+            code_version="200_1",
+            code=200,
+            version=1,
+            status=0,
+            source="GetClinrec2",
+            http_status=200,
+            content_type="application/json",
+            raw_content=raw,
+            validation="valid",
+            catalog_source_record_id=2001,
+            document_db_id=2001,
+        ),
+    )
+    write_json(staging_current / "catalog-record.json", candidate_record)
+    write_json(
+        staging_current.parent / "bank-manifest.json",
         {
-            "timestamp": "20260101T000000Z",
-            "removed_from_catalog": ["100_1"],
-            "removed": ["100_1"],
-            "reactivated": ["200_1"],
-            "added": [],
-            "missing_locally": [],
-            "requires_manual_review": True,
-            "replacement_candidates": {},
+            "code_version": "200_1",
+            "code": 200,
+            "version": 1,
+            "current_status": "valid",
+            "previous_status": "not_checked",
+            "pdf_status": "not_requested",
         },
     )
+    candidate_dir = settings.paths.data_root / "bank" / "candidates" / "20260101T000000Z"
+    candidate_records = candidate_dir / "catalog-active.jsonl"
+    write_jsonl(candidate_records, [candidate_record])
+    plan_summary = build_update_plan(
+        settings,
+        transaction_id="20260101T000000Z",
+        candidate_records_path=candidate_records,
+        candidate_snapshot_path=candidate_dir,
+    )
+    update_plan_state(plan_summary.plan_path, "staged")
 
-    summary = apply_update_plan(settings, plan_path, allow_manual_review=True)
+    summary = apply_update_plan(settings, plan_summary.plan_path, allow_manual_review=True)
 
     assert summary.moved_to_legacy == 1
     assert summary.reactivated == 1

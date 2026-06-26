@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import shutil
 import unicodedata
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -19,6 +20,19 @@ class BankError(RuntimeError):
 
 TEMPORARY_RELATION_STATUSES = {
     "previous_temporary_failure",
+}
+
+RAW_MANIFEST_SCHEMA_VERSION = "2.0"
+PLAN_SCHEMA_VERSION = "2.0"
+CANDIDATE_MANIFEST_SCHEMA_VERSION = "2.0"
+TRANSACTION_SCHEMA_VERSION = "2.0"
+
+DB_ID_STATES = {
+    "match",
+    "mismatch",
+    "catalog_id_missing",
+    "document_db_id_missing",
+    "both_missing",
 }
 
 
@@ -77,6 +91,10 @@ def bank_staging_root(settings: Settings) -> Path:
     return bank_root(settings) / "staging"
 
 
+def bank_candidates_root(settings: Settings) -> Path:
+    return bank_root(settings) / "candidates"
+
+
 def bank_state_root(settings: Settings) -> Path:
     return bank_root(settings) / "state"
 
@@ -87,6 +105,14 @@ def bank_plans_root(settings: Settings) -> Path:
 
 def bank_history_root(settings: Settings) -> Path:
     return bank_root(settings) / "history"
+
+
+def bank_quarantine_root(settings: Settings) -> Path:
+    return bank_root(settings) / "quarantine"
+
+
+def bank_transactions_root(settings: Settings) -> Path:
+    return bank_root(settings) / "transactions"
 
 
 def bank_references_root(settings: Settings) -> Path:
@@ -162,6 +188,32 @@ def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
     with path.open("w", encoding="utf-8", newline="\n") as file:
         for row in rows:
             file.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def stable_json_dumps(payload: Any) -> str:
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def stable_json_bytes(payload: Any) -> bytes:
+    return stable_json_dumps(payload).encode("utf-8")
+
+
+def sha256_file(path: Path) -> str:
+    return sha256_bytes(path.read_bytes())
+
+
+def sha256_json(payload: Any) -> str:
+    return sha256_bytes(stable_json_bytes(payload))
+
+
+def atomic_write_json(path: Path, payload: Any) -> None:
+    part_path = path.with_suffix(path.suffix + ".part")
+    part_path.parent.mkdir(parents=True, exist_ok=True)
+    part_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    part_path.replace(path)
 
 
 def append_checkpoint(settings: Settings, stage: str, row: dict[str, Any]) -> None:
@@ -308,8 +360,6 @@ def minimal_validate_raw_document(
         errors.append(f"version mismatch: {version!r}")
     if not name:
         errors.append("name is empty")
-    if status_value is None:
-        errors.append("status is missing")
     if not obj:
         errors.append("obj is not an object")
     if not isinstance(sections, list) or not sections:
@@ -359,7 +409,8 @@ def existing_manifest_matches(path: Path, manifest: dict[str, Any]) -> bool:
         return False
     content = path.read_bytes()
     return (
-        manifest.get("sha256") == sha256_bytes(content)
+        manifest.get("schema_version") == RAW_MANIFEST_SCHEMA_VERSION
+        and manifest.get("sha256") == sha256_bytes(content)
         and manifest.get("size") == len(content)
         and manifest.get("validation") == "valid"
     )
@@ -389,6 +440,7 @@ def manifest_for_raw_json(
     error: str | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
+        "schema_version": RAW_MANIFEST_SCHEMA_VERSION,
         "code_version": code_version,
         "code": code,
         "version": version,
@@ -407,6 +459,7 @@ def manifest_for_raw_json(
         "validation": validation,
         "catalog_source_record_id": catalog_source_record_id,
         "document_db_id": document_db_id,
+        "db_id_state": db_id_state(catalog_source_record_id, document_db_id),
         "db_id_match": ids_match(catalog_source_record_id, document_db_id),
     }
     if error:
@@ -485,6 +538,75 @@ def ids_match(left: int | None, right: int | None) -> bool | None:
     return left == right
 
 
+def db_id_state(catalog_source_record_id: int | None, document_db_id: int | None) -> str:
+    if catalog_source_record_id is None and document_db_id is None:
+        return "both_missing"
+    if catalog_source_record_id is None:
+        return "catalog_id_missing"
+    if document_db_id is None:
+        return "document_db_id_missing"
+    return "match" if catalog_source_record_id == document_db_id else "mismatch"
+
+
+def current_validation_issues(document_root: Path, code_version: str) -> list[str]:
+    current_root = document_root / "current"
+    raw_path = current_root / "getclinrec.json"
+    manifest_path = current_root / "manifest.json"
+    catalog_record_path = current_root / "catalog-record.json"
+    bank_manifest_path = document_root / "bank-manifest.json"
+    issues: list[str] = []
+
+    if not raw_path.exists():
+        issues.append("missing_getclinrec_json")
+        raw_content = b""
+    else:
+        raw_content = raw_path.read_bytes()
+
+    manifest = read_json_file(manifest_path)
+    if not manifest:
+        issues.append("missing_manifest")
+    else:
+        if manifest.get("schema_version") != RAW_MANIFEST_SCHEMA_VERSION:
+            issues.append("invalid_manifest_schema_version")
+        if manifest.get("validation") != "valid":
+            issues.append("manifest_validation_not_valid")
+        if not isinstance(manifest.get("sha256"), str) or not manifest.get("sha256"):
+            issues.append("manifest_sha256_missing")
+        elif raw_path.exists() and manifest.get("sha256") != sha256_bytes(raw_content):
+            issues.append("manifest_sha256_mismatch")
+        manifest_size = manifest.get("size")
+        if not isinstance(manifest_size, int) or manifest_size <= 0:
+            issues.append("manifest_size_invalid")
+        elif raw_path.exists() and manifest_size != len(raw_content):
+            issues.append("manifest_size_mismatch")
+        if manifest.get("db_id_state") not in DB_ID_STATES:
+            issues.append("manifest_db_id_state_invalid")
+
+    if raw_path.exists():
+        info, errors = minimal_validate_raw_document(
+            raw_content,
+            expected_code_version=code_version,
+        )
+        if info is None or errors:
+            issues.extend(f"raw:{error}" for error in errors)
+
+    catalog_record = read_json_file(catalog_record_path)
+    if catalog_record.get("code_version") != code_version:
+        issues.append("catalog_record_code_version_mismatch")
+
+    bank_manifest = read_json_file(bank_manifest_path)
+    if bank_manifest.get("code_version") != code_version:
+        issues.append("bank_manifest_code_version_mismatch")
+    if bank_manifest.get("current_status") != "valid":
+        issues.append("bank_manifest_current_status_not_valid")
+
+    return issues
+
+
+def is_strict_current_valid(document_root: Path, code_version: str) -> bool:
+    return not current_validation_issues(document_root, code_version)
+
+
 def refresh_bank_manifest(
     settings: Settings,
     code_version: str,
@@ -505,6 +627,23 @@ def refresh_bank_manifest(
         "updated_at": utc_now(),
     }
     write_json(path, payload)
+
+
+def copy_directory(source: Path, target: Path) -> None:
+    if target.exists():
+        raise BankError(f"Refusing to overwrite existing directory: {target}")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(source, target)
+
+
+def move_directory(source: Path, target: Path) -> bool:
+    if not source.exists():
+        return False
+    if target.exists():
+        raise BankError(f"Refusing to overwrite existing directory: {target}")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    source.replace(target)
+    return True
 
 
 def string_value(value: Any) -> str:
