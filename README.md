@@ -11,24 +11,33 @@ be downloaded together with the JSON bank.
 - `sync-catalog` and `bank-sync-catalog` save raw catalog snapshots plus separate
   `catalog-active.jsonl` and `catalog-all-statuses.jsonl` indexes.
 - `bank-fetch-candidate` creates an immutable candidate catalog under
-  `data/bank/candidates/{TRANSACTION_ID}/`.
-- `bank-plan-update --candidate ...` creates a hash-bound plan under
+  `data/bank/candidates/{TRANSACTION_ID}/` without modifying production indexes.
+- `bank-plan-update --candidate ...` creates a plan bound to the candidate catalog,
+  candidate manifest, and previous accepted generation hashes under
   `data/bank/plans/{TRANSACTION_ID}/`.
 - `bank-stage-update --plan ...` downloads required raw JSON into
-  `data/bank/staging/{TRANSACTION_ID}/` and validates it before active is touched.
-- `bank-apply-update --plan ...` transactionally applies a staged plan, runs
-  candidate QA, accepts the candidate catalog last, and records a transaction journal.
-- `bank-rollback` and `bank-transaction-status` inspect or recover transactions.
+  `data/bank/staging/{TRANSACTION_ID}/` and writes transaction metadata under
+  `data/bank/transactions/{TRANSACTION_ID}/`.
+- `bank-review-update --plan ...` records explicit review decisions for identity,
+  raw-source, and orphan conflicts before apply.
+- `bank-qa --against candidate --phase staged|applied --plan ...` verifies the
+  plan-bound candidate before and after apply.
+- `bank-apply-update --plan ...` acquires a writer lock, applies a staged plan with
+  a write-ahead journal, switches the accepted pointer atomically, and rolls back on
+  failed post-apply QA.
+- `bank-rollback`, `bank-transaction-status --json`, `bank-transaction-list`, and
+  `bank-transaction-recover` inspect or recover transactions.
 - `bank-bootstrap --apply` creates the initial bank through the same candidate,
   plan, stage, apply, QA, accept workflow.
-- `bank-download-current` downloads byte-for-byte raw `GetClinrec2` JSON into
-  `data/bank/active/{CODE_VERSION}/current/`.
+- `bank-download-current` downloads selected raw JSON into maintenance staging by
+  default; direct active writes require `--unsafe-direct-active-write`.
 - `bank-update-references` updates the NKO reference history after raw-bank sync.
 - `bank-enrich-developers` creates `developers.json` after references are available.
 - `bank-analyze-statuses` counts raw status values without interpreting them.
 - `bank-check-previous` checks only the nearest `Version - 1` candidate.
 - `bank-qa --against accepted` verifies the accepted catalog against active.
-- `bank-qa --against candidate --plan ...` verifies a plan-bound candidate state.
+- `bank-qa --against candidate --phase staged|applied --plan ...` verifies a
+  plan-bound candidate state.
 - `bank-analyze-identities` reports `catalog.source_record_id` / `GetClinrec2.db_id`
   consistency, duplicate ids, and db id to `CodeVersion` pairs.
 - `bank-run` is disabled for this transactional stage.
@@ -58,6 +67,8 @@ Pinned direct dependencies live in `pyproject.toml`. A full local lock is commit
 clinrec bank-fetch-candidate
 clinrec bank-plan-update --candidate data/bank/candidates/{TRANSACTION_ID}
 clinrec bank-stage-update --plan data/bank/plans/{TRANSACTION_ID}/plan.json
+clinrec bank-qa --against candidate --phase staged --plan data/bank/plans/{TRANSACTION_ID}/plan.json
+clinrec bank-review-update --plan data/bank/plans/{TRANSACTION_ID}/plan.json --decision use_staged_candidate --reason "reviewed source identity"
 clinrec bank-apply-update --plan data/bank/plans/{TRANSACTION_ID}/plan.json
 clinrec bank-qa --against accepted
 clinrec bank-update-references
@@ -77,6 +88,9 @@ If apply is interrupted or fails after mutating active/legacy, inspect and recov
 
 ```powershell
 clinrec bank-transaction-status --transaction-id {TRANSACTION_ID}
+clinrec bank-transaction-status --transaction-id {TRANSACTION_ID} --json
+clinrec bank-transaction-list
+clinrec bank-transaction-recover --transaction-id {TRANSACTION_ID}
 clinrec bank-apply-update --plan data/bank/plans/{TRANSACTION_ID}/plan.json --resume
 clinrec bank-rollback --transaction-id {TRANSACTION_ID}
 ```
@@ -87,8 +101,11 @@ For a controlled pilot before a full active-bank run:
 clinrec bank-fetch-candidate --pilot --code-version 773_2 --code-version 843_1 --code-version 270_2 --code-version 270_3
 clinrec bank-plan-update --candidate data/bank/candidates/{TRANSACTION_ID}
 clinrec bank-stage-update --plan data/bank/plans/{TRANSACTION_ID}/plan.json
-clinrec bank-qa --against candidate --plan data/bank/plans/{TRANSACTION_ID}/plan.json
+clinrec bank-qa --against candidate --phase staged --plan data/bank/plans/{TRANSACTION_ID}/plan.json
 ```
+
+Pilot candidates are isolated review artifacts. Production apply rejects `mode=pilot`
+candidates.
 
 Do not run `clinrec parse`, old `clinrec qa`, `clinrec build-families`, or old
 `clinrec run-all` as part of this raw-bank stage. Do not run `bank-check-previous --all`,
@@ -130,9 +147,46 @@ Candidate catalogs, plans, staging, and journals are transaction scoped:
 - `data/bank/staging/{TRANSACTION_ID}/`
 - `data/bank/transactions/{TRANSACTION_ID}/`
 
-The accepted catalog in `data/bank/state/` is the membership source of truth. It is
-updated only after staged documents have been promoted, candidate QA has passed, and
-the transaction is ready to complete.
+## Accepted Generation Model
+
+The accepted catalog in `data/bank/state/` is the membership source of truth. Accepted
+state is stored as immutable generations:
+
+- `data/bank/state/generations/{GENERATION_ID}/catalog-active.jsonl`
+- `data/bank/state/generations/{GENERATION_ID}/manifest.json`
+- `data/bank/state/generations/{GENERATION_ID}/source.json`
+- `data/bank/state/current.json`
+
+`current.json` is switched with an atomic file replacement and records the generation
+id, catalog path, catalog SHA-256, total records, acceptance time, and transaction id.
+Legacy `accepted-catalog.json` and `accepted-catalog-records.jsonl` are migrated on
+first access and kept only for audit compatibility.
+
+## Candidate Trust Chain
+
+Candidate manifests record the transaction id, mode, selected records, requested/found
+CodeVersions, validation status, and SHA-256 hashes for active and all-status indexes.
+Plan, stage, QA, apply, and resume verify those hashes before trusting the candidate.
+Candidate fetch writes candidate-local indexes and reports, not production `data/indexes/`.
+
+## Transaction Safety
+
+Apply uses one writer lock at `data/bank/state/writer.lock`, an atomic write-ahead
+journal at `data/bank/transactions/{TRANSACTION_ID}/journal.json`, and backups for
+active, legacy, quarantine, and the accepted pointer. Mutating operations are recorded
+before filesystem changes and marked completed only after verification. Rollback runs
+in reverse from backups and restores the previous accepted pointer.
+
+`data/bank/staging/{TRANSACTION_ID}/` contains staged document directories only.
+`staging-summary.json`, QA reports, and journal metadata live under the transaction
+directory. A completed transaction removes its staging directory.
+
+## Review Decisions
+
+Plans with identity conflicts, raw db_id changes, silent source changes, or orphaned
+local records require `data/bank/plans/{TRANSACTION_ID}/decisions.json`. The review
+file records CodeVersion, conflict type, decision, reason, and decision time. Apply
+rejects missing decisions and any decision that asks to abort.
 
 Raw `current/manifest.json` files use schema version `2.0` and must contain a valid
 SHA-256, byte size, validation state, opaque raw status fields, and `db_id_state`.
@@ -151,10 +205,20 @@ Raw status fields such as `status`, `ApplyStatus`, and `ApplyStatusCalculated` a
 preserved as opaque source values. They do not decide active/legacy placement,
 predecessor confirmation, or automatic replacement links in the raw-bank lifecycle.
 
+## Exit Codes
+
+- `0`: success
+- `1`: command/runtime failure
+- `2`: validation failure
+- `3`: manual review required
+- `4`: transaction incomplete
+- `5`: rollback failure
+- `6`: writer lock conflict
+
 ## Development Checks
 
 ```powershell
-python -m pytest
-python -m ruff check .
-python -m mypy src
+.venv\Scripts\python.exe -m pytest
+.venv\Scripts\python.exe -m ruff check .
+.venv\Scripts\python.exe -m mypy src
 ```

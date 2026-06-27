@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Annotated
 
@@ -18,6 +19,7 @@ from clinrec.api.version_discovery import discover_versions as run_discover_vers
 from clinrec.bank.candidate import fetch_candidate_catalog as run_bank_fetch_candidate
 from clinrec.bank.common import BankError, BankRecordFilter
 from clinrec.bank.current import download_current_documents as run_bank_download_current
+from clinrec.bank.decisions import build_decision_template, decisions_path_for_plan
 from clinrec.bank.identities import analyze_identities as run_bank_analyze_identities
 from clinrec.bank.previous import check_previous_documents as run_bank_check_previous
 from clinrec.bank.qa import run_bank_qa
@@ -44,7 +46,12 @@ from clinrec.bank.references import (
 )
 from clinrec.bank.run import run_bank_pipeline
 from clinrec.bank.statuses import analyze_statuses as run_bank_analyze_statuses
-from clinrec.bank.transaction import read_journal, rollback_transaction
+from clinrec.bank.transaction import (
+    list_transactions,
+    read_journal,
+    reconcile_started_operations,
+    rollback_transaction,
+)
 from clinrec.config import DEFAULT_CONFIG_PATH, Settings, ensure_data_directories, load_settings
 from clinrec.logging import configure_logging
 from clinrec.parsing.document import ParseError, ParseOptions
@@ -83,6 +90,23 @@ def placeholder(command_name: str, config_path: Path, *, http_planned: bool = Fa
     if http_planned:
         typer.echo("HTTP download is not implemented for this command yet.")
     structlog.get_logger().info("placeholder_command_completed", command=command_name)
+
+
+def bank_exit_code(exc: Exception) -> int:
+    if not isinstance(exc, BankError):
+        return 1
+    message = str(exc).lower()
+    if "writer lock" in message or "another writer" in message:
+        return 6
+    if "rollback_failed" in message or "rollback failure" in message:
+        return 5
+    if "resume" in message or "incomplete" in message:
+        return 4
+    if "manual review" in message or "review decisions" in message:
+        return 3
+    if any(token in message for token in ("qa", "hash", "validation", "staging", "manifest")):
+        return 2
+    return 1
 
 
 @app.command("sync-catalog")
@@ -144,15 +168,25 @@ def bank_bootstrap(
         bool,
         typer.Option("--force", help="Redownload documents even when local manifests are valid."),
     ] = False,
+    bootstrap_over_existing: Annotated[
+        bool,
+        typer.Option("--bootstrap-over-existing", help="Allow bootstrap over existing bank."),
+    ] = False,
 ) -> None:
     """Create the initial active raw-bank from the current active catalog."""
     settings = bootstrap(config)
     try:
         with ClinrecApiClient(settings.http, settings.rate_limit) as client:
-            summary = run_bank_bootstrap(settings, client, force=force, apply=apply)
+            summary = run_bank_bootstrap(
+                settings,
+                client,
+                force=force,
+                apply=apply,
+                bootstrap_over_existing=bootstrap_over_existing,
+            )
     except (BankError, SyncError) as exc:
         typer.echo(f"bank-bootstrap failed: {exc}", err=True)
-        raise typer.Exit(1) from exc
+        raise typer.Exit(bank_exit_code(exc)) from exc
 
     typer.echo("bank-bootstrap completed")
     typer.echo(f"transaction_id: {summary['transaction_id']}")
@@ -192,7 +226,7 @@ def bank_fetch_candidate(
             )
     except (BankError, SyncError) as exc:
         typer.echo(f"bank-fetch-candidate failed: {exc}", err=True)
-        raise typer.Exit(1) from exc
+        raise typer.Exit(bank_exit_code(exc)) from exc
 
     typer.echo("bank-fetch-candidate completed")
     typer.echo(f"transaction_id: {summary.transaction_id}")
@@ -248,7 +282,7 @@ def bank_plan_update(
                 )
     except (BankError, SyncError) as exc:
         typer.echo(f"bank-plan-update failed: {exc}", err=True)
-        raise typer.Exit(1) from exc
+        raise typer.Exit(bank_exit_code(exc)) from exc
 
     typer.echo("bank-plan-update completed")
     typer.echo(f"plan: {summary['plan']}")
@@ -285,6 +319,10 @@ def bank_apply_update(
         bool,
         typer.Option("--rollback-on-error/--no-rollback-on-error"),
     ] = True,
+    recover_stale_lock: Annotated[
+        bool,
+        typer.Option("--recover-stale-lock", help="Remove a stale writer lock first."),
+    ] = False,
 ) -> None:
     """Apply a reviewed bank update plan."""
     settings = bootstrap(config)
@@ -296,10 +334,11 @@ def bank_apply_update(
             allow_identity_conflict=allow_identity_conflict,
             resume=resume,
             rollback_on_error=rollback_on_error,
+            recover_stale_lock=recover_stale_lock,
         )
     except BankError as exc:
         typer.echo(f"bank-apply-update failed: {exc}", err=True)
-        raise typer.Exit(1) from exc
+        raise typer.Exit(bank_exit_code(exc)) from exc
 
     typer.echo("bank-apply-update completed")
     typer.echo(f"transaction_id: {summary.transaction_id}")
@@ -356,7 +395,7 @@ def bank_stage_update(
             )
     except BankError as exc:
         typer.echo(f"bank-stage-update failed: {exc}", err=True)
-        raise typer.Exit(1) from exc
+        raise typer.Exit(bank_exit_code(exc)) from exc
 
     typer.echo("bank-stage-update completed")
     typer.echo(f"transaction_id: {summary.transaction_id}")
@@ -379,7 +418,7 @@ def bank_rollback(
         journal = rollback_transaction(settings, transaction_id)
     except BankError as exc:
         typer.echo(f"bank-rollback failed: {exc}", err=True)
-        raise typer.Exit(1) from exc
+        raise typer.Exit(bank_exit_code(exc)) from exc
     typer.echo("bank-rollback completed")
     typer.echo(f"transaction_id: {journal['transaction_id']}")
     typer.echo(f"state: {journal['state']}")
@@ -389,6 +428,10 @@ def bank_rollback(
 def bank_transaction_status(
     transaction_id: Annotated[str, typer.Option("--transaction-id")],
     config: ConfigOption = DEFAULT_CONFIG_PATH,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Print the complete journal as JSON."),
+    ] = False,
 ) -> None:
     """Show a raw-bank transaction journal."""
     settings = bootstrap(config)
@@ -396,7 +439,10 @@ def bank_transaction_status(
         journal = read_journal(settings, transaction_id)
     except BankError as exc:
         typer.echo(f"bank-transaction-status failed: {exc}", err=True)
-        raise typer.Exit(1) from exc
+        raise typer.Exit(bank_exit_code(exc)) from exc
+    if json_output:
+        typer.echo(json.dumps(journal, ensure_ascii=False, indent=2, sort_keys=True))
+        return
     typer.echo("bank-transaction-status completed")
     typer.echo(f"transaction_id: {journal['transaction_id']}")
     typer.echo(f"state: {journal['state']}")
@@ -404,13 +450,77 @@ def bank_transaction_status(
     typer.echo(f"errors: {len(journal.get('errors') or [])}")
 
 
+@app.command("bank-transaction-list")
+def bank_transaction_list(config: ConfigOption = DEFAULT_CONFIG_PATH) -> None:
+    """List raw-bank transactions."""
+    settings = bootstrap(config)
+    rows = list_transactions(settings)
+    typer.echo("bank-transaction-list completed")
+    for row in rows:
+        typer.echo(
+            f"{row['transaction_id']}: state={row['state']}, "
+            f"plan={row['plan_id']}, updated_at={row['updated_at']}"
+        )
+
+
+@app.command("bank-transaction-recover")
+def bank_transaction_recover(
+    transaction_id: Annotated[str, typer.Option("--transaction-id")],
+    config: ConfigOption = DEFAULT_CONFIG_PATH,
+) -> None:
+    """Reconcile started journal operations after a crash."""
+    settings = bootstrap(config)
+    try:
+        reconcile_started_operations(settings, transaction_id)
+        journal = read_journal(settings, transaction_id)
+    except BankError as exc:
+        typer.echo(f"bank-transaction-recover failed: {exc}", err=True)
+        raise typer.Exit(bank_exit_code(exc)) from exc
+    typer.echo("bank-transaction-recover completed")
+    typer.echo(f"transaction_id: {transaction_id}")
+    typer.echo(f"state: {journal['state']}")
+
+
+@app.command("bank-review-update")
+def bank_review_update(
+    plan: Annotated[
+        Path,
+        typer.Option(
+            "--plan",
+            help="Path to data/bank/plans/{TRANSACTION_ID}/plan.json.",
+            exists=True,
+            file_okay=True,
+            dir_okay=False,
+            readable=True,
+        ),
+    ],
+    config: ConfigOption = DEFAULT_CONFIG_PATH,
+    decision: Annotated[
+        str,
+        typer.Option("--decision", help="Decision to apply to every required review item."),
+    ] = "use_staged_candidate",
+    reason: Annotated[
+        str,
+        typer.Option("--reason", help="Human review reason."),
+    ] = "manual review approved",
+) -> None:
+    """Create review decisions for plan conflicts."""
+    _ = bootstrap(config)
+    from clinrec.bank.reconcile import load_verified_plan
+
+    plan_payload = load_verified_plan(plan)
+    payload = build_decision_template(plan_payload, decision=decision, reason=reason)
+    path = decisions_path_for_plan(plan)
+    from clinrec.bank.common import atomic_write_json
+
+    atomic_write_json(path, payload)
+    typer.echo("bank-review-update completed")
+    typer.echo(f"decisions: {path}")
+
+
 @app.command("bank-update")
 def bank_update(
     config: ConfigOption = DEFAULT_CONFIG_PATH,
-    apply_update: Annotated[
-        bool,
-        typer.Option("--apply", help="Apply the generated plan after staging new documents."),
-    ] = False,
     verify_existing: Annotated[
         bool,
         typer.Option(
@@ -433,23 +543,17 @@ def bank_update(
             summary = run_bank_update(
                 settings,
                 client,
-                apply=apply_update,
+                apply=False,
                 verify_existing=verify_existing,
                 allow_large_delta=allow_large_delta,
             )
     except (BankError, SyncError) as exc:
         typer.echo(f"bank-update failed: {exc}", err=True)
-        raise typer.Exit(1) from exc
+        raise typer.Exit(bank_exit_code(exc)) from exc
 
     typer.echo("bank-update completed")
     typer.echo(f"plan: {summary['plan']}")
     typer.echo(f"requires_manual_review: {summary['requires_manual_review']}")
-    if apply_update:
-        typer.echo(f"applied: {summary.get('applied', 0)}")
-        typer.echo(f"moved_to_legacy: {summary.get('moved_to_legacy', 0)}")
-        typer.echo(f"reactivated: {summary.get('reactivated', 0)}")
-        typer.echo(f"qa_fatal: {summary.get('qa_fatal', 0)}")
-        typer.echo(f"qa_errors: {summary.get('qa_errors', 0)}")
 
 
 @app.command("bank-update-references")
@@ -693,6 +797,13 @@ def bank_download_current(
         bool,
         typer.Option("--dry-run", help="Show selected records without HTTP requests or writes."),
     ] = False,
+    unsafe_direct_active_write: Annotated[
+        bool,
+        typer.Option(
+            "--unsafe-direct-active-write",
+            help="Write directly to active instead of maintenance staging.",
+        ),
+    ] = False,
 ) -> None:
     """Download active-bank raw GetClinrec2 JSON files only."""
     settings = bootstrap(config)
@@ -705,6 +816,7 @@ def bank_download_current(
         force=force,
         retry_failed=retry_failed,
         dry_run=dry_run,
+        unsafe_direct_active_write=unsafe_direct_active_write,
     )
     try:
         if dry_run:
@@ -714,7 +826,7 @@ def bank_download_current(
                 summary = run_bank_download_current(settings, client, options)
     except BankError as exc:
         typer.echo(f"bank-download-current failed: {exc}", err=True)
-        raise typer.Exit(1) from exc
+        raise typer.Exit(bank_exit_code(exc)) from exc
 
     typer.echo("bank-download-current completed")
     typer.echo(f"planned: {summary.planned}")
@@ -791,7 +903,7 @@ def bank_check_previous(
                 summary = run_bank_check_previous(settings, client, options)
     except BankError as exc:
         typer.echo(f"bank-check-previous failed: {exc}", err=True)
-        raise typer.Exit(1) from exc
+        raise typer.Exit(bank_exit_code(exc)) from exc
 
     typer.echo("bank-check-previous completed")
     typer.echo(f"planned: {summary.planned}")
@@ -827,6 +939,10 @@ def bank_qa(
             dir_okay=False,
             readable=True,
         ),
+    ] = None,
+    phase: Annotated[
+        str | None,
+        typer.Option("--phase", help="Candidate QA phase: staged or applied."),
     ] = None,
     code_version: Annotated[
         list[str] | None,
@@ -866,10 +982,16 @@ def bank_qa(
         all_records=all_records or not any((code_version, code, from_code, to_code)),
     )
     try:
-        summary = run_bank_qa(settings, options, against=against, plan_path=plan)
+        summary = run_bank_qa(
+            settings,
+            options,
+            against=against,
+            phase=phase,
+            plan_path=plan,
+        )
     except BankError as exc:
         typer.echo(f"bank-qa failed: {exc}", err=True)
-        raise typer.Exit(1) from exc
+        raise typer.Exit(bank_exit_code(exc)) from exc
 
     typer.echo("bank-qa completed")
     typer.echo(f"expected: {summary.expected}")
@@ -922,7 +1044,7 @@ def bank_analyze_identities(
         summary = run_bank_analyze_identities(settings, options)
     except BankError as exc:
         typer.echo(f"bank-analyze-identities failed: {exc}", err=True)
-        raise typer.Exit(1) from exc
+        raise typer.Exit(bank_exit_code(exc)) from exc
 
     typer.echo("bank-analyze-identities completed")
     typer.echo(f"unique_db_ids: {summary.unique_db_ids}")
@@ -936,10 +1058,23 @@ def bank_analyze_identities(
 
 
 @app.command("bank-analyze-statuses")
-def bank_analyze_statuses(config: ConfigOption = DEFAULT_CONFIG_PATH) -> None:
+def bank_analyze_statuses(
+    config: ConfigOption = DEFAULT_CONFIG_PATH,
+    candidate: Annotated[
+        Path | None,
+        typer.Option(
+            "--candidate",
+            help="Analyze statuses from a candidate plan.",
+            exists=True,
+            file_okay=True,
+            dir_okay=False,
+            readable=True,
+        ),
+    ] = None,
+) -> None:
     """Count raw catalog/document status values without interpreting them."""
     settings = bootstrap(config)
-    summary = run_bank_analyze_statuses(settings)
+    summary = run_bank_analyze_statuses(settings, candidate_plan=candidate)
 
     typer.echo("bank-analyze-statuses completed")
     typer.echo(f"active_catalog_records: {summary.active_catalog_records}")

@@ -1,14 +1,29 @@
 from __future__ import annotations
 
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from clinrec.api.catalog_sync import write_json
 from clinrec.api.client import ClinrecApiClient
+from clinrec.bank.accepted import (
+    accepted_catalog_sha256 as current_accepted_catalog_sha256,
+)
+from clinrec.bank.accepted import (
+    accepted_current_pointer_path,
+    create_accepted_generation,
+    legacy_accepted_records_path,
+)
+from clinrec.bank.accepted import (
+    read_accepted_catalog_records as read_current_accepted_catalog_records,
+)
 from clinrec.bank.candidate import (
+    candidate_manifest_sha256,
     fetch_candidate_catalog,
     load_candidate_records,
+    verify_candidate_manifest,
+    verify_candidate_manifest_hash,
 )
 from clinrec.bank.common import (
     PLAN_SCHEMA_VERSION,
@@ -20,15 +35,14 @@ from clinrec.bank.common import (
     bank_legacy_root,
     bank_plans_root,
     bank_staging_root,
-    bank_state_root,
     catalog_record_for_bank,
     compact_timestamp,
     current_validation_issues,
     db_id_state,
     load_catalog_records,
+    minimal_validate_raw_document,
     normalize_title,
     read_json_file,
-    read_jsonl,
     relative_to_data_root,
     sha256_file,
     sha256_json,
@@ -36,19 +50,28 @@ from clinrec.bank.common import (
     stable_json_dumps,
     string_value,
     utc_now,
-    write_jsonl,
 )
 from clinrec.bank.current import download_current_documents
+from clinrec.bank.decisions import verify_decisions
 from clinrec.bank.references import enrich_developers, update_references
 from clinrec.bank.transaction import (
+    UNFINISHED_STATES,
+    acquire_writer_lock,
+    begin_operation,
+    complete_operation,
     create_journal,
     ensure_area_backup,
+    ensure_state_backup,
     journal_path,
+    move_active_to_quarantine,
     promote_staged_to_active,
     read_journal,
+    reconcile_started_operations,
+    release_writer_lock,
     remove_legacy_for_reactivation,
     rollback_transaction,
     set_journal_state,
+    transaction_root,
 )
 from clinrec.bank.transaction import (
     move_active_to_legacy as tx_move_active_to_legacy,
@@ -90,21 +113,19 @@ class BankApplySummary:
 
 
 def accepted_catalog_records_path(settings: Settings) -> Path:
-    return bank_state_root(settings) / "accepted-catalog-records.jsonl"
+    return legacy_accepted_records_path(settings)
 
 
 def accepted_catalog_path(settings: Settings) -> Path:
-    return bank_state_root(settings) / "accepted-catalog.json"
+    return accepted_current_pointer_path(settings)
 
 
 def read_accepted_catalog_records(settings: Settings) -> list[dict[str, Any]]:
-    return read_jsonl(accepted_catalog_records_path(settings))
+    return read_current_accepted_catalog_records(settings)
 
 
 def accepted_catalog_sha256(settings: Settings) -> str | None:
-    accepted = read_json_file(accepted_catalog_path(settings))
-    value = accepted.get("sha256")
-    return string_value(value) if value else None
+    return current_accepted_catalog_sha256(settings)
 
 
 def accept_current_catalog(
@@ -133,22 +154,29 @@ def accept_current_catalog(
         raise BankError("Refusing to accept active catalog with identity conflicts.")
 
     current_timestamp = timestamp or compact_timestamp()
-    accepted_records_path = accepted_catalog_records_path(settings)
-    write_jsonl(accepted_records_path, records)
-    sha256 = sha256_rows(records)
-    accepted = {
+    generation = create_accepted_generation(
+        settings,
+        records=records,
+        transaction_id=current_timestamp,
+        generation_id=current_timestamp,
+        snapshot_path=snapshot_path,
+        source_catalog_path=records_path,
+        switch_pointer=True,
+    )
+    return {
+        "schema_version": "2.0",
         "timestamp": current_timestamp,
+        "generation_id": generation.generation_id,
+        "catalog_path": relative_to_data_root(settings, generation.catalog_path),
         "snapshot_path": relative_to_data_root(settings, snapshot_path)
         if snapshot_path is not None
         else None,
-        "records_path": relative_to_data_root(settings, accepted_records_path),
-        "total_records": len(records),
+        "records_path": relative_to_data_root(settings, generation.catalog_path),
+        "total_records": generation.total_records,
         "unique_code_versions": len(set(code_versions)),
-        "sha256": sha256,
-        "accepted_at": utc_now(),
+        "sha256": generation.catalog_sha256,
+        "accepted_at": generation.accepted_at,
     }
-    write_json(accepted_catalog_path(settings), accepted)
-    return accepted
 
 
 def build_update_plan(
@@ -162,6 +190,16 @@ def build_update_plan(
 ) -> BankPlanSummary:
     plan_transaction_id = transaction_id or timestamp or compact_timestamp()
     current_records_path = candidate_records_path or settings.paths.indexes / "catalog-active.jsonl"
+    candidate_manifest: dict[str, Any] | None = None
+    candidate_manifest_path: Path | None = None
+    candidate_manifest_hash: str | None = None
+    if candidate_snapshot_path is not None:
+        candidate_manifest = verify_candidate_manifest(
+            candidate_snapshot_path,
+            transaction_id=plan_transaction_id,
+        )
+        candidate_manifest_path = candidate_snapshot_path / "manifest.json"
+        candidate_manifest_hash = candidate_manifest_sha256(candidate_snapshot_path)
     current_records = load_candidate_records(current_records_path)
     previous_records = read_accepted_catalog_records(settings)
     plan_dir = bank_plans_root(settings) / plan_transaction_id
@@ -186,6 +224,11 @@ def build_update_plan(
         "previous_accepted_catalog_sha256": accepted_catalog_sha256(settings),
         "candidate_catalog_sha256": sha256_file(current_records_path),
         "candidate_catalog_records_path": current_records_path.as_posix(),
+        "candidate_manifest_path": candidate_manifest_path.as_posix()
+        if candidate_manifest_path is not None
+        else None,
+        "candidate_manifest_sha256": candidate_manifest_hash,
+        "candidate_mode": candidate_manifest.get("mode") if candidate_manifest else "legacy",
         "candidate_snapshot_path": candidate_snapshot_path.as_posix()
         if candidate_snapshot_path is not None
         else current_records_path.parent.as_posix(),
@@ -252,7 +295,7 @@ def reconcile_catalogs(
 
     expected = set(current_by_cv)
     missing_locally = sorted(expected - local_active - set(reactivated))
-    orphaned_local = sorted(local_active - expected)
+    orphaned_local = sorted((local_active - expected) - set(removed))
     return {
         "unchanged": unchanged,
         "added": added,
@@ -297,7 +340,7 @@ def stage_update(
     selected_rows = [
         row for row in candidate_rows if string_value(row.get("code_version")) in required
     ]
-    summary_path = bank_staging_root(settings) / transaction_id / "staging-summary.json"
+    summary_path = transaction_root(settings, transaction_id) / "staging-summary.json"
     if dry_run:
         summary = stage_summary_payload(plan, required, [], not_attempted=sorted(required))
         write_json(summary_path, summary)
@@ -332,12 +375,23 @@ def stage_update(
         if document.status in {"downloaded", "already_valid"}
     }
     invalid = strict_staging_failures(settings, transaction_id, validatable)
+    staged_identity_conflicts = staged_db_id_conflicts(settings, transaction_id, validatable)
+    comparisons = verify_existing_comparisons(
+        settings,
+        transaction_id,
+        set(plan_actions(plan, "unchanged")) if verify_existing else set(),
+    )
+    if verify_existing:
+        update_plan_after_verify_existing(plan_path, comparisons)
+        plan = load_verified_plan(plan_path)
     summary = stage_summary_payload(
         plan,
         required,
         documents,
         not_attempted=not_attempted,
         invalid=invalid,
+        staged_identity_conflicts=staged_identity_conflicts,
+        comparisons=comparisons,
     )
     write_json(summary_path, summary)
     if summary["failed"] == 0 and summary["not_attempted"] == 0:
@@ -354,44 +408,69 @@ def apply_update_plan(
     allow_identity_conflict: bool = False,
     resume: bool = False,
     rollback_on_error: bool = True,
+    recover_stale_lock: bool = False,
 ) -> BankApplySummary:
     plan = load_verified_plan(plan_path)
     if plan.get("requires_manual_review") and not allow_manual_review:
         raise BankError("Plan requires manual review before apply.")
-    if plan.get("identity_conflicts") and not allow_identity_conflict:
-        raise BankError("Plan contains identity conflicts; explicit override is required.")
+    _ = allow_identity_conflict
     if plan.get("state") not in {"staged", "ready_to_apply", "applying"}:
         raise BankError(f"Plan state is not applicable: {plan.get('state')}")
-    verify_candidate_hash(plan)
+    verify_candidate_hash(plan, reject_pilot=True)
     verify_previous_catalog_hash(settings, plan)
+    decisions = verify_decisions(plan_path, plan)
 
     transaction_id = string_value(plan["transaction_id"])
     if journal_path(settings, transaction_id).exists():
         journal = read_journal(settings, transaction_id)
         if journal.get("state") == "completed":
             raise BankError("Plan cannot be applied twice.")
-        if not resume and journal.get("state") not in {"created", "applying", "failed"}:
+        if journal.get("state") in UNFINISHED_STATES and not resume:
             raise BankError("Existing transaction requires --resume or rollback.")
+        if resume:
+            reconcile_started_operations(settings, transaction_id)
+    elif resume:
+        raise BankError("Cannot resume without an existing transaction journal.")
 
     required = required_staging_set(plan, verify_existing=False)
     invalid = strict_staging_failures(settings, transaction_id, required)
     if invalid:
         raise BankError(f"Required staging is incomplete or invalid: {invalid}")
 
-    create_journal(
-        settings,
-        transaction_id=transaction_id,
-        plan_id=string_value(plan["plan_id"]),
-        candidate_catalog_sha256=string_value(plan["candidate_catalog_sha256"]),
-        previous_catalog_sha256=plan.get("previous_accepted_catalog_sha256"),
-    )
-    set_journal_state(settings, transaction_id, "applying")
-    update_plan_state(plan_path, "applying")
-
     moved_to_legacy = 0
     reactivated = 0
     promoted = 0
+    lock_acquired = False
     try:
+        acquire_writer_lock(settings, transaction_id, recover_stale=recover_stale_lock)
+        lock_acquired = True
+        create_journal(
+            settings,
+            transaction_id=transaction_id,
+            plan_id=string_value(plan["plan_id"]),
+            candidate_catalog_sha256=string_value(plan["candidate_catalog_sha256"]),
+            previous_catalog_sha256=plan.get("previous_accepted_catalog_sha256"),
+            candidate_manifest_sha256=string_value(plan.get("candidate_manifest_sha256"))
+            if plan.get("candidate_manifest_sha256")
+            else None,
+        )
+        set_journal_state(settings, transaction_id, "staging_validated")
+
+        from clinrec.bank.qa import run_bank_qa
+
+        staged_qa = run_bank_qa(
+            settings,
+            BankRecordFilter(all_records=True),
+            against="candidate",
+            phase="staged",
+            plan_path=plan_path,
+        )
+        if staged_qa.fatal or staged_qa.errors:
+            raise BankError("Candidate staged QA failed.")
+
+        set_journal_state(settings, transaction_id, "applying")
+        update_plan_state(plan_path, "applying")
+
         for code_version in plan_actions(plan, "removed_from_catalog"):
             if tx_move_active_to_legacy(settings, transaction_id, code_version=code_version):
                 write_lifecycle(settings, code_version, plan)
@@ -420,29 +499,56 @@ def apply_update_plan(
             ):
                 promoted += 1
 
+        promoted += apply_review_decisions(settings, transaction_id, decisions)
+        promoted += apply_silent_source_changes(settings, transaction_id, plan)
         update_metadata_sidecars(settings, transaction_id, plan)
 
-        from clinrec.bank.qa import run_bank_qa
-
-        qa_summary = run_bank_qa(
+        applied_qa = run_bank_qa(
             settings,
             BankRecordFilter(all_records=True),
             against="candidate",
+            phase="applied",
             plan_path=plan_path,
         )
-        if qa_summary.fatal or qa_summary.errors:
-            raise BankError("Post-apply candidate QA failed.")
+        if applied_qa.fatal or applied_qa.errors:
+            raise BankError("Candidate applied QA failed.")
+
         if accept_catalog:
-            candidate_path = Path(string_value(plan["candidate_catalog_records_path"]))
-            accept_current_catalog(
+            set_journal_state(settings, transaction_id, "state_committing")
+            ensure_state_backup(settings, transaction_id)
+            pointer_operation = begin_operation(
                 settings,
-                timestamp=transaction_id,
-                snapshot_path=Path(string_value(plan["candidate_snapshot_path"])),
-                records_path=candidate_path,
+                transaction_id,
+                operation_type="accepted_pointer_commit",
+                code_version="__accepted__",
+                source=accepted_catalog_path(settings),
+                target=accepted_catalog_path(settings),
             )
+            candidate_path = Path(string_value(plan["candidate_catalog_records_path"]))
+            create_accepted_generation(
+                settings,
+                records=load_candidate_records(candidate_path),
+                transaction_id=transaction_id,
+                generation_id=transaction_id,
+                snapshot_path=Path(string_value(plan["candidate_snapshot_path"])),
+                source_catalog_path=candidate_path,
+                switch_pointer=True,
+            )
+            complete_operation(settings, transaction_id, pointer_operation)
+
         cleanup_empty_staging(settings, transaction_id)
+        accepted_qa = run_bank_qa(
+            settings,
+            BankRecordFilter(all_records=True),
+            against="accepted",
+        )
+        if accepted_qa.fatal or accepted_qa.errors:
+            raise BankError("Accepted QA failed after pointer switch.")
+
         set_journal_state(settings, transaction_id, "completed")
         update_plan_state(plan_path, "applied")
+        release_writer_lock(settings, transaction_id)
+        lock_acquired = False
     except Exception:
         if rollback_on_error:
             rollback_transaction(settings, transaction_id)
@@ -450,6 +556,8 @@ def apply_update_plan(
         else:
             set_journal_state(settings, transaction_id, "failed")
             update_plan_state(plan_path, "failed")
+            if lock_acquired:
+                release_writer_lock(settings, transaction_id)
         raise
 
     return BankApplySummary(
@@ -467,9 +575,19 @@ def bank_bootstrap(
     *,
     force: bool = False,
     apply: bool = False,
+    bootstrap_over_existing: bool = False,
 ) -> dict[str, Any]:
     if not apply:
         raise BankError("bank-bootstrap requires --apply for transactional bootstrap.")
+    active_entries = (
+        list(bank_active_root(settings).iterdir())
+        if bank_active_root(settings).exists()
+        else []
+    )
+    if active_entries and not bootstrap_over_existing:
+        raise BankError("Bootstrap requires an empty active bank.")
+    if accepted_catalog_path(settings).exists() and not bootstrap_over_existing:
+        raise BankError("Bootstrap requires an empty accepted state.")
     candidate = fetch_candidate_catalog(settings, client)
     plan_summary = build_update_plan(
         settings,
@@ -486,6 +604,8 @@ def bank_bootstrap(
     from clinrec.bank.qa import run_bank_qa
 
     final_qa = run_bank_qa(settings, BankRecordFilter(all_records=True), against="accepted")
+    if final_qa.fatal or final_qa.errors:
+        raise BankError("Bootstrap final accepted QA failed.")
     return {
         "catalog_active_records": candidate.active_total_records,
         "transaction_id": candidate.transaction_id,
@@ -557,12 +677,25 @@ def update_plan_state(path: Path, state: str) -> None:
     write_plan_with_hash(path, plan)
 
 
-def verify_candidate_hash(plan: dict[str, Any]) -> None:
+def verify_candidate_hash(plan: dict[str, Any], *, reject_pilot: bool = False) -> None:
     path = Path(string_value(plan.get("candidate_catalog_records_path")))
     if not path.exists():
         raise BankError(f"Candidate catalog is missing: {path}")
     if sha256_file(path) != plan.get("candidate_catalog_sha256"):
         raise BankError("Candidate catalog hash mismatch.")
+    manifest_path_value = plan.get("candidate_manifest_path")
+    manifest_hash_value = plan.get("candidate_manifest_sha256")
+    if manifest_path_value:
+        manifest_path = Path(string_value(manifest_path_value))
+        candidate_root = manifest_path.parent
+        verify_candidate_manifest(
+            candidate_root,
+            transaction_id=string_value(plan["transaction_id"]),
+        )
+        if manifest_hash_value:
+            verify_candidate_manifest_hash(candidate_root, string_value(manifest_hash_value))
+    if reject_pilot and plan.get("candidate_mode") == "pilot":
+        raise BankError("Pilot candidate cannot be applied to production.")
 
 
 def verify_previous_catalog_hash(settings: Settings, plan: dict[str, Any]) -> None:
@@ -582,10 +715,24 @@ def required_staging_set(plan: dict[str, Any], *, verify_existing: bool) -> set[
         | set(plan_actions(plan, "missing_locally"))
         | set(plan_actions(plan, "reactivated"))
         | set(plan_actions(plan, "silent_source_candidates"))
+        | identity_conflict_code_versions(plan)
     )
     if verify_existing:
         selected |= set(plan_actions(plan, "unchanged"))
     return selected
+
+
+def identity_conflict_code_versions(plan: dict[str, Any]) -> set[str]:
+    code_versions: set[str] = set()
+    for issue in plan_actions(plan, "identity_conflicts"):
+        if not isinstance(issue, dict):
+            continue
+        if isinstance(issue.get("code_versions"), list):
+            code_versions.update(string_value(value) for value in issue["code_versions"])
+        elif issue.get("code_version"):
+            code_versions.add(string_value(issue.get("code_version")))
+    code_versions.discard("")
+    return code_versions
 
 
 def strict_staging_failures(
@@ -602,6 +749,97 @@ def strict_staging_failures(
     return failures
 
 
+def staged_db_id_conflicts(
+    settings: Settings,
+    transaction_id: str,
+    code_versions: set[str],
+) -> list[dict[str, Any]]:
+    conflicts: list[dict[str, Any]] = []
+    staging_root = bank_staging_root(settings) / transaction_id
+    for code_version in sorted(code_versions):
+        manifest = read_json_file(staging_root / code_version / "current" / "manifest.json")
+        if manifest.get("db_id_state") == "mismatch":
+            conflicts.append(
+                {
+                    "code_version": code_version,
+                    "catalog_source_record_id": manifest.get("catalog_source_record_id"),
+                    "document_db_id": manifest.get("document_db_id"),
+                    "db_id_state": "mismatch",
+                }
+            )
+    return conflicts
+
+
+def verify_existing_comparisons(
+    settings: Settings,
+    transaction_id: str,
+    code_versions: set[str],
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    staging_root = bank_staging_root(settings) / transaction_id
+    for code_version in sorted(code_versions):
+        active_raw = bank_active_root(settings) / code_version / "current" / "getclinrec.json"
+        staged_document = staging_root / code_version
+        staged_raw = staged_document / "current" / "getclinrec.json"
+        if not active_raw.exists() or not staged_raw.exists():
+            continue
+        active_bytes = active_raw.read_bytes()
+        staged_bytes = staged_raw.read_bytes()
+        if active_bytes == staged_bytes:
+            shutil.rmtree(staged_document)
+            rows.append({"code_version": code_version, "state": "identical"})
+            continue
+        active_info, active_errors = minimal_validate_raw_document(
+            active_bytes,
+            expected_code_version=code_version,
+        )
+        staged_info, staged_errors = minimal_validate_raw_document(
+            staged_bytes,
+            expected_code_version=code_version,
+        )
+        if active_info is None or staged_info is None or active_errors or staged_errors:
+            rows.append({"code_version": code_version, "state": "staged_invalid"})
+            continue
+        if active_info.db_id == staged_info.db_id:
+            rows.append({"code_version": code_version, "state": "silent_source_change"})
+        else:
+            rows.append(
+                {
+                    "code_version": code_version,
+                    "state": "raw_identity_conflict",
+                    "active_db_id": active_info.db_id,
+                    "staged_db_id": staged_info.db_id,
+                }
+            )
+    return rows
+
+
+def update_plan_after_verify_existing(
+    plan_path: Path,
+    comparisons: list[dict[str, Any]],
+) -> None:
+    if not comparisons:
+        return
+    plan = load_verified_plan(plan_path)
+    actions_value = plan.get("actions")
+    actions = dict(actions_value) if isinstance(actions_value, dict) else {}
+    silent = set(plan_actions(plan, "silent_source_candidates"))
+    raw_conflicts = list(plan_actions(plan, "raw_identity_conflicts"))
+    for row in comparisons:
+        code_version = string_value(row.get("code_version"))
+        state = row.get("state")
+        if state == "silent_source_change":
+            silent.add(code_version)
+        elif state == "raw_identity_conflict":
+            raw_conflicts.append(row)
+    actions["silent_source_candidates"] = sorted(silent)
+    actions["raw_identity_conflicts"] = raw_conflicts
+    plan["actions"] = actions
+    plan["silent_source_candidates"] = actions["silent_source_candidates"]
+    plan["raw_identity_conflicts"] = actions["raw_identity_conflicts"]
+    write_plan_with_hash(plan_path, plan)
+
+
 def stage_summary_payload(
     plan: dict[str, Any],
     required: set[str],
@@ -609,12 +847,16 @@ def stage_summary_payload(
     *,
     not_attempted: list[str],
     invalid: dict[str, list[str]] | None = None,
+    staged_identity_conflicts: list[dict[str, Any]] | None = None,
+    comparisons: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     invalid = invalid or {}
+    staged_identity_conflicts = staged_identity_conflicts or []
+    comparisons = comparisons or []
     failed_documents = [
         row for row in documents if row["status"] not in {"downloaded", "already_valid"}
     ]
-    failed = len(failed_documents) + len(invalid)
+    failed = len(failed_documents) + len(invalid) + len(staged_identity_conflicts)
     return {
         "transaction_id": plan["transaction_id"],
         "plan_id": plan["plan_id"],
@@ -625,10 +867,17 @@ def stage_summary_payload(
         "failed": failed,
         "not_attempted": len(not_attempted),
         "circuit_open": any(row["status"] == "circuit_open" for row in documents),
-        "identity_conflicts": plan_actions(plan, "identity_conflicts"),
+        "identity_conflicts": plan_actions(plan, "identity_conflicts")
+        + staged_identity_conflicts,
+        "verify_existing_comparisons": comparisons,
         "documents": documents,
         "invalid": invalid,
-        "blocking_conditions": blocking_conditions(failed, not_attempted, invalid),
+        "blocking_conditions": blocking_conditions(
+            failed,
+            not_attempted,
+            invalid,
+            staged_identity_conflicts,
+        ),
     }
 
 
@@ -651,6 +900,7 @@ def blocking_conditions(
     failed: int,
     not_attempted: list[str],
     invalid: dict[str, list[str]],
+    staged_identity_conflicts: list[dict[str, Any]],
 ) -> list[str]:
     conditions: list[str] = []
     if failed:
@@ -659,6 +909,8 @@ def blocking_conditions(
         conditions.append("not_attempted_documents")
     if invalid:
         conditions.append("invalid_staging_documents")
+    if staged_identity_conflicts:
+        conditions.append("raw_identity_conflict")
     return conditions
 
 
@@ -676,6 +928,76 @@ def update_metadata_sidecars(settings: Settings, transaction_id: str, plan: dict
         )
         archive_catalog_sidecar(settings, code_version, catalog_path, transaction_id)
         write_json(catalog_path, records[code_version])
+
+
+def apply_review_decisions(
+    settings: Settings,
+    transaction_id: str,
+    decisions: dict[str, Any] | None,
+) -> int:
+    if not decisions:
+        return 0
+    promoted = 0
+    for row in decisions.get("decisions") or []:
+        if not isinstance(row, dict):
+            continue
+        code_version = string_value(row.get("code_version"))
+        conflict_type = string_value(row.get("conflict_type"))
+        decision = string_value(row.get("decision"))
+        staging_document = bank_staging_root(settings) / transaction_id / code_version
+        if conflict_type == "orphaned_local":
+            if decision != "move_to_quarantine":
+                raise BankError("Orphaned local records must be moved to quarantine or aborted.")
+            if move_active_to_quarantine(
+                settings,
+                transaction_id,
+                code_version=code_version,
+                reason=string_value(row.get("reason")),
+            ):
+                promoted += 1
+            continue
+        if decision == "move_current_to_quarantine_and_use_staged":
+            move_active_to_quarantine(
+                settings,
+                transaction_id,
+                code_version=code_version,
+                reason=string_value(row.get("reason")),
+            )
+            if promote_staged_to_active(
+                settings,
+                transaction_id,
+                code_version=code_version,
+                staging_document=staging_document,
+            ):
+                promoted += 1
+        elif decision == "use_staged_candidate":
+            if promote_staged_to_active(
+                settings,
+                transaction_id,
+                code_version=code_version,
+                staging_document=staging_document,
+            ):
+                promoted += 1
+        elif decision in {"keep_current_and_reject_candidate", "associate_with_candidate"}:
+            raise BankError(f"Review decision is not production-applicable yet: {decision}")
+    return promoted
+
+
+def apply_silent_source_changes(
+    settings: Settings,
+    transaction_id: str,
+    plan: dict[str, Any],
+) -> int:
+    promoted = 0
+    for code_version in plan_actions(plan, "silent_source_candidates"):
+        if promote_staged_to_active(
+            settings,
+            transaction_id,
+            code_version=code_version,
+            staging_document=bank_staging_root(settings) / transaction_id / code_version,
+        ):
+            promoted += 1
+    return promoted
 
 
 def archive_catalog_sidecar(
@@ -706,8 +1028,14 @@ def archive_catalog_sidecar(
 
 def cleanup_empty_staging(settings: Settings, transaction_id: str) -> None:
     root = bank_staging_root(settings) / transaction_id
-    if root.exists() and not any(root.iterdir()):
-        root.rmdir()
+    if not root.exists():
+        return
+    entries = list(root.iterdir())
+    if entries:
+        raise BankError(
+            f"Transaction staging is not empty after apply: {[entry.name for entry in entries]}"
+        )
+    root.rmdir()
 
 
 def write_lifecycle(settings: Settings, code_version: str, plan: dict[str, Any]) -> None:

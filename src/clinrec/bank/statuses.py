@@ -7,14 +7,16 @@ from pathlib import Path
 from typing import Any
 
 from clinrec.api.catalog_sync import write_json
+from clinrec.bank.accepted import load_accepted_generation
 from clinrec.bank.common import (
+    BankError,
     bank_active_root,
     bank_legacy_root,
     bank_reports_root,
-    catalog_index_path,
     first_present,
     read_json_file,
     read_jsonl,
+    sha256_file,
     string_value,
     utc_now,
 )
@@ -31,15 +33,21 @@ class BankStatusAnalysisSummary:
     documents: int
 
 
-def analyze_statuses(settings: Settings) -> BankStatusAnalysisSummary:
+def analyze_statuses(
+    settings: Settings,
+    *,
+    candidate_plan: Path | None = None,
+) -> BankStatusAnalysisSummary:
     reports_root = bank_reports_root(settings)
     reports_root.mkdir(parents=True, exist_ok=True)
     report_path = reports_root / "status-analysis.json"
     csv_path = reports_root / "status-analysis.csv"
     transitions_path = reports_root / "status-transitions.csv"
 
-    active_catalog = read_jsonl(catalog_index_path(settings, active=True))
-    all_statuses_catalog = read_jsonl(catalog_index_path(settings, active=False))
+    active_catalog, all_statuses_catalog, source = status_catalog_sources(
+        settings,
+        candidate_plan=candidate_plan,
+    )
     documents = document_status_rows(settings)
     transition_rows = neighboring_status_rows(all_statuses_catalog)
 
@@ -66,6 +74,7 @@ def analyze_statuses(settings: Settings) -> BankStatusAnalysisSummary:
         report_path,
         {
             "generated_at": utc_now(),
+            "source": source,
             "status_interpretation": "unknown",
             "active_catalog_records": len(active_catalog),
             "all_statuses_catalog_records": len(all_statuses_catalog),
@@ -92,6 +101,44 @@ def analyze_statuses(settings: Settings) -> BankStatusAnalysisSummary:
         active_catalog_records=len(active_catalog),
         all_statuses_catalog_records=len(all_statuses_catalog),
         documents=len(documents),
+    )
+
+
+def status_catalog_sources(
+    settings: Settings,
+    *,
+    candidate_plan: Path | None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+    if candidate_plan is not None:
+        from clinrec.bank.reconcile import load_verified_plan, verify_candidate_hash
+
+        plan = load_verified_plan(candidate_plan)
+        verify_candidate_hash(plan)
+        active_path = Path(string_value(plan.get("candidate_catalog_records_path")))
+        snapshot_root = Path(string_value(plan.get("candidate_snapshot_path")))
+        all_statuses_path = snapshot_root / "catalog-all-statuses.jsonl"
+        return (
+            read_jsonl(active_path),
+            read_jsonl(all_statuses_path),
+            {
+                "type": "candidate",
+                "plan": candidate_plan.as_posix(),
+                "active_sha256": sha256_file(active_path),
+                "all_statuses_sha256": sha256_file(all_statuses_path),
+            },
+        )
+    try:
+        generation = load_accepted_generation(settings)
+    except BankError:
+        return [], [], {"type": "accepted", "error": "missing_accepted_generation"}
+    return (
+        read_jsonl(generation.catalog_path),
+        [],
+        {
+            "type": "accepted",
+            "generation_id": generation.generation_id,
+            "active_sha256": generation.catalog_sha256,
+        },
     )
 
 

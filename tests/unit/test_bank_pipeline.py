@@ -15,8 +15,10 @@ from clinrec.bank.common import (
     bank_active_root,
     bank_legacy_root,
     manifest_for_raw_json,
+    read_json_file,
     read_jsonl,
     sha256_bytes,
+    sha256_file,
     write_jsonl,
 )
 from clinrec.bank.current import download_current_documents
@@ -26,6 +28,7 @@ from clinrec.bank.qa import run_bank_qa
 from clinrec.bank.reconcile import (
     accept_current_catalog,
     apply_update_plan,
+    bank_bootstrap,
     build_update_plan,
     reconcile_catalogs,
     stage_update,
@@ -33,6 +36,7 @@ from clinrec.bank.reconcile import (
 )
 from clinrec.bank.references import enrich_developers, update_references
 from clinrec.bank.statuses import analyze_statuses
+from clinrec.bank.transaction import acquire_writer_lock, release_writer_lock
 from clinrec.config import (
     ConcurrencySettings,
     DiscoverySettings,
@@ -110,6 +114,46 @@ def write_catalog_indexes(
 ) -> None:
     write_jsonl(settings.paths.indexes / "catalog-active.jsonl", active)
     write_jsonl(settings.paths.indexes / "catalog-all-statuses.jsonl", all_statuses or active)
+
+
+def write_candidate_catalog(
+    settings: Settings,
+    transaction_id: str,
+    rows: list[dict[str, Any]],
+    *,
+    all_statuses: list[dict[str, Any]] | None = None,
+    mode: str = "production",
+    requested_code_versions: list[str] | None = None,
+) -> tuple[Path, Path]:
+    candidate_dir = settings.paths.data_root / "bank" / "candidates" / transaction_id
+    active_path = candidate_dir / "catalog-active.jsonl"
+    all_statuses_path = candidate_dir / "catalog-all-statuses.jsonl"
+    write_jsonl(active_path, rows)
+    write_jsonl(all_statuses_path, all_statuses or rows)
+    requested = sorted(requested_code_versions or [])
+    found = sorted({str(row.get("code_version")) for row in rows})
+    missing = sorted(set(requested) - set(found))
+    write_json(
+        candidate_dir / "manifest.json",
+        {
+            "schema_version": "2.0",
+            "transaction_id": transaction_id,
+            "mode": mode,
+            "created_at": "2026-01-01T00:00:00Z",
+            "source_active_total_records": len(rows),
+            "selected_records": len(rows),
+            "active_total_records": len(rows),
+            "active_unique_code_versions": len(found),
+            "active_index_sha256": sha256_file(active_path),
+            "all_statuses_index_sha256": sha256_file(all_statuses_path),
+            "requested_code_versions": requested,
+            "found_code_versions": found,
+            "missing_requested_code_versions": missing,
+            "validation_status": "valid" if not missing else "invalid",
+            "validation_issues": [],
+        },
+    )
+    return candidate_dir, active_path
 
 
 def json_result(code_version: str, content: bytes) -> JsonPayloadResult:
@@ -233,7 +277,7 @@ def test_bank_download_current_preserves_raw_and_creates_no_parsed_outputs(
     summary = download_current_documents(
         settings,
         Client(),  # type: ignore[arg-type]
-        BankRecordFilter(code_versions=["843_1"]),
+        BankRecordFilter(code_versions=["843_1"], unsafe_direct_active_write=True),
     )
 
     document_dir = settings.paths.data_root / "bank" / "active" / "843_1"
@@ -283,7 +327,7 @@ def test_bank_download_current_uses_real_773_2_fixture_byte_for_byte(
     summary = download_current_documents(
         settings,
         Client(),  # type: ignore[arg-type]
-        BankRecordFilter(code_versions=["773_2"]),
+        BankRecordFilter(code_versions=["773_2"], unsafe_direct_active_write=True),
     )
 
     document_dir = settings.paths.data_root / "bank" / "active" / "773_2"
@@ -538,6 +582,30 @@ def test_bank_qa_reports_catalog_db_id_mismatch(tmp_path: Path) -> None:
     assert "catalog_db_id_mismatch" in anomalies
 
 
+def test_accepted_generation_pointer_detects_catalog_tampering(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    row = catalog_row("843_1", 843, 1, 0, source_record_id=1737)
+
+    accepted = accept_current_catalog(settings, timestamp="20260101T000000Z", records=[row])
+    pointer = read_json_file(settings.paths.data_root / "bank" / "state" / "current.json")
+    generation_catalog = (
+        settings.paths.data_root
+        / "bank"
+        / "state"
+        / "generations"
+        / accepted["generation_id"]
+        / "catalog-active.jsonl"
+    )
+
+    assert pointer["generation_id"] == accepted["generation_id"]
+    assert generation_catalog.exists()
+
+    generation_catalog.write_text("", encoding="utf-8")
+
+    with pytest.raises(BankError, match="hash mismatch"):
+        run_bank_qa(settings, BankRecordFilter(all_records=True))
+
+
 def test_strict_manifest_requires_v2_valid_sha_and_size(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
     row = catalog_row("843_1", 843, 1, 0, source_record_id=1737)
@@ -577,7 +645,7 @@ def test_failed_force_attempt_preserves_last_known_good_manifest(tmp_path: Path)
     download_current_documents(
         settings,
         GoodClient(),  # type: ignore[arg-type]
-        BankRecordFilter(code_versions=["843_1"]),
+        BankRecordFilter(code_versions=["843_1"], unsafe_direct_active_write=True),
     )
     current_root = bank_active_root(settings) / "843_1" / "current"
     raw_before = (current_root / "getclinrec.json").read_bytes()
@@ -596,7 +664,11 @@ def test_failed_force_attempt_preserves_last_known_good_manifest(tmp_path: Path)
     summary = download_current_documents(
         settings,
         FailingClient(),  # type: ignore[arg-type]
-        BankRecordFilter(code_versions=["843_1"], force=True),
+        BankRecordFilter(
+            code_versions=["843_1"],
+            force=True,
+            unsafe_direct_active_write=True,
+        ),
     )
 
     assert summary.failed == 1
@@ -705,9 +777,11 @@ def test_bank_plan_large_drop_requires_review(tmp_path: Path) -> None:
 
 def test_plan_contains_hashes_and_rejects_modified_plan(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
-    candidate_dir = settings.paths.data_root / "bank" / "candidates" / "tx-plan"
-    candidate_records = candidate_dir / "catalog-active.jsonl"
-    write_jsonl(candidate_records, [catalog_row("843_1", 843, 1, 0)])
+    candidate_dir, candidate_records = write_candidate_catalog(
+        settings,
+        "tx-plan",
+        [catalog_row("843_1", 843, 1, 0)],
+    )
 
     summary = build_update_plan(
         settings,
@@ -719,6 +793,7 @@ def test_plan_contains_hashes_and_rejects_modified_plan(tmp_path: Path) -> None:
 
     assert plan["schema_version"] == "2.0"
     assert plan["candidate_catalog_sha256"]
+    assert plan["candidate_manifest_sha256"]
     assert plan["plan_sha256"]
 
     plan["candidate_total"] = 999
@@ -728,11 +803,36 @@ def test_plan_contains_hashes_and_rejects_modified_plan(tmp_path: Path) -> None:
         apply_update_plan(settings, summary.plan_path, allow_manual_review=True)
 
 
+def test_candidate_manifest_hash_mismatch_is_rejected(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    candidate_dir, candidate_records = write_candidate_catalog(
+        settings,
+        "tx-manifest",
+        [catalog_row("843_1", 843, 1, 0)],
+    )
+    summary = build_update_plan(
+        settings,
+        transaction_id="tx-manifest",
+        candidate_records_path=candidate_records,
+        candidate_snapshot_path=candidate_dir,
+    )
+    update_plan_state(summary.plan_path, "staged")
+    manifest_path = candidate_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text("utf-8"))
+    manifest["selected_records"] = 999
+    write_json(manifest_path, manifest)
+
+    with pytest.raises(BankError, match="Candidate manifest hash mismatch"):
+        apply_update_plan(settings, summary.plan_path, allow_manual_review=True)
+
+
 def test_stale_candidate_catalog_is_rejected(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
-    candidate_dir = settings.paths.data_root / "bank" / "candidates" / "tx-stale"
-    candidate_records = candidate_dir / "catalog-active.jsonl"
-    write_jsonl(candidate_records, [catalog_row("843_1", 843, 1, 0)])
+    candidate_dir, candidate_records = write_candidate_catalog(
+        settings,
+        "tx-stale",
+        [catalog_row("843_1", 843, 1, 0)],
+    )
     summary = build_update_plan(
         settings,
         transaction_id="tx-stale",
@@ -754,9 +854,11 @@ def test_stale_candidate_catalog_is_rejected(tmp_path: Path) -> None:
 
 def test_apply_without_complete_staging_is_rejected(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
-    candidate_dir = settings.paths.data_root / "bank" / "candidates" / "tx-missing-stage"
-    candidate_records = candidate_dir / "catalog-active.jsonl"
-    write_jsonl(candidate_records, [catalog_row("843_1", 843, 1, 0)])
+    candidate_dir, candidate_records = write_candidate_catalog(
+        settings,
+        "tx-missing-stage",
+        [catalog_row("843_1", 843, 1, 0)],
+    )
     summary = build_update_plan(
         settings,
         transaction_id="tx-missing-stage",
@@ -771,10 +873,9 @@ def test_apply_without_complete_staging_is_rejected(tmp_path: Path) -> None:
 
 def test_stage_circuit_breaker_reports_not_attempted(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
-    candidate_dir = settings.paths.data_root / "bank" / "candidates" / "tx-circuit"
-    candidate_records = candidate_dir / "catalog-active.jsonl"
-    write_jsonl(
-        candidate_records,
+    candidate_dir, candidate_records = write_candidate_catalog(
+        settings,
+        "tx-circuit",
         [
             catalog_row("843_1", 843, 1, 0),
             catalog_row("773_2", 773, 2, 0),
@@ -805,10 +906,12 @@ def test_stage_circuit_breaker_reports_not_attempted(tmp_path: Path) -> None:
 
 def test_candidate_qa_uses_plan_snapshot_and_staging(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
-    candidate_dir = settings.paths.data_root / "bank" / "candidates" / "tx-candidate-qa"
-    candidate_records = candidate_dir / "catalog-active.jsonl"
     row = catalog_row("843_1", 843, 1, 0, source_record_id=1737)
-    write_jsonl(candidate_records, [row])
+    candidate_dir, candidate_records = write_candidate_catalog(
+        settings,
+        "tx-candidate-qa",
+        [row],
+    )
     plan = build_update_plan(
         settings,
         transaction_id="tx-candidate-qa",
@@ -834,6 +937,51 @@ def test_candidate_qa_uses_plan_snapshot_and_staging(tmp_path: Path) -> None:
 
     assert summary.fatal == 0
     assert summary.completeness_path.parent.parent.name == "tx-candidate-qa"
+
+
+def test_candidate_staged_qa_rejects_extra_staging_folder(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    row = catalog_row("843_1", 843, 1, 0, source_record_id=1737)
+    candidate_dir, candidate_records = write_candidate_catalog(
+        settings,
+        "tx-extra-stage",
+        [row],
+    )
+    plan = build_update_plan(
+        settings,
+        transaction_id="tx-extra-stage",
+        candidate_records_path=candidate_records,
+        candidate_snapshot_path=candidate_dir,
+    )
+    write_valid_bank_document(
+        settings.paths.data_root / "bank" / "staging" / "tx-extra-stage" / "843_1",
+        "843_1",
+        code=843,
+        version=1,
+        source_record_id=1737,
+        db_id=1737,
+    )
+    write_valid_bank_document(
+        settings.paths.data_root / "bank" / "staging" / "tx-extra-stage" / "999_1",
+        "999_1",
+        code=999,
+        version=1,
+        source_record_id=9991,
+        db_id=9991,
+    )
+    update_plan_state(plan.plan_path, "staged")
+
+    summary = run_bank_qa(
+        settings,
+        BankRecordFilter(all_records=True),
+        against="candidate",
+        phase="staged",
+        plan_path=plan.plan_path,
+    )
+    completeness = json.loads(summary.completeness_path.read_text("utf-8"))
+
+    assert summary.fatal >= 1
+    assert completeness["unexpected_staging_folders"] == ["999_1"]
 
 
 def test_bank_apply_moves_removed_to_legacy_and_reactivates(tmp_path: Path) -> None:
@@ -887,9 +1035,11 @@ def test_bank_apply_moves_removed_to_legacy_and_reactivates(tmp_path: Path) -> N
             "pdf_status": "not_requested",
         },
     )
-    candidate_dir = settings.paths.data_root / "bank" / "candidates" / "20260101T000000Z"
-    candidate_records = candidate_dir / "catalog-active.jsonl"
-    write_jsonl(candidate_records, [candidate_record])
+    candidate_dir, candidate_records = write_candidate_catalog(
+        settings,
+        "20260101T000000Z",
+        [candidate_record],
+    )
     plan_summary = build_update_plan(
         settings,
         transaction_id="20260101T000000Z",
@@ -905,6 +1055,83 @@ def test_bank_apply_moves_removed_to_legacy_and_reactivates(tmp_path: Path) -> N
     assert (bank_legacy_root(settings) / "100_1" / "lifecycle.json").exists()
     assert (bank_active_root(settings) / "200_1").exists()
     assert accepted_catalog_path(settings).exists()
+    assert not (settings.paths.data_root / "bank" / "staging" / "20260101T000000Z").exists()
+    assert (
+        settings.paths.data_root
+        / "bank"
+        / "transactions"
+        / "20260101T000000Z"
+        / "staging-summary.json"
+    ).parent.exists()
+
+
+def test_pilot_candidate_cannot_apply_to_production(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    candidate_dir, candidate_records = write_candidate_catalog(
+        settings,
+        "tx-pilot",
+        [catalog_row("843_1", 843, 1, 0)],
+        mode="pilot",
+        requested_code_versions=["843_1"],
+    )
+    plan = build_update_plan(
+        settings,
+        transaction_id="tx-pilot",
+        candidate_records_path=candidate_records,
+        candidate_snapshot_path=candidate_dir,
+    )
+    update_plan_state(plan.plan_path, "staged")
+
+    with pytest.raises(BankError, match="Pilot candidate"):
+        apply_update_plan(settings, plan.plan_path, allow_manual_review=True)
+
+
+def test_bank_download_current_defaults_to_maintenance_staging(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    write_catalog_indexes(settings, active=[catalog_row("843_1", 843, 1, 0)])
+    raw = (FIXTURES / "clinrec_843_1_real_shape.json").read_bytes()
+
+    class Client:
+        def fetch_clinrec_payload(self, code_version: str) -> JsonPayloadResult:
+            return json_result(code_version, raw)
+
+    summary = download_current_documents(
+        settings,
+        Client(),  # type: ignore[arg-type]
+        BankRecordFilter(code_versions=["843_1"], timestamp="tx-maintenance"),
+    )
+
+    assert summary.downloaded == 1
+    assert not (bank_active_root(settings) / "843_1").exists()
+    assert (
+        settings.paths.data_root
+        / "bank"
+        / "maintenance"
+        / "download-current"
+        / "tx-maintenance"
+        / "843_1"
+        / "current"
+        / "getclinrec.json"
+    ).exists()
+
+
+def test_writer_lock_rejects_concurrent_transaction(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+
+    acquire_writer_lock(settings, "tx-one")
+    try:
+        with pytest.raises(BankError, match="Another writer"):
+            acquire_writer_lock(settings, "tx-two")
+    finally:
+        release_writer_lock(settings, "tx-one")
+
+
+def test_bootstrap_refuses_existing_bank(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    (bank_active_root(settings) / "843_1").mkdir(parents=True)
+
+    with pytest.raises(BankError, match="empty active bank"):
+        bank_bootstrap(settings, object(), apply=True)  # type: ignore[arg-type]
 
 
 def test_bank_update_references_failure_does_not_raise(tmp_path: Path) -> None:
@@ -996,14 +1223,16 @@ def test_bank_enrich_developers_resolves_nko_after_download(tmp_path: Path) -> N
 
 def test_bank_analyze_statuses_preserves_raw_values(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
+    active_rows = [catalog_row("100_1", 100, 1, 7)]
     write_catalog_indexes(
         settings,
-        active=[catalog_row("100_1", 100, 1, 7)],
+        active=active_rows,
         all_statuses=[
             catalog_row("100_1", 100, 1, 7),
             catalog_row("100_2", 100, 2, 9),
         ],
     )
+    accept_current_catalog(settings, timestamp="20260101T000000Z", records=active_rows)
     current_root = bank_active_root(settings) / "100_1" / "current"
     current_root.mkdir(parents=True)
     write_json(

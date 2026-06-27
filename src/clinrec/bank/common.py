@@ -47,6 +47,7 @@ class BankRecordFilter:
     retry_failed: bool = False
     dry_run: bool = False
     timestamp: str | None = None
+    unsafe_direct_active_write: bool = False
 
 
 @dataclass(frozen=True)
@@ -157,7 +158,7 @@ def catalog_index_path(settings: Settings, *, active: bool) -> Path:
 
 
 def accepted_catalog_path(settings: Settings) -> Path:
-    return bank_state_root(settings) / "accepted-catalog.json"
+    return bank_state_root(settings) / "current.json"
 
 
 def read_json_file(path: Path) -> dict[str, Any]:

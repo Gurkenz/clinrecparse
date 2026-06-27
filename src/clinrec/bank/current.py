@@ -12,6 +12,7 @@ from clinrec.bank.common import (
     BankRecordFilter,
     add_catalog_status_fields,
     append_checkpoint,
+    bank_root,
     catalog_record_for_bank,
     compact_timestamp,
     current_dir,
@@ -82,6 +83,12 @@ def download_current_documents(
     if client is None:
         raise BankError("HTTP client is required unless --dry-run is used.")
 
+    effective_destination_root = destination_root
+    if destination_root is None and not options.unsafe_direct_active_write:
+        effective_destination_root = (
+            bank_root(settings) / "maintenance" / "download-current" / timestamp
+        )
+
     documents: list[BankDownloadDocumentSummary] = []
     for record in records:
         code_version = string_value(record.get("code_version"))
@@ -91,7 +98,7 @@ def download_current_documents(
                 client,
                 record,
                 options,
-                destination_root=destination_root,
+                destination_root=effective_destination_root,
             )
         except (KeyboardInterrupt, SystemExit):
             raise
@@ -100,7 +107,7 @@ def download_current_documents(
                 settings,
                 code_version,
                 str(exc),
-                destination_root=destination_root,
+                destination_root=effective_destination_root,
             )
         documents.append(document)
         append_checkpoint(
@@ -237,6 +244,9 @@ def download_one_current(
             status="failed",
             error=error,
         )
+
+    if destination_root is None and options.force and target_path.exists():
+        ensure_direct_identity_is_unchanged(target_path, result.raw_content, code_version)
 
     history_path = preserve_silent_source_change(
         settings,
@@ -430,6 +440,28 @@ def preserve_silent_source_change(
     history_path.parent.mkdir(parents=True, exist_ok=True)
     history_path.write_bytes(old_content)
     return Path(history_path)
+
+
+def ensure_direct_identity_is_unchanged(
+    target_path: Path,
+    new_content: bytes,
+    code_version: str,
+) -> None:
+    old_content = target_path.read_bytes()
+    old_info, old_errors = minimal_validate_raw_document(
+        old_content,
+        expected_code_version=code_version,
+    )
+    new_info, new_errors = minimal_validate_raw_document(
+        new_content,
+        expected_code_version=code_version,
+    )
+    if old_info is None or new_info is None or old_errors or new_errors:
+        return
+    if old_info.db_id != new_info.db_id:
+        raise BankError(
+            "Refusing unsafe direct active replacement because document db_id changed."
+        )
 
 
 def raw_result_from_fixture(
