@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +14,7 @@ from clinrec.bank.common import (
     BankRecordFilter,
     accepted_catalog_path,
     bank_active_root,
+    bank_history_root,
     bank_legacy_root,
     manifest_for_raw_json,
     read_json_file,
@@ -29,6 +31,7 @@ from clinrec.bank.reconcile import (
     accept_current_catalog,
     apply_update_plan,
     bank_bootstrap,
+    build_execution_actions,
     build_update_plan,
     reconcile_catalogs,
     stage_update,
@@ -36,7 +39,19 @@ from clinrec.bank.reconcile import (
 )
 from clinrec.bank.references import enrich_developers, update_references
 from clinrec.bank.statuses import analyze_statuses
-from clinrec.bank.transaction import acquire_writer_lock, release_writer_lock
+from clinrec.bank.transaction import (
+    acquire_writer_lock,
+    begin_operation,
+    create_journal,
+    ensure_area_backup,
+    journal_path,
+    promote_staged_to_active,
+    read_journal,
+    reconcile_started_operations,
+    release_writer_lock,
+    transaction_root,
+    writer_lock_path,
+)
 from clinrec.config import (
     ConcurrencySettings,
     DiscoverySettings,
@@ -1113,6 +1128,277 @@ def test_bank_download_current_defaults_to_maintenance_staging(tmp_path: Path) -
         / "current"
         / "getclinrec.json"
     ).exists()
+
+
+def test_completed_promotion_resume_does_not_archive_active_target(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    create_journal(
+        settings,
+        transaction_id="tx-promote",
+        plan_id="plan-tx-promote",
+        candidate_catalog_sha256="candidate",
+        previous_catalog_sha256=None,
+    )
+    staging = settings.paths.data_root / "bank" / "staging" / "tx-promote" / "843_1"
+    (staging / "current").mkdir(parents=True)
+    (staging / "current" / "getclinrec.json").write_bytes(b"raw")
+
+    assert promote_staged_to_active(
+        settings,
+        "tx-promote",
+        code_version="843_1",
+        staging_document=staging,
+    )
+    assert not staging.exists()
+
+    assert not promote_staged_to_active(
+        settings,
+        "tx-promote",
+        code_version="843_1",
+        staging_document=staging,
+    )
+    assert (bank_active_root(settings) / "843_1").exists()
+    assert not bank_history_root(settings).exists()
+
+
+def test_reconcile_started_move_uses_expected_source_hash(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    create_journal(
+        settings,
+        transaction_id="tx-started-move",
+        plan_id="plan-tx-started-move",
+        candidate_catalog_sha256="candidate",
+        previous_catalog_sha256=None,
+    )
+    source = bank_active_root(settings) / "100_1"
+    target = bank_legacy_root(settings) / "100_1"
+    source.mkdir(parents=True)
+    (source / "payload.txt").write_text("expected", encoding="utf-8")
+    begin_operation(
+        settings,
+        "tx-started-move",
+        operation_type="move_active_to_legacy",
+        code_version="100_1",
+        source=source,
+        target=target,
+    )
+    target.parent.mkdir(parents=True)
+    source.replace(target)
+
+    reconcile_started_operations(settings, "tx-started-move")
+
+    journal = read_journal(settings, "tx-started-move")
+    assert journal["operations"][0]["state"] == "completed"
+
+
+def test_reconcile_started_move_rejects_wrong_target_hash(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    create_journal(
+        settings,
+        transaction_id="tx-wrong-target",
+        plan_id="plan-tx-wrong-target",
+        candidate_catalog_sha256="candidate",
+        previous_catalog_sha256=None,
+    )
+    source = bank_active_root(settings) / "100_1"
+    target = bank_legacy_root(settings) / "100_1"
+    source.mkdir(parents=True)
+    (source / "payload.txt").write_text("expected", encoding="utf-8")
+    begin_operation(
+        settings,
+        "tx-wrong-target",
+        operation_type="move_active_to_legacy",
+        code_version="100_1",
+        source=source,
+        target=target,
+    )
+    shutil.rmtree(source)
+    target.mkdir(parents=True)
+    (target / "payload.txt").write_text("wrong", encoding="utf-8")
+
+    reconcile_started_operations(settings, "tx-wrong-target")
+
+    journal = read_journal(settings, "tx-wrong-target")
+    assert journal["operations"][0]["state"] == "failed"
+    assert journal["operations"][0]["error"] == "target_hash_mismatch"
+
+
+def test_backup_copy_after_crash_resumes_without_duplicate(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    create_journal(
+        settings,
+        transaction_id="tx-backup",
+        plan_id="plan-tx-backup",
+        candidate_catalog_sha256="candidate",
+        previous_catalog_sha256=None,
+    )
+    source = bank_active_root(settings) / "100_1"
+    source.mkdir(parents=True)
+    (source / "payload.txt").write_text("expected", encoding="utf-8")
+    backup = transaction_root(settings, "tx-backup") / "backups" / "active" / "100_1"
+    begin_operation(
+        settings,
+        "tx-backup",
+        operation_type="backup_active",
+        code_version="100_1",
+        source=source,
+        target=backup,
+        idempotency_key="backup_active:100_1",
+    )
+    shutil.copytree(source, backup)
+
+    resumed = ensure_area_backup(
+        settings,
+        "tx-backup",
+        area="active",
+        code_version="100_1",
+        source=source,
+    )
+
+    journal = read_journal(settings, "tx-backup")
+    assert resumed == backup
+    assert journal["operations"][0]["state"] == "completed"
+    backup_root = transaction_root(settings, "tx-backup") / "backups" / "active"
+    assert len(list(backup_root.iterdir())) == 1
+
+
+def test_apply_create_journal_failure_releases_writer_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = make_settings(tmp_path)
+    row = catalog_row("843_1", 843, 1, 0, source_record_id=1737)
+    write_valid_bank_document(
+        bank_active_root(settings) / "843_1",
+        "843_1",
+        code=843,
+        version=1,
+        source_record_id=1737,
+        db_id=1737,
+    )
+    accept_current_catalog(settings, timestamp="20251231T000000Z", records=[row])
+    candidate_dir, candidate_records = write_candidate_catalog(settings, "tx-journal-fail", [row])
+    plan = build_update_plan(
+        settings,
+        transaction_id="tx-journal-fail",
+        candidate_records_path=candidate_records,
+        candidate_snapshot_path=candidate_dir,
+    )
+    update_plan_state(plan.plan_path, "staged")
+
+    def fail_create_journal(*_args: Any, **_kwargs: Any) -> None:
+        raise BankError("create_journal failed")
+
+    monkeypatch.setattr("clinrec.bank.reconcile.create_journal", fail_create_journal)
+
+    with pytest.raises(BankError, match="create_journal failed"):
+        apply_update_plan(settings, plan.plan_path, allow_manual_review=True)
+
+    assert not writer_lock_path(settings).exists()
+    assert not journal_path(settings, "tx-journal-fail").exists()
+
+
+def test_stage_db_id_mismatch_moves_plan_to_review_required(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    candidate_dir, candidate_records = write_candidate_catalog(
+        settings,
+        "tx-db-review",
+        [catalog_row("843_1", 843, 1, 0, source_record_id=9999)],
+    )
+    plan = build_update_plan(
+        settings,
+        transaction_id="tx-db-review",
+        candidate_records_path=candidate_records,
+        candidate_snapshot_path=candidate_dir,
+    )
+    raw = (FIXTURES / "clinrec_843_1_real_shape.json").read_bytes()
+
+    class Client:
+        def fetch_clinrec_payload(self, code_version: str) -> JsonPayloadResult:
+            assert code_version == "843_1"
+            return json_result(code_version, raw)
+
+    summary = stage_update(settings, Client(), plan.plan_path)  # type: ignore[arg-type]
+    updated = read_json_file(plan.plan_path)
+
+    assert summary.failed == 0
+    assert updated["state"] == "review_required"
+    assert updated["raw_identity_conflicts"][0]["code_version"] == "843_1"
+
+
+def test_decisions_hash_is_bound_to_existing_journal(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    create_journal(
+        settings,
+        transaction_id="tx-decisions",
+        plan_id="plan-tx-decisions",
+        candidate_catalog_sha256="candidate",
+        previous_catalog_sha256=None,
+        decisions_sha256="first",
+    )
+
+    with pytest.raises(BankError, match="decisions_sha256 mismatch"):
+        create_journal(
+            settings,
+            transaction_id="tx-decisions",
+            plan_id="plan-tx-decisions",
+            candidate_catalog_sha256="candidate",
+            previous_catalog_sha256=None,
+            decisions_sha256="second",
+        )
+
+
+def test_execution_actions_reject_double_mutation(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    plan = {
+        "transaction_id": "tx-actions",
+        "actions": {
+            "added": ["100_1"],
+            "silent_source_candidates": ["100_1"],
+        },
+    }
+
+    with pytest.raises(BankError, match="multiple incompatible"):
+        build_execution_actions(settings, "tx-actions", plan, None)
+
+
+def test_direct_force_history_preserves_complete_bundle(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    write_catalog_indexes(settings, active=[catalog_row("100_1", 100, 1, 0, source_record_id=10)])
+    first_raw = document_bytes("100_1", code=100, version=1, status=0, db_id=10, title="First")
+    second_raw = document_bytes("100_1", code=100, version=1, status=0, db_id=10, title="Second")
+
+    class FirstClient:
+        def fetch_clinrec_payload(self, code_version: str) -> JsonPayloadResult:
+            return json_result(code_version, first_raw)
+
+    class SecondClient:
+        def fetch_clinrec_payload(self, code_version: str) -> JsonPayloadResult:
+            return json_result(code_version, second_raw)
+
+    download_current_documents(
+        settings,
+        FirstClient(),  # type: ignore[arg-type]
+        BankRecordFilter(code_versions=["100_1"], unsafe_direct_active_write=True),
+    )
+    download_current_documents(
+        settings,
+        SecondClient(),  # type: ignore[arg-type]
+        BankRecordFilter(
+            code_versions=["100_1"],
+            force=True,
+            unsafe_direct_active_write=True,
+        ),
+    )
+
+    history_dirs = list((bank_history_root(settings) / "100_1").glob("*/direct-force-replacement"))
+    assert len(history_dirs) == 1
+    history = history_dirs[0]
+    assert (history / "getclinrec.json").read_bytes() == first_raw
+    assert (history / "manifest.json").exists()
+    assert (history / "catalog-record.json").exists()
+    assert (history / "bank-manifest.json").exists()
+    assert read_json_file(history / "event.json")["event_type"] == "direct_force_replacement"
 
 
 def test_writer_lock_rejects_concurrent_transaction(tmp_path: Path) -> None:

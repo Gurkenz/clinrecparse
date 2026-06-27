@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from clinrec.bank.accepted import (
+    accepted_current_pointer_path,
     atomic_write_json_fsync,
     read_accepted_pointer,
     restore_accepted_pointer,
@@ -102,6 +103,7 @@ def create_journal(
     candidate_catalog_sha256: str,
     previous_catalog_sha256: str | None,
     candidate_manifest_sha256: str | None = None,
+    decisions_sha256: str | None = None,
 ) -> dict[str, Any]:
     path = journal_path(settings, transaction_id)
     if path.exists():
@@ -112,6 +114,7 @@ def create_journal(
             candidate_catalog_sha256=candidate_catalog_sha256,
             previous_catalog_sha256=previous_catalog_sha256,
             candidate_manifest_sha256=candidate_manifest_sha256,
+            decisions_sha256=decisions_sha256,
         )
         if journal.get("state") == "completed":
             raise BankError(f"Transaction already completed: {transaction_id}")
@@ -125,6 +128,7 @@ def create_journal(
         "updated_at": utc_now(),
         "candidate_catalog_sha256": candidate_catalog_sha256,
         "candidate_manifest_sha256": candidate_manifest_sha256,
+        "decisions_sha256": decisions_sha256,
         "previous_catalog_sha256": previous_catalog_sha256,
         "operations": [],
         "rollback_operations": [],
@@ -142,12 +146,14 @@ def verify_journal_binding(
     candidate_catalog_sha256: str,
     previous_catalog_sha256: str | None,
     candidate_manifest_sha256: str | None,
+    decisions_sha256: str | None,
 ) -> None:
     checks = {
         "plan_id": plan_id,
         "candidate_catalog_sha256": candidate_catalog_sha256,
         "previous_catalog_sha256": previous_catalog_sha256,
         "candidate_manifest_sha256": candidate_manifest_sha256,
+        "decisions_sha256": decisions_sha256,
     }
     for key, expected in checks.items():
         if journal.get(key) != expected:
@@ -222,6 +228,52 @@ def begin_operation(
     return operation_id
 
 
+def operation_by_idempotency_key(
+    settings: Settings,
+    transaction_id: str,
+    key: str,
+) -> dict[str, Any] | None:
+    journal = read_journal(settings, transaction_id)
+    for operation in journal.get("operations") or []:
+        if operation.get("idempotency_key") == key:
+            return operation if isinstance(operation, dict) else None
+    return None
+
+
+def operation_is_completed(settings: Settings, transaction_id: str, key: str) -> bool:
+    operation = operation_by_idempotency_key(settings, transaction_id, key)
+    return bool(operation and operation.get("state") == "completed")
+
+
+def completed_move_is_consistent(
+    settings: Settings,
+    transaction_id: str,
+    *,
+    key: str,
+    expected_target: Path | None = None,
+) -> bool:
+    operation = operation_by_idempotency_key(settings, transaction_id, key)
+    if not operation or operation.get("state") != "completed":
+        return False
+    target_value = operation.get("target")
+    target = Path(str(target_value)) if target_value else expected_target
+    if expected_target is not None and target is None:
+        target = expected_target
+    expected_sha = operation.get("expected_source_sha256") or operation.get(
+        "expected_target_sha256"
+    )
+    if expected_sha is None:
+        if target is not None and target.exists():
+            raise BankError(f"transaction_inconsistent: completed {key} has unexpected target")
+        return True
+    if target is None or not target.exists():
+        raise BankError(f"transaction_inconsistent: completed {key} target is missing")
+    actual_sha = path_sha256(target)
+    if actual_sha != expected_sha:
+        raise BankError(f"transaction_inconsistent: completed {key} target hash mismatch")
+    return True
+
+
 def complete_operation(settings: Settings, transaction_id: str, operation_id: str) -> None:
     journal = read_journal(settings, transaction_id)
     for operation in journal["operations"]:
@@ -288,17 +340,66 @@ def ensure_area_backup(
 ) -> Path | None:
     journal = read_journal(settings, transaction_id)
     backups: dict[str, Any] = journal.setdefault("backups", {}).setdefault(area, {})
-    if code_version in backups:
-        value = backups[code_version]
-        return Path(value) if value else None
-    if source.exists():
-        backup = transaction_root(settings, transaction_id) / "backups" / area / code_version
-        copy_directory(source, backup)
-        backups[code_version] = backup.as_posix()
+    key = f"backup_{area}:{code_version}"
+    existing = operation_by_idempotency_key(settings, transaction_id, key)
+    if existing and existing.get("state") == "completed":
+        value = backups.get(code_version)
+        expected_sha = existing.get("expected_source_sha256")
+        if expected_sha is None:
+            if value:
+                raise BankError(f"transaction_inconsistent: backup {key} should be empty")
+            return None
+        if not value:
+            raise BankError(f"transaction_inconsistent: backup {key} path is missing")
+        backup = Path(str(value))
+        if not backup.exists() or path_sha256(backup) != expected_sha:
+            raise BankError(f"transaction_inconsistent: backup {key} hash mismatch")
+        return backup
+    if not source.exists():
+        operation_id = begin_operation(
+            settings,
+            transaction_id,
+            operation_type=f"backup_{area}",
+            code_version=code_version,
+            source=source,
+            target=None,
+            idempotency_key=key,
+        )
+        journal = read_journal(settings, transaction_id)
+        journal.setdefault("backups", {}).setdefault(area, {})[code_version] = None
+        write_journal(settings, transaction_id, journal)
+        complete_operation(settings, transaction_id, operation_id)
+        return None
+
+    backup = transaction_root(settings, transaction_id) / "backups" / area / code_version
+    operation_id = begin_operation(
+        settings,
+        transaction_id,
+        operation_type=f"backup_{area}",
+        code_version=code_version,
+        source=source,
+        target=backup,
+        idempotency_key=key,
+    )
+    operation = operation_by_idempotency_key(settings, transaction_id, key)
+    expected_sha = operation.get("expected_source_sha256") if operation else path_sha256(source)
+    if backup.exists():
+        if path_sha256(backup) != expected_sha:
+            fail_operation(settings, transaction_id, operation_id, "backup_hash_mismatch")
+            raise BankError(f"Backup hash mismatch for {area}/{code_version}.")
     else:
-        backup = None
-        backups[code_version] = None
+        try:
+            copy_directory(source, backup)
+        except Exception as exc:
+            fail_operation(settings, transaction_id, operation_id, str(exc))
+            raise
+        if path_sha256(backup) != expected_sha:
+            fail_operation(settings, transaction_id, operation_id, "backup_hash_mismatch")
+            raise BankError(f"Backup hash mismatch for {area}/{code_version}.")
+    journal = read_journal(settings, transaction_id)
+    journal.setdefault("backups", {}).setdefault(area, {})[code_version] = backup.as_posix()
     write_journal(settings, transaction_id, journal)
+    complete_operation(settings, transaction_id, operation_id)
     return backup
 
 
@@ -308,9 +409,21 @@ def ensure_state_backup(settings: Settings, transaction_id: str) -> dict[str, An
     if "accepted_pointer" in state_backups:
         value = state_backups["accepted_pointer"]
         return value if isinstance(value, dict) else None
+    operation_id = begin_operation(
+        settings,
+        transaction_id,
+        operation_type="backup_state",
+        code_version="__accepted__",
+        source=accepted_current_pointer_path(settings),
+        target=None,
+        idempotency_key="backup_state:accepted_pointer",
+    )
     pointer = read_accepted_pointer(settings)
+    journal = read_journal(settings, transaction_id)
+    state_backups = journal.setdefault("backups", {}).setdefault("state", {})
     state_backups["accepted_pointer"] = pointer
     write_journal(settings, transaction_id, journal)
+    complete_operation(settings, transaction_id, operation_id)
     return pointer
 
 
@@ -322,6 +435,12 @@ def archive_existing_target(
     target: Path,
     event_type: str,
 ) -> Path | None:
+    key = f"archive:{event_type}:{code_version}:{target.as_posix()}"
+    completed = operation_by_idempotency_key(settings, transaction_id, key)
+    if completed and completed.get("state") == "completed":
+        completed_move_is_consistent(settings, transaction_id, key=key)
+        value = completed.get("target")
+        return Path(str(value)) if value else None
     if not target.exists():
         return None
     archive = unique_path(
@@ -338,8 +457,11 @@ def archive_existing_target(
         code_version=code_version,
         source=target,
         target=archive,
-        idempotency_key=f"archive:{event_type}:{code_version}:{target.as_posix()}",
+        idempotency_key=key,
     )
+    operation = operation_by_idempotency_key(settings, transaction_id, key)
+    if operation and operation.get("target"):
+        archive = Path(str(operation["target"]))
     try:
         move_directory(target, archive)
     except Exception as exc:
@@ -357,6 +479,9 @@ def promote_staged_to_active(
     staging_document: Path,
 ) -> bool:
     target = bank_active_root(settings) / code_version
+    key = f"promote_staged_to_active:{code_version}"
+    if completed_move_is_consistent(settings, transaction_id, key=key, expected_target=target):
+        return False
     ensure_area_backup(
         settings,
         transaction_id,
@@ -378,6 +503,7 @@ def promote_staged_to_active(
         code_version=code_version,
         source=staging_document,
         target=target,
+        idempotency_key=key,
     )
     try:
         moved = move_directory(staging_document, target)
@@ -397,6 +523,9 @@ def move_active_to_legacy(
 ) -> bool:
     source = bank_active_root(settings) / code_version
     target = bank_legacy_root(settings) / code_version
+    key = f"move_active_to_legacy:{code_version}"
+    if completed_move_is_consistent(settings, transaction_id, key=key, expected_target=target):
+        return False
     ensure_area_backup(
         settings,
         transaction_id,
@@ -425,6 +554,7 @@ def move_active_to_legacy(
         code_version=code_version,
         source=source,
         target=target,
+        idempotency_key=key,
     )
     try:
         moved = move_directory(source, target)
@@ -443,6 +573,10 @@ def remove_legacy_for_reactivation(
     code_version: str,
 ) -> None:
     target = bank_legacy_root(settings) / code_version
+    key = f"archive:reactivated-legacy:{code_version}:{target.as_posix()}"
+    if operation_is_completed(settings, transaction_id, key):
+        completed_move_is_consistent(settings, transaction_id, key=key)
+        return
     ensure_area_backup(
         settings,
         transaction_id,
@@ -468,6 +602,9 @@ def move_active_to_quarantine(
 ) -> bool:
     source = bank_active_root(settings) / code_version
     target = bank_quarantine_root(settings) / code_version / compact_timestamp()
+    key = f"move_active_to_quarantine:{code_version}"
+    if completed_move_is_consistent(settings, transaction_id, key=key):
+        return False
     ensure_area_backup(
         settings,
         transaction_id,
@@ -489,7 +626,11 @@ def move_active_to_quarantine(
         code_version=code_version,
         source=source,
         target=target,
+        idempotency_key=key,
     )
+    operation = operation_by_idempotency_key(settings, transaction_id, key)
+    if operation and operation.get("target"):
+        target = Path(str(operation["target"]))
     try:
         moved = move_directory(source, target)
     except Exception as exc:
@@ -589,12 +730,19 @@ def reconcile_started_operations(settings: Settings, transaction_id: str) -> Non
             continue
         source = Path(str(operation.get("source"))) if operation.get("source") else None
         target = Path(str(operation.get("target"))) if operation.get("target") else None
+        expected_source_sha = operation.get("expected_source_sha256")
         expected_target_sha = operation.get("expected_target_sha256")
         if source and target and not source.exists() and target.exists():
             actual_target_sha = path_sha256(target)
-            if expected_target_sha in {None, actual_target_sha}:
+            expected_sha = expected_source_sha or expected_target_sha
+            if expected_sha in {None, actual_target_sha}:
                 operation["state"] = "completed"
                 operation["completed_at"] = operation.get("completed_at") or utc_now()
+                changed = True
+            else:
+                operation["state"] = "failed"
+                operation["error"] = "target_hash_mismatch"
+                journal.setdefault("errors", []).append(operation)
                 changed = True
         elif source and source.exists() and target and not target.exists():
             operation["state"] = "planned"

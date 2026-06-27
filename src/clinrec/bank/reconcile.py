@@ -64,6 +64,7 @@ from clinrec.bank.transaction import (
     ensure_state_backup,
     journal_path,
     move_active_to_quarantine,
+    operation_is_completed,
     promote_staged_to_active,
     read_journal,
     reconcile_started_operations,
@@ -110,6 +111,16 @@ class BankApplySummary:
     reactivated: int
     plan_path: Path
     transaction_id: str
+
+
+@dataclass(frozen=True)
+class ExecutionAction:
+    code_version: str
+    action: str
+    source: Path | None = None
+    destination: Path | None = None
+    conflict_types: tuple[str, ...] = ()
+    decision: dict[str, Any] | None = None
 
 
 def accepted_catalog_records_path(settings: Settings) -> Path:
@@ -376,6 +387,9 @@ def stage_update(
     }
     invalid = strict_staging_failures(settings, transaction_id, validatable)
     staged_identity_conflicts = staged_db_id_conflicts(settings, transaction_id, validatable)
+    if staged_identity_conflicts:
+        update_plan_after_staged_identity_conflicts(plan_path, staged_identity_conflicts)
+        plan = load_verified_plan(plan_path)
     comparisons = verify_existing_comparisons(
         settings,
         transaction_id,
@@ -394,8 +408,11 @@ def stage_update(
         comparisons=comparisons,
     )
     write_json(summary_path, summary)
-    if summary["failed"] == 0 and summary["not_attempted"] == 0:
-        update_plan_state(plan_path, "staged")
+    if summary["technical_failed"] == 0 and summary["not_attempted"] == 0:
+        update_plan_state(
+            plan_path,
+            "review_required" if summary["manual_review_required"] else "staged",
+        )
     return stage_summary_from_payload(summary_path, summary)
 
 
@@ -414,13 +431,14 @@ def apply_update_plan(
     if plan.get("requires_manual_review") and not allow_manual_review:
         raise BankError("Plan requires manual review before apply.")
     _ = allow_identity_conflict
-    if plan.get("state") not in {"staged", "ready_to_apply", "applying"}:
+    if plan.get("state") not in {"staged", "review_required", "ready_to_apply", "applying"}:
         raise BankError(f"Plan state is not applicable: {plan.get('state')}")
     verify_candidate_hash(plan, reject_pilot=True)
     verify_previous_catalog_hash(settings, plan)
     decisions = verify_decisions(plan_path, plan)
 
     transaction_id = string_value(plan["transaction_id"])
+    execution_actions = build_execution_actions(settings, transaction_id, plan, decisions)
     if journal_path(settings, transaction_id).exists():
         journal = read_journal(settings, transaction_id)
         if journal.get("state") == "completed":
@@ -441,6 +459,8 @@ def apply_update_plan(
     reactivated = 0
     promoted = 0
     lock_acquired = False
+    journal_created = False
+    mutation_started = False
     try:
         acquire_writer_lock(settings, transaction_id, recover_stale=recover_stale_lock)
         lock_acquired = True
@@ -453,8 +473,13 @@ def apply_update_plan(
             candidate_manifest_sha256=string_value(plan.get("candidate_manifest_sha256"))
             if plan.get("candidate_manifest_sha256")
             else None,
+            decisions_sha256=string_value(decisions.get("decisions_sha256"))
+            if decisions and decisions.get("decisions_sha256")
+            else None,
         )
+        journal_created = True
         set_journal_state(settings, transaction_id, "staging_validated")
+        verify_candidate_hash(plan, reject_pilot=True)
 
         from clinrec.bank.qa import run_bank_qa
 
@@ -470,39 +495,76 @@ def apply_update_plan(
 
         set_journal_state(settings, transaction_id, "applying")
         update_plan_state(plan_path, "applying")
+        verify_candidate_hash(plan, reject_pilot=True)
+        mutation_started = True
 
-        for code_version in plan_actions(plan, "removed_from_catalog"):
-            if tx_move_active_to_legacy(settings, transaction_id, code_version=code_version):
-                write_lifecycle(settings, code_version, plan)
-                moved_to_legacy += 1
-
-        for code_version in plan_actions(plan, "reactivated"):
-            remove_legacy_for_reactivation(settings, transaction_id, code_version=code_version)
-            if promote_staged_to_active(
-                settings,
-                transaction_id,
-                code_version=code_version,
-                staging_document=bank_staging_root(settings) / transaction_id / code_version,
-            ):
-                reactivated += 1
-
-        for code_version in sorted(
-            set(plan_actions(plan, "added")) | set(plan_actions(plan, "missing_locally"))
-        ):
-            if code_version in set(plan_actions(plan, "reactivated")):
+        for action in execution_actions.values():
+            if action.action == "move_to_legacy":
+                if tx_move_active_to_legacy(
+                    settings,
+                    transaction_id,
+                    code_version=action.code_version,
+                ):
+                    write_lifecycle(settings, action.code_version, plan)
+                    moved_to_legacy += 1
+            elif action.action == "promote_reactivated":
+                remove_legacy_for_reactivation(
+                    settings,
+                    transaction_id,
+                    code_version=action.code_version,
+                )
+                if promote_staged_to_active(
+                    settings,
+                    transaction_id,
+                    code_version=action.code_version,
+                    staging_document=bank_staging_root(settings)
+                    / transaction_id
+                    / action.code_version,
+                ):
+                    reactivated += 1
+            elif action.action in {
+                "promote_added",
+                "promote_silent_change",
+                "promote_reviewed_identity",
+            }:
+                if (
+                    action.decision
+                    and action.decision.get("final_action")
+                    == "move_current_to_quarantine_and_use_staged"
+                ):
+                    move_active_to_quarantine(
+                        settings,
+                        transaction_id,
+                        code_version=action.code_version,
+                        reason=string_value(action.decision.get("reason")),
+                    )
+                if promote_staged_to_active(
+                    settings,
+                    transaction_id,
+                    code_version=action.code_version,
+                    staging_document=bank_staging_root(settings)
+                    / transaction_id
+                    / action.code_version,
+                ):
+                    promoted += 1
+            elif action.action == "quarantine_orphan":
+                if move_active_to_quarantine(
+                    settings,
+                    transaction_id,
+                    code_version=action.code_version,
+                    reason=string_value(
+                        action.decision.get("reason") if action.decision else "manual review"
+                    ),
+                ):
+                    promoted += 1
+            elif action.action == "update_metadata_only":
+                update_metadata_sidecar(settings, transaction_id, plan, action.code_version)
+            elif action.action == "no_op":
                 continue
-            if promote_staged_to_active(
-                settings,
-                transaction_id,
-                code_version=code_version,
-                staging_document=bank_staging_root(settings) / transaction_id / code_version,
-            ):
-                promoted += 1
+            else:
+                raise BankError(f"Unsupported execution action: {action.action}")
 
-        promoted += apply_review_decisions(settings, transaction_id, decisions)
-        promoted += apply_silent_source_changes(settings, transaction_id, plan)
-        update_metadata_sidecars(settings, transaction_id, plan)
-
+        verify_candidate_hash(plan, reject_pilot=True)
         applied_qa = run_bank_qa(
             settings,
             BankRecordFilter(all_records=True),
@@ -516,25 +578,14 @@ def apply_update_plan(
         if accept_catalog:
             set_journal_state(settings, transaction_id, "state_committing")
             ensure_state_backup(settings, transaction_id)
-            pointer_operation = begin_operation(
+            candidate_path = Path(string_value(plan["candidate_catalog_records_path"]))
+            verify_candidate_hash(plan, reject_pilot=True)
+            commit_accepted_generation(
                 settings,
                 transaction_id,
-                operation_type="accepted_pointer_commit",
-                code_version="__accepted__",
-                source=accepted_catalog_path(settings),
-                target=accepted_catalog_path(settings),
+                plan=plan,
+                candidate_path=candidate_path,
             )
-            candidate_path = Path(string_value(plan["candidate_catalog_records_path"]))
-            create_accepted_generation(
-                settings,
-                records=load_candidate_records(candidate_path),
-                transaction_id=transaction_id,
-                generation_id=transaction_id,
-                snapshot_path=Path(string_value(plan["candidate_snapshot_path"])),
-                source_catalog_path=candidate_path,
-                switch_pointer=True,
-            )
-            complete_operation(settings, transaction_id, pointer_operation)
 
         cleanup_empty_staging(settings, transaction_id)
         accepted_qa = run_bank_qa(
@@ -549,13 +600,24 @@ def apply_update_plan(
         update_plan_state(plan_path, "applied")
         release_writer_lock(settings, transaction_id)
         lock_acquired = False
-    except Exception:
-        if rollback_on_error:
-            rollback_transaction(settings, transaction_id)
-            update_plan_state(plan_path, "rolled_back")
+    except Exception as exc:
+        if rollback_on_error and journal_created and mutation_started:
+            try:
+                rollback_transaction(settings, transaction_id)
+                update_plan_state(plan_path, "rolled_back")
+            except Exception as rollback_exc:
+                exc.add_note(f"Rollback failed: {rollback_exc}")
+                raise exc from rollback_exc
         else:
-            set_journal_state(settings, transaction_id, "failed")
-            update_plan_state(plan_path, "failed")
+            if journal_created:
+                try:
+                    set_journal_state(settings, transaction_id, "failed")
+                except BankError:
+                    pass
+            try:
+                update_plan_state(plan_path, "failed")
+            except BankError:
+                pass
             if lock_acquired:
                 release_writer_lock(settings, transaction_id)
         raise
@@ -567,6 +629,218 @@ def apply_update_plan(
         plan_path=plan_path,
         transaction_id=transaction_id,
     )
+
+
+def build_execution_actions(
+    settings: Settings,
+    transaction_id: str,
+    plan: dict[str, Any],
+    decisions: dict[str, Any] | None,
+) -> dict[str, ExecutionAction]:
+    actions: dict[str, ExecutionAction] = {}
+    staging_root = bank_staging_root(settings) / transaction_id
+    decisions_by_code_version = {
+        string_value(row.get("code_version")): row
+        for row in (decisions or {}).get("decisions", [])
+        if isinstance(row, dict)
+    }
+
+    def add(action: ExecutionAction) -> None:
+        existing = actions.get(action.code_version)
+        if existing is not None and existing.action != action.action:
+            raise BankError(
+                "CodeVersion has multiple incompatible mutating actions: "
+                f"{action.code_version}: {existing.action}, {action.action}"
+            )
+        actions[action.code_version] = action
+
+    for code_version in sorted(plan_actions(plan, "removed_from_catalog")):
+        add(
+            ExecutionAction(
+                code_version=string_value(code_version),
+                action="move_to_legacy",
+                source=bank_active_root(settings) / string_value(code_version),
+                destination=bank_legacy_root(settings) / string_value(code_version),
+            )
+        )
+
+    reactivated = {string_value(value) for value in plan_actions(plan, "reactivated")}
+    for code_version in sorted(reactivated):
+        add(
+            ExecutionAction(
+                code_version=code_version,
+                action="promote_reactivated",
+                source=staging_root / code_version,
+                destination=bank_active_root(settings) / code_version,
+            )
+        )
+
+    for code_version in sorted(
+        {string_value(value) for value in plan_actions(plan, "added")}
+        | {string_value(value) for value in plan_actions(plan, "missing_locally")}
+    ):
+        if code_version in reactivated:
+            continue
+        add(
+            ExecutionAction(
+                code_version=code_version,
+                action="promote_added",
+                source=staging_root / code_version,
+                destination=bank_active_root(settings) / code_version,
+            )
+        )
+
+    metadata_changed = sorted(
+        string_value(value) for value in plan_actions(plan, "metadata_changed")
+    )
+    for code_version in metadata_changed:
+        catalog_path = bank_active_root(settings) / code_version / "current" / "catalog-record.json"
+        add(
+            ExecutionAction(
+                code_version=code_version,
+                action="update_metadata_only",
+                source=catalog_path,
+                destination=catalog_path,
+            )
+        )
+
+    for code_version, row in sorted(decisions_by_code_version.items()):
+        conflicts = tuple(sorted(str(value) for value in row.get("conflicts", [])))
+        final_action = string_value(row.get("final_action"))
+        if final_action in {
+            "use_staged_candidate",
+            "move_current_to_quarantine_and_use_staged",
+        }:
+            action_name = (
+                "promote_silent_change"
+                if "silent_source_change" in conflicts
+                else "promote_reviewed_identity"
+            )
+            add(
+                ExecutionAction(
+                    code_version=code_version,
+                    action=action_name,
+                    source=staging_root / code_version,
+                    destination=bank_active_root(settings) / code_version,
+                    conflict_types=conflicts,
+                    decision=row,
+                )
+            )
+        elif final_action == "move_orphan_to_quarantine":
+            add(
+                ExecutionAction(
+                    code_version=code_version,
+                    action="quarantine_orphan",
+                    source=bank_active_root(settings) / code_version,
+                    destination=bank_active_root(settings) / code_version,
+                    conflict_types=conflicts,
+                    decision=row,
+                )
+            )
+        elif final_action == "abort_transaction":
+            raise BankError("Review decisions request abort_transaction.")
+        else:
+            raise BankError(f"Unsupported review final_action: {final_action}")
+
+    decided = set(decisions_by_code_version)
+    for code_version in sorted(
+        string_value(value) for value in plan_actions(plan, "silent_source_candidates")
+    ):
+        if code_version in decided:
+            continue
+        add(
+            ExecutionAction(
+                code_version=code_version,
+                action="promote_silent_change",
+                source=staging_root / code_version,
+                destination=bank_active_root(settings) / code_version,
+                conflict_types=("silent_source_change",),
+            )
+        )
+
+    return {code_version: actions[code_version] for code_version in sorted(actions)}
+
+
+def update_metadata_sidecar(
+    settings: Settings,
+    transaction_id: str,
+    plan: dict[str, Any],
+    code_version: str,
+) -> None:
+    records = {string_value(row.get("code_version")): row for row in candidate_rows_for_plan(plan)}
+    if code_version not in records:
+        raise BankError(f"Missing candidate record for metadata update: {code_version}")
+    document_root = bank_active_root(settings) / code_version
+    catalog_path = document_root / "current" / "catalog-record.json"
+    key = f"update_metadata_sidecar:{code_version}"
+    if operation_is_completed(settings, transaction_id, key):
+        actual = stable_json_dumps(read_json_file(catalog_path))
+        expected = stable_json_dumps(records[code_version])
+        if actual != expected:
+            raise BankError(
+                "transaction_inconsistent: completed metadata sidecar target mismatch"
+            )
+        return
+    ensure_area_backup(
+        settings,
+        transaction_id,
+        area="active",
+        code_version=code_version,
+        source=document_root,
+    )
+    operation_id = begin_operation(
+        settings,
+        transaction_id,
+        operation_type="update_metadata_sidecar",
+        code_version=code_version,
+        source=catalog_path,
+        target=catalog_path,
+        idempotency_key=key,
+    )
+    try:
+        archive_catalog_sidecar(settings, code_version, catalog_path, transaction_id)
+        write_json(catalog_path, records[code_version])
+    except Exception as exc:
+        from clinrec.bank.transaction import fail_operation
+
+        fail_operation(settings, transaction_id, operation_id, str(exc))
+        raise
+    complete_operation(settings, transaction_id, operation_id)
+
+
+def commit_accepted_generation(
+    settings: Settings,
+    transaction_id: str,
+    *,
+    plan: dict[str, Any],
+    candidate_path: Path,
+) -> None:
+    key = "accepted_pointer_commit:__accepted__"
+    if operation_is_completed(settings, transaction_id, key):
+        if accepted_catalog_sha256(settings) != plan.get("candidate_catalog_sha256"):
+            raise BankError("transaction_inconsistent: accepted pointer hash mismatch")
+        return
+    pointer_operation = begin_operation(
+        settings,
+        transaction_id,
+        operation_type="accepted_pointer_commit",
+        code_version="__accepted__",
+        source=accepted_catalog_path(settings),
+        target=accepted_catalog_path(settings),
+        idempotency_key=key,
+    )
+    create_accepted_generation(
+        settings,
+        records=load_candidate_records(candidate_path),
+        transaction_id=transaction_id,
+        generation_id=transaction_id,
+        snapshot_path=Path(string_value(plan["candidate_snapshot_path"])),
+        source_catalog_path=candidate_path,
+        switch_pointer=True,
+    )
+    if accepted_catalog_sha256(settings) != plan.get("candidate_catalog_sha256"):
+        raise BankError("Accepted generation hash mismatch after pointer switch.")
+    complete_operation(settings, transaction_id, pointer_operation)
 
 
 def bank_bootstrap(
@@ -840,6 +1114,33 @@ def update_plan_after_verify_existing(
     write_plan_with_hash(plan_path, plan)
 
 
+def update_plan_after_staged_identity_conflicts(
+    plan_path: Path,
+    conflicts: list[dict[str, Any]],
+) -> None:
+    if not conflicts:
+        return
+    plan = load_verified_plan(plan_path)
+    actions_value = plan.get("actions")
+    actions = dict(actions_value) if isinstance(actions_value, dict) else {}
+    existing = {
+        string_value(item.get("code_version")): item
+        for item in actions.get("raw_identity_conflicts", [])
+        if isinstance(item, dict)
+    }
+    for row in conflicts:
+        code_version = string_value(row.get("code_version"))
+        existing[code_version] = {
+            **row,
+            "state": "raw_identity_conflict",
+            "conflict_type": "raw_identity_conflict",
+        }
+    actions["raw_identity_conflicts"] = [existing[key] for key in sorted(existing)]
+    plan["actions"] = actions
+    plan["raw_identity_conflicts"] = actions["raw_identity_conflicts"]
+    write_plan_with_hash(plan_path, plan)
+
+
 def stage_summary_payload(
     plan: dict[str, Any],
     required: set[str],
@@ -856,7 +1157,9 @@ def stage_summary_payload(
     failed_documents = [
         row for row in documents if row["status"] not in {"downloaded", "already_valid"}
     ]
-    failed = len(failed_documents) + len(invalid) + len(staged_identity_conflicts)
+    technical_failed = len(failed_documents) + len(invalid)
+    manual_review_required = len(staged_identity_conflicts)
+    failed = technical_failed
     return {
         "transaction_id": plan["transaction_id"],
         "plan_id": plan["plan_id"],
@@ -865,6 +1168,18 @@ def stage_summary_payload(
         "downloaded": sum(1 for row in documents if row["status"] == "downloaded"),
         "already_valid": sum(1 for row in documents if row["status"] == "already_valid"),
         "failed": failed,
+        "technical_failed": technical_failed,
+        "invalid_documents": len(invalid),
+        "manual_review_required": manual_review_required,
+        "warnings": [
+            {
+                "code_version": row["code_version"],
+                "warning": "document_db_id_missing",
+            }
+            for row in documents
+            if read_json_file(Path(row["manifest"])).get("db_id_state")
+            == "document_db_id_missing"
+        ],
         "not_attempted": len(not_attempted),
         "circuit_open": any(row["status"] == "circuit_open" for row in documents),
         "identity_conflicts": plan_actions(plan, "identity_conflicts")
@@ -876,7 +1191,7 @@ def stage_summary_payload(
             failed,
             not_attempted,
             invalid,
-            staged_identity_conflicts,
+            [],
         ),
     }
 

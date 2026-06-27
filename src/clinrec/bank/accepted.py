@@ -114,22 +114,23 @@ def load_accepted_generation(settings: Settings, *, migrate: bool = True) -> Acc
 
 
 def read_accepted_catalog_records(settings: Settings) -> list[dict[str, Any]]:
-    try:
-        generation = load_accepted_generation(settings)
-    except BankError:
+    if not accepted_current_pointer_path(settings).exists():
         if legacy_accepted_records_path(settings).exists():
-            return read_jsonl(legacy_accepted_records_path(settings))
+            generation = load_accepted_generation(settings)
+            return read_jsonl(generation.catalog_path)
         return []
+    generation = load_accepted_generation(settings, migrate=False)
     return read_jsonl(generation.catalog_path)
 
 
 def accepted_catalog_sha256(settings: Settings) -> str | None:
-    try:
-        return load_accepted_generation(settings).catalog_sha256
-    except BankError:
+    if not accepted_current_pointer_path(settings).exists():
         legacy = read_json_file(legacy_accepted_catalog_path(settings))
         value = legacy.get("sha256")
+        if legacy_accepted_records_path(settings).exists():
+            return load_accepted_generation(settings).catalog_sha256
         return string_value(value) if value else None
+    return load_accepted_generation(settings, migrate=False).catalog_sha256
 
 
 def create_accepted_generation(

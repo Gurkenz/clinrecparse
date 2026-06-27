@@ -429,16 +429,58 @@ def preserve_silent_source_change(
         return None
     if old_info.db_id != new_info.db_id or old_info.code_version != new_info.code_version:
         return None
-    history_path = (
+    history_root = (
         settings.paths.data_root
         / "bank"
         / "history"
         / code_version
         / compact_timestamp()
-        / "getclinrec.json"
+        / "direct-force-replacement"
     )
-    history_path.parent.mkdir(parents=True, exist_ok=True)
+    history_path = history_root / "getclinrec.json"
+    history_root.mkdir(parents=True, exist_ok=True)
     history_path.write_bytes(old_content)
+    current_root = target_path.parent
+    document_root = current_root.parent
+    for name in ("manifest.json", "catalog-record.json"):
+        source = current_root / name
+        if source.exists():
+            (history_root / name).write_bytes(source.read_bytes())
+    bank_manifest = document_root / "bank-manifest.json"
+    if bank_manifest.exists():
+        (history_root / "bank-manifest.json").write_bytes(bank_manifest.read_bytes())
+    write_json(
+        history_root / "event.json",
+        {
+            "event_type": "direct_force_replacement",
+            "code_version": code_version,
+            "recorded_at": utc_now(),
+            "old_sha256": manifest_for_raw_json(
+                code_version=code_version,
+                code=old_info.code,
+                version=old_info.version,
+                status=old_info.status,
+                source="GetClinrec2",
+                http_status=200,
+                content_type="application/json",
+                raw_content=old_content,
+                validation="valid",
+                document_db_id=old_info.db_id,
+            )["sha256"],
+            "new_sha256": manifest_for_raw_json(
+                code_version=code_version,
+                code=new_info.code,
+                version=new_info.version,
+                status=new_info.status,
+                source="GetClinrec2",
+                http_status=200,
+                content_type="application/json",
+                raw_content=new_content,
+                validation="valid",
+                document_db_id=new_info.db_id,
+            )["sha256"],
+        },
+    )
     return Path(history_path)
 
 

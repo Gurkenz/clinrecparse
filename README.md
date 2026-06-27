@@ -205,6 +205,51 @@ Raw status fields such as `status`, `ApplyStatus`, and `ApplyStatusCalculated` a
 preserved as opaque source values. They do not decide active/legacy placement,
 predecessor confirmation, or automatic replacement links in the raw-bank lifecycle.
 
+## Research Corpus
+
+`research-build-corpus` builds an isolated raw JSON corpus for empirical parser,
+diff, and identity-design work. It is not an accepted production bank and must not be
+used with `bank-apply-update`.
+
+```powershell
+clinrec research-build-corpus `
+  --current-count 50 `
+  --legacy-target 10 `
+  --legacy-minimum 5 `
+  --legacy-attempt-limit 20 `
+  --seed 20260627 `
+  --include 773_2 `
+  --include 843_1 `
+  --include 270_2 `
+  --include 270_3 `
+  --output data/research/corpora/live-json-50
+```
+
+Research output must live outside `data/bank`. Catalog snapshots, selected current
+JSON, nearest previous-version attempts, manifests, profiling JSONL files, schema
+summaries, pair observations, and `reports/research-findings.md` are written under
+the selected output directory. Raw `GetClinrec2` responses are saved byte-for-byte;
+HTML inside source JSON is counted for structure only and is not normalized or
+extracted.
+
+Selection is deterministic for a fixed seed. Forced `--include` records are selected
+first, then the remaining sample is balanced across Version 1, Version 2, and Version
+3+ records. If a selected non-forced current document fails after retry policy, the
+builder records the failure and chooses a replacement. Legacy attempts use only the
+nearest `Version - 1` candidate, stop at `--legacy-target` or
+`--legacy-attempt-limit`, and record partial results honestly.
+
+Useful research controls:
+
+```powershell
+clinrec research-build-corpus --output data/research/corpora/live-json-50 --resume
+clinrec research-build-corpus --output data/research/corpora/live-json-50 --profile-only
+clinrec research-build-corpus --output data/research/corpora/live-json-50 --dry-run
+```
+
+`data/` is ignored by Git, so downloaded research JSON and generated reports remain
+local artifacts. Verify with `git status --short` before committing source changes.
+
 ## Exit Codes
 
 - `0`: success

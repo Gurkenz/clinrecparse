@@ -58,6 +58,8 @@ from clinrec.parsing.document import ParseError, ParseOptions
 from clinrec.parsing.document import parse_documents as run_parse_documents
 from clinrec.qa.checks import QaOptions
 from clinrec.qa.checks import run_qa as run_qa_checks
+from clinrec.research.corpus import ResearchCorpusOptions
+from clinrec.research.corpus import build_research_corpus as run_research_build_corpus
 
 app = typer.Typer(help="Clinical recommendations pipeline CLI.")
 
@@ -516,6 +518,65 @@ def bank_review_update(
     atomic_write_json(path, payload)
     typer.echo("bank-review-update completed")
     typer.echo(f"decisions: {path}")
+
+
+@app.command("research-build-corpus")
+def research_build_corpus(
+    output: Annotated[
+        Path,
+        typer.Option(
+            "--output",
+            help="Research corpus output directory, e.g. data/research/corpora/live-json-50.",
+        ),
+    ],
+    config: ConfigOption = DEFAULT_CONFIG_PATH,
+    current_count: Annotated[int, typer.Option("--current-count", min=1)] = 50,
+    legacy_target: Annotated[int, typer.Option("--legacy-target", min=0)] = 10,
+    legacy_minimum: Annotated[int, typer.Option("--legacy-minimum", min=0)] = 5,
+    legacy_attempt_limit: Annotated[int, typer.Option("--legacy-attempt-limit", min=0)] = 20,
+    seed: Annotated[int, typer.Option("--seed")] = 20260627,
+    include: Annotated[
+        list[str] | None,
+        typer.Option("--include", help="Force one active CodeVersion into selection."),
+    ] = None,
+    resume: Annotated[bool, typer.Option("--resume")] = False,
+    retry_failed: Annotated[bool, typer.Option("--retry-failed")] = False,
+    profile_only: Annotated[bool, typer.Option("--profile-only")] = False,
+    dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
+) -> None:
+    """Build an isolated raw JSON research corpus without touching the production bank."""
+    settings = bootstrap(config)
+    options = ResearchCorpusOptions(
+        output=output,
+        current_count=current_count,
+        legacy_target=legacy_target,
+        legacy_minimum=legacy_minimum,
+        legacy_attempt_limit=legacy_attempt_limit,
+        seed=seed,
+        include=tuple(include or ()),
+        resume=resume,
+        retry_failed=retry_failed,
+        profile_only=profile_only,
+        dry_run=dry_run,
+    )
+    try:
+        if dry_run or profile_only:
+            summary = run_research_build_corpus(settings, None, options)
+        else:
+            with ClinrecApiClient(settings.http, settings.rate_limit) as client:
+                summary = run_research_build_corpus(settings, client, options)
+    except BankError as exc:
+        typer.echo(f"research-build-corpus failed: {exc}", err=True)
+        raise typer.Exit(bank_exit_code(exc)) from exc
+
+    typer.echo("research-build-corpus completed")
+    typer.echo(f"output: {summary.output}")
+    typer.echo(f"status: {summary.status}")
+    typer.echo(f"valid_current_count: {summary.valid_current_count}")
+    typer.echo(f"valid_legacy_count: {summary.valid_legacy_count}")
+    typer.echo(f"legacy_attempts: {summary.legacy_attempts}")
+    typer.echo(f"corpus: {summary.corpus_path}")
+    typer.echo(f"summary: {summary.summary_path}")
 
 
 @app.command("bank-update")
