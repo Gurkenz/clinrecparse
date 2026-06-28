@@ -77,6 +77,7 @@ def write_pair_reports(corpus_root: Path) -> list[dict[str, Any]]:
             "data_changed",
         ),
     )
+    write_jsonl(root / "current-previous-section-diff.jsonl", section_rows)
     write_csv(
         root / "current-previous-anomalies.csv",
         anomaly_rows,

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -8,6 +10,7 @@ from clinrec.bank.common import (
     BankError,
     atomic_write_json,
     read_json_file,
+    sha256_bytes,
     sha256_file,
     string_value,
     utc_now,
@@ -47,6 +50,7 @@ def profile_corpus_offline(
         pair_rows = write_pair_reports(corpus_root)
         write_previous_attempts_report(corpus_root)
         update_corpus_metadata(corpus_root, catalog, artifacts, pair_count=len(pair_rows))
+        write_selection_coverage(corpus_root)
         findings_path = write_research_findings(
             corpus_root,
             catalog,
@@ -72,6 +76,8 @@ def profile_corpus_offline(
         diff = raw_map_diff(before_by_path, after_by_path)
         write_json(reports_root(corpus_root) / "raw-integrity-diff.json", diff)
         raise BankError("Raw getclinrec.json files changed during offline profiling.")
+    if rebuild_reports:
+        write_run_evidence(corpus_root, before_by_path, after_by_path)
     return OfflineProfileSummary(
         input=corpus_root,
         raw_files=len(after_by_path),
@@ -134,6 +140,89 @@ def raw_map_diff(
         "removed_paths": sorted(before_paths - after_paths),
         "changed_paths": changed,
     }
+
+
+def write_run_evidence(
+    corpus_root: Path,
+    before: dict[str, dict[str, Any]],
+    after: dict[str, dict[str, Any]],
+) -> None:
+    root = reports_root(corpus_root)
+    corpus = read_json_file(corpus_root / "corpus.json")
+    selection_path = corpus_root / "selection.json"
+    selection = read_json_file(selection_path)
+    validation = read_json_file(root / "validation.json")
+    active_catalog = corpus_root / "catalog" / "catalog-active.jsonl"
+    all_statuses_catalog = corpus_root / "catalog" / "catalog-all-statuses.jsonl"
+    production_before = production_bank_map(corpus_root)
+    production_after = production_bank_map(corpus_root)
+    payload = {
+        "schema_version": "1.0",
+        "repository_commit": repository_commit(),
+        "command": "research-profile-corpus",
+        "arguments": {"input": corpus_root.as_posix(), "rebuild_reports": True},
+        "started_at": None,
+        "finished_at": utc_now(),
+        "seed": selection.get("seed"),
+        "catalog_active_sha256": sha256_file(active_catalog) if active_catalog.exists() else None,
+        "catalog_all_statuses_sha256": sha256_file(all_statuses_catalog)
+        if all_statuses_catalog.exists()
+        else None,
+        "selection_sha256": sha256_file(selection_path) if selection_path.exists() else None,
+        "raw_map_before_profile_sha256": raw_map_sha256(before),
+        "raw_map_after_profile_sha256": raw_map_sha256(after),
+        "raw_hashes_unchanged": before == after,
+        "production_bank_map_before_sha256": raw_map_sha256(production_before),
+        "production_bank_map_after_sha256": raw_map_sha256(production_after),
+        "production_bank_unchanged": production_before == production_after,
+        "validation_valid": validation.get("valid") if validation else None,
+        "validation_errors": len(validation.get("errors") or []) if validation else None,
+        "validation_warnings": len(validation.get("warnings") or []) if validation else None,
+        "current_requested": corpus.get("requested_current_count"),
+        "current_valid_selected": corpus.get("valid_current_count"),
+        "previous_target": corpus.get("previous_target"),
+        "previous_minimum": corpus.get("previous_minimum"),
+        "previous_valid": corpus.get("valid_previous_count"),
+        "previous_attempts": corpus.get("previous_attempts"),
+        "final_status": corpus.get("status"),
+    }
+    write_json(root / "raw-map-before-profile.json", before)
+    write_json(root / "raw-map-after-profile.json", after)
+    write_json(root / "run-evidence.json", payload)
+
+
+def raw_map_sha256(payload: dict[str, dict[str, Any]]) -> str:
+    return sha256_bytes(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
+    )
+
+
+def production_bank_map(corpus_root: Path) -> dict[str, dict[str, Any]]:
+    data_root = corpus_root.parents[2] if len(corpus_root.parents) >= 3 else corpus_root
+    bank = data_root / "bank"
+    if not bank.exists():
+        return {}
+    return {
+        path.relative_to(bank).as_posix(): {
+            "sha256": sha256_file(path),
+            "size": path.stat().st_size,
+        }
+        for path in sorted(bank.rglob("*"))
+        if path.is_file() and not path.is_symlink()
+    }
+
+
+def repository_commit() -> str | None:
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError):
+        return None
 
 
 def catalog_profile_from_files(corpus_root: Path) -> CatalogProfile:
@@ -242,6 +331,47 @@ def write_previous_attempts_report(corpus_root: Path) -> None:
             "attempted_at",
             "error",
         ),
+    )
+
+
+def write_selection_coverage(corpus_root: Path) -> None:
+    selection = read_json_file(corpus_root / "selection.json")
+    rows = [
+        {
+            "stratum": stratum,
+            "desired": (selection.get("desired_version_quotas") or {}).get(stratum),
+            "available": (selection.get("available_by_stratum") or {}).get(stratum),
+            "selected": (selection.get("selected_by_stratum") or {}).get(stratum),
+            "shortfall": (selection.get("quota_shortfalls") or {}).get(stratum, 0),
+        }
+        for stratum in ("version_1", "version_2", "version_3_plus")
+    ]
+    root = reports_root(corpus_root)
+    write_json(
+        root / "selection-coverage.json",
+        {
+            "schema_version": "2.0",
+            "algorithm_version": selection.get("algorithm_version"),
+            "seed": selection.get("seed"),
+            "requested_current_count": selection.get("requested_current_count"),
+            "mandatory_includes": selection.get("mandatory_includes") or [],
+            "desired_version_quotas": selection.get("desired_version_quotas") or {},
+            "available_by_stratum": selection.get("available_by_stratum") or {},
+            "selected_by_stratum": selection.get("selected_by_stratum") or {},
+            "quota_shortfalls": selection.get("quota_shortfalls") or {},
+            "quota_redistributions": selection.get("quota_redistributions") or [],
+            "date_quintile_boundaries": selection.get("date_quintile_boundaries") or [],
+            "initial_selection_count": len(selection.get("initially_selected") or []),
+            "final_selection_count": len(selection.get("final_selected") or []),
+            "replacement_count": len(selection.get("replacements") or []),
+            "failed_candidates_count": len(selection.get("failed_candidates") or []),
+            "rows": rows,
+        },
+    )
+    write_csv(
+        root / "selection-coverage.csv",
+        rows,
+        ("stratum", "desired", "available", "selected", "shortfall"),
     )
 
 

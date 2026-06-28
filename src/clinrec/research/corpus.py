@@ -29,6 +29,7 @@ from clinrec.config import PathSettings, Settings
 from clinrec.models.external import ApiErrorKind, ExternalApiError
 from clinrec.research.catalog import records_by_code_version, resolve_catalog_candidates
 from clinrec.research.migration import research_layout
+from clinrec.research.reports import write_csv
 from clinrec.research.schema import profile_corpus_offline
 
 RESEARCH_SCHEMA_VERSION = "2.0"
@@ -1081,6 +1082,7 @@ def write_reports(
         "updated_at": utc_now(),
     }
     write_json(reports_root(output) / "corpus-summary.json", summary)
+    write_selection_coverage(output, selection)
     if not (reports_root(output) / "research-findings.md").exists():
         write_findings(output, summary)
     write_corpus_state(output, options, selection, "", status)
@@ -1092,6 +1094,44 @@ def write_reports(
         legacy_attempts=len(existing_legacy_attempts(output)),
         corpus_path=output / "corpus.json",
         summary_path=reports_root(output) / "corpus-summary.json",
+    )
+
+
+def write_selection_coverage(output: Path, selection: dict[str, Any]) -> None:
+    rows = [
+        {
+            "stratum": stratum,
+            "desired": (selection.get("desired_version_quotas") or {}).get(stratum),
+            "available": (selection.get("available_by_stratum") or {}).get(stratum),
+            "selected": (selection.get("selected_by_stratum") or {}).get(stratum),
+            "shortfall": (selection.get("quota_shortfalls") or {}).get(stratum, 0),
+        }
+        for stratum in ("version_1", "version_2", "version_3_plus")
+    ]
+    payload = {
+        "schema_version": "2.0",
+        "algorithm_version": selection.get("algorithm_version"),
+        "seed": selection.get("seed"),
+        "requested_current_count": selection.get("requested_current_count"),
+        "mandatory_includes": selection.get("mandatory_includes") or [],
+        "desired_version_quotas": selection.get("desired_version_quotas") or {},
+        "available_by_stratum": selection.get("available_by_stratum") or {},
+        "selected_by_stratum": selection.get("selected_by_stratum") or {},
+        "quota_shortfalls": selection.get("quota_shortfalls") or {},
+        "quota_redistributions": selection.get("quota_redistributions") or [],
+        "date_quintile_boundaries": selection.get("date_quintile_boundaries") or [],
+        "initial_selection_count": len(selection.get("initially_selected") or []),
+        "final_selection_count": len(selection.get("final_selected") or []),
+        "replacement_count": len(selection.get("replacements") or []),
+        "failed_candidates_count": len(selection.get("failed_candidates") or []),
+        "rows": rows,
+    }
+    root = reports_root(output)
+    write_json(root / "selection-coverage.json", payload)
+    write_csv(
+        root / "selection-coverage.csv",
+        rows,
+        ("stratum", "desired", "available", "selected", "shortfall"),
     )
 
 
