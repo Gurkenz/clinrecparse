@@ -54,6 +54,11 @@ from clinrec.bank.transaction import (
 )
 from clinrec.config import DEFAULT_CONFIG_PATH, Settings, ensure_data_directories, load_settings
 from clinrec.logging import configure_logging
+from clinrec.parsed.layer import ParsedBuildOptions
+from clinrec.parsed.layer import build_parsed_dataset as run_parsed_build
+from clinrec.parsed.layer import build_parsed_diff as run_parsed_build_diff
+from clinrec.parsed.layer import export_parsed_dataset as run_parsed_export
+from clinrec.parsed.layer import validate_parsed_dataset as run_parsed_validate
 from clinrec.parsing.document import ParseError, ParseOptions
 from clinrec.parsing.document import parse_documents as run_parse_documents
 from clinrec.qa.checks import QaOptions
@@ -523,7 +528,17 @@ def research_build_corpus(
         ),
     ],
     config: ConfigOption = DEFAULT_CONFIG_PATH,
-    current_count: Annotated[int, typer.Option("--current-count", min=1)] = 50,
+    current_count: Annotated[int | None, typer.Option("--current-count", min=1)] = None,
+    all_current: Annotated[
+        bool,
+        typer.Option(
+            "--all-current",
+            help=(
+                "Download every unique valid CodeVersion from the active catalog; "
+                "mutually exclusive with --current-count."
+            ),
+        ),
+    ] = False,
     previous_target: Annotated[
         int | None,
         typer.Option("--previous-target", min=0, help="Preferred previous-version target."),
@@ -564,6 +579,13 @@ def research_build_corpus(
 ) -> None:
     """Build an isolated raw JSON research corpus without touching the production bank."""
     settings = bootstrap(config)
+    if all_current and current_count is not None:
+        typer.echo(
+            "research-build-corpus failed: "
+            "--all-current and --current-count are mutually exclusive.",
+            err=True,
+        )
+        raise typer.Exit(2)
     effective_previous_target = previous_target if previous_target is not None else legacy_target
     effective_previous_minimum = (
         previous_minimum if previous_minimum is not None else legacy_minimum
@@ -575,7 +597,9 @@ def research_build_corpus(
     )
     options = ResearchCorpusOptions(
         output=output,
-        current_count=current_count,
+        current_count=current_count if current_count is not None else 50,
+        selection_mode="all_current" if all_current else "count",
+        requested_current_count=current_count,
         legacy_target=effective_previous_target if effective_previous_target is not None else 10,
         legacy_minimum=effective_previous_minimum if effective_previous_minimum is not None else 5,
         legacy_attempt_limit=effective_previous_attempt_limit
@@ -703,6 +727,166 @@ def research_profile_corpus(
     typer.echo(f"sections: {summary.sections}")
     typer.echo(f"pairs: {summary.pairs}")
     typer.echo(f"findings: {summary.findings_path}")
+
+
+@app.command("parsed-build")
+def parsed_build(
+    input: Annotated[
+        Path,
+        typer.Option(
+            "--input",
+            help="Research raw corpus directory, e.g. data/research/corpora/live-json-250.",
+            exists=True,
+            file_okay=False,
+            dir_okay=True,
+            readable=True,
+        ),
+    ],
+    output: Annotated[
+        Path,
+        typer.Option("--output", help="Parsed dataset output directory."),
+    ],
+    code_version: Annotated[
+        list[str] | None,
+        typer.Option("--code-version", help="Current CodeVersion to parse; can be repeated."),
+    ] = None,
+    all_current: Annotated[
+        bool,
+        typer.Option("--all-current", help="Parse every current document in the raw corpus."),
+    ] = False,
+    include_previous: Annotated[
+        bool,
+        typer.Option(
+            "--include-previous",
+            help="Also parse previous documents for selected current.",
+        ),
+    ] = False,
+) -> None:
+    """Build deterministic parsed application-layer artifacts from immutable research raw JSON."""
+    if all_current and code_version:
+        typer.echo(
+            "parsed-build failed: --all-current and --code-version are mutually exclusive.",
+            err=True,
+        )
+        raise typer.Exit(2)
+    try:
+        summary = run_parsed_build(
+            ParsedBuildOptions(
+                input=input,
+                output=output,
+                code_versions=tuple(code_version or ()),
+                all_current=all_current,
+                include_previous=include_previous,
+            )
+        )
+    except BankError as exc:
+        typer.echo(f"parsed-build failed: {exc}", err=True)
+        raise typer.Exit(bank_exit_code(exc)) from exc
+    typer.echo("parsed-build completed")
+    typer.echo(f"output: {summary.output}")
+    typer.echo(f"source_documents: {summary.source_documents}")
+    typer.echo(f"parsed_documents: {summary.parsed_documents}")
+    typer.echo(f"failed_documents: {summary.failed_documents}")
+    typer.echo(f"sections: {summary.sections}")
+    typer.echo(f"tables: {summary.tables}")
+    typer.echo(f"images: {summary.images}")
+    typer.echo(f"chunks: {summary.chunks}")
+    typer.echo(f"summary: {summary.summary_path}")
+    if summary.failed_documents:
+        raise typer.Exit(1)
+
+
+@app.command("parsed-validate")
+def parsed_validate(
+    input: Annotated[
+        Path,
+        typer.Option(
+            "--input",
+            help="Parsed dataset directory, e.g. data/parsed/pilot-v1.",
+            exists=True,
+            file_okay=False,
+            dir_okay=True,
+            readable=True,
+        ),
+    ],
+) -> None:
+    """Validate parsed artifacts against their immutable raw JSON sources."""
+    try:
+        summary = run_parsed_validate(input)
+    except BankError as exc:
+        typer.echo(f"parsed-validate failed: {exc}", err=True)
+        raise typer.Exit(bank_exit_code(exc)) from exc
+    typer.echo("parsed-validate completed")
+    typer.echo(f"input: {summary.input}")
+    typer.echo(f"valid: {summary.valid}")
+    typer.echo(f"errors: {summary.errors}")
+    typer.echo(f"warnings: {summary.warnings}")
+    typer.echo(f"report: {summary.report_json}")
+    typer.echo(f"markdown: {summary.report_markdown}")
+    if not summary.valid:
+        raise typer.Exit(2)
+
+
+@app.command("parsed-export")
+def parsed_export(
+    input: Annotated[
+        Path,
+        typer.Option(
+            "--input",
+            help="Parsed dataset directory, e.g. data/parsed/pilot-v1.",
+            exists=True,
+            file_okay=False,
+            dir_okay=True,
+            readable=True,
+        ),
+    ],
+    output: Annotated[Path, typer.Option("--output", help="Export output directory.")],
+) -> None:
+    """Export backend, frontend, search, and RAG packages from a parsed dataset."""
+    try:
+        summary = run_parsed_export(input, output)
+    except BankError as exc:
+        typer.echo(f"parsed-export failed: {exc}", err=True)
+        raise typer.Exit(bank_exit_code(exc)) from exc
+    typer.echo("parsed-export completed")
+    typer.echo(f"input: {summary.input}")
+    typer.echo(f"output: {summary.output}")
+    typer.echo(f"backend_files: {summary.backend_files}")
+    typer.echo(f"frontend_documents: {summary.frontend_documents}")
+    typer.echo(f"assets: {summary.assets}")
+    typer.echo(f"search_chunks: {summary.search_chunks}")
+    typer.echo(f"rag_chunks: {summary.rag_chunks}")
+    typer.echo(f"manifest: {summary.manifest_path}")
+
+
+@app.command("parsed-build-diff")
+def parsed_build_diff(
+    input: Annotated[
+        Path,
+        typer.Option(
+            "--input",
+            help="Parsed dataset directory, e.g. data/parsed/pilot-v1.",
+            exists=True,
+            file_okay=False,
+            dir_okay=True,
+            readable=True,
+            writable=True,
+        ),
+    ],
+) -> None:
+    """Build structural current/previous parsed diffs without clinical significance claims."""
+    try:
+        summary = run_parsed_build_diff(input)
+    except BankError as exc:
+        typer.echo(f"parsed-build-diff failed: {exc}", err=True)
+        raise typer.Exit(bank_exit_code(exc)) from exc
+    typer.echo("parsed-build-diff completed")
+    typer.echo(f"input: {summary.input}")
+    typer.echo(f"pairs: {summary.pairs}")
+    typer.echo(f"section_changes: {summary.section_changes}")
+    typer.echo(f"table_changes: {summary.table_changes}")
+    typer.echo(f"image_changes: {summary.image_changes}")
+    typer.echo(f"summary: {summary.summary_path}")
 
 
 @app.command("bank-update")

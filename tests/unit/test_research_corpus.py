@@ -184,6 +184,98 @@ def test_research_selection_missing_forced_fails() -> None:
         )
 
 
+def test_research_all_current_dry_run_writes_universe_reports(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    output = settings.paths.data_root / "research" / "corpora" / "all-current-dry-run"
+    rows = [
+        catalog_row(200, 2),
+        catalog_row(200, 1),
+        {**catalog_row(200, 2), "source_record_id": 20022},
+        {**catalog_row(0, 0), "source_record_id": 9999, "code_version": "_"},
+    ]
+    write_jsonl(output / "catalog" / "catalog-active.jsonl", rows)
+    write_jsonl(output / "catalog" / "catalog-all-statuses.jsonl", rows)
+
+    summary = build_research_corpus(
+        settings,
+        None,
+        ResearchCorpusOptions(
+            output=output,
+            selection_mode="all_current",
+            legacy_target=0,
+            legacy_minimum=0,
+            dry_run=True,
+        ),
+    )
+
+    selection = read_json_file(output / "selection.json")
+    universe = read_json_file(output / "reports" / "current-universe.json")
+    coverage = read_json_file(output / "reports" / "current-coverage.json")
+    provenance = read_jsonl(output / "reports" / "selection-provenance.jsonl")
+
+    assert summary.status == "dry_run"
+    assert selection["selection_mode"] == "all_current"
+    assert selection["requested_current_count"] == 2
+    assert selection["initially_selected"] == ["200_1", "200_2"]
+    assert selection["replacements"] == []
+    assert universe["unique_valid_code_versions"] == 2
+    assert universe["malformed_rows"] == 1
+    assert universe["duplicate_code_version_groups"] == 1
+    assert coverage["not_attempted"] == 2
+    assert [row["selection_reason"] for row in provenance] == [
+        "all_current_universe",
+        "all_current_universe",
+    ]
+
+
+def test_research_all_current_keeps_failures_without_replacement(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    output = settings.paths.data_root / "research" / "corpora" / "all-current-failure"
+    rows = [catalog_row(100, 1), catalog_row(101, 1)]
+    write_jsonl(output / "catalog" / "catalog-active.jsonl", rows)
+    write_jsonl(output / "catalog" / "catalog-all-statuses.jsonl", rows)
+
+    class Client:
+        def fetch_clinrec_payload(
+            self,
+            code_version: str,
+        ) -> JsonPayloadResult | ExternalApiError:
+            if code_version == "100_1":
+                return ExternalApiError(
+                    endpoint="GetClinrec2",
+                    kind=ApiErrorKind.HTTP_STATUS,
+                    message="Not found",
+                    status_code=404,
+                    code_version=code_version,
+                )
+            return json_result(code_version)
+
+    summary = build_research_corpus(
+        settings,
+        Client(),  # type: ignore[arg-type]
+        ResearchCorpusOptions(
+            output=output,
+            selection_mode="all_current",
+            legacy_target=0,
+            legacy_minimum=0,
+        ),
+    )
+
+    selection = read_json_file(output / "selection.json")
+    attempts = read_jsonl(output / "attempts" / "current-attempts.jsonl")
+    coverage = read_json_file(output / "reports" / "current-coverage.json")
+
+    assert summary.status == "failed"
+    assert summary.valid_current_count == 1
+    assert selection["replacements"] == []
+    assert selection["final_selected"] == ["101_1"]
+    assert selection["failed_candidates"][0]["code_version"] == "100_1"
+    assert selection["failed_candidates"][0]["result"] == "404"
+    assert [row["result"] for row in attempts] == ["404", "downloaded"]
+    assert coverage["downloaded_valid"] == 1
+    assert coverage["permanent_unavailable"] == 1
+
+
 def test_research_option_relationships_fail_before_output_mutation(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
     output = settings.paths.data_root / "research" / "corpora" / "bad-options"

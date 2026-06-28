@@ -21,6 +21,10 @@ def test_cli_help() -> None:
     assert "research-validate-corpus" in result.output
     assert "research-migrate-layout" in result.output
     assert "research-profile-corpus" in result.output
+    assert "parsed-build" in result.output
+    assert "parsed-validate" in result.output
+    assert "parsed-export" in result.output
+    assert "parsed-build-diff" in result.output
 
 
 def test_identity_conflict_bypass_flags_are_not_exposed() -> None:
@@ -31,6 +35,28 @@ def test_identity_conflict_bypass_flags_are_not_exposed() -> None:
     assert stage_help.exit_code == 0
     assert "--allow-identity-conflict" not in apply_help.output
     assert "--allow-identity-conflict" not in stage_help.output
+
+
+def test_research_all_current_cli_flag_and_conflict(tmp_path: Path) -> None:
+    help_result = runner.invoke(app, ["research-build-corpus", "--help"])
+
+    assert help_result.exit_code == 0
+    assert "--all-current" in help_result.output
+
+    conflict = runner.invoke(
+        app,
+        [
+            "research-build-corpus",
+            "--output",
+            str(tmp_path / "corpus"),
+            "--all-current",
+            "--current-count",
+            "3",
+        ],
+    )
+
+    assert conflict.exit_code == 2
+    assert "mutually exclusive" in conflict.output
 
 
 def test_qa_command_with_empty_temp_data(tmp_path: Path) -> None:

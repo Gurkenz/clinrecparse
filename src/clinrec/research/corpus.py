@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from clinrec.api.catalog_sync import sync_catalog, to_int, write_json
 from clinrec.api.client import ClinrecApiClient
@@ -30,6 +30,7 @@ from clinrec.models.external import ApiErrorKind, ExternalApiError
 from clinrec.research.catalog import records_by_code_version, resolve_catalog_candidates
 from clinrec.research.migration import research_layout
 from clinrec.research.reports import write_csv
+from clinrec.research.reports import write_jsonl as write_report_jsonl
 from clinrec.research.schema import profile_corpus_offline
 
 RESEARCH_SCHEMA_VERSION = "2.0"
@@ -40,6 +41,8 @@ SELECTION_ALGORITHM_VERSION = "research-selection-2"
 class ResearchCorpusOptions:
     output: Path
     current_count: int = 50
+    selection_mode: Literal["count", "all_current"] = "count"
+    requested_current_count: int | None = None
     legacy_target: int = 10
     legacy_minimum: int = 5
     legacy_attempt_limit: int = 20
@@ -83,6 +86,9 @@ def build_research_corpus(
     ):
         if existing_status == "completed":
             active_records, all_records, _ = load_or_sync_research_catalog(settings, None, options)
+            active_catalog_sha = sha256_file(output / "catalog" / "catalog-active.jsonl")
+            write_current_universe_reports(output, active_records, active_catalog_sha)
+            options = resolve_selection_options(options, active_records)
             profile_corpus(output, all_records)
             return write_reports(output, active_records, all_records, options, existing_status)
         raise BankError("Existing incomplete corpus requires --resume or a new output path.")
@@ -92,7 +98,11 @@ def build_research_corpus(
         client,
         options,
     )
+    write_current_universe_reports(output, active_records, catalog_sha)
+    options = resolve_selection_options(options, active_records)
     selection = load_or_create_selection(output, active_records, catalog_sha, options)
+    if selection.get("selection_mode") != options.selection_mode:
+        raise BankError("Existing selection mode differs; create a new corpus output.")
     if options.dry_run:
         write_corpus_state(output, options, selection, catalog_sha, "dry_run")
         return write_reports(output, active_records, all_records, options, "dry_run")
@@ -114,6 +124,8 @@ def build_research_corpus(
 
 
 def validate_research_options(options: ResearchCorpusOptions) -> None:
+    if options.selection_mode not in {"count", "all_current"}:
+        raise BankError(f"Unsupported selection_mode: {options.selection_mode!r}")
     if options.current_count <= 0:
         raise BankError("current_count must be greater than 0.")
     if options.legacy_target < 0:
@@ -219,6 +231,163 @@ def load_or_sync_research_catalog(
     )
 
 
+@dataclass(frozen=True)
+class CurrentUniverse:
+    code_versions: list[str]
+    rows: list[dict[str, Any]]
+    malformed_rows: list[dict[str, Any]]
+    collision_rows: list[dict[str, Any]]
+    valid_row_count: int
+
+
+def resolve_selection_options(
+    options: ResearchCorpusOptions,
+    active_records: list[dict[str, Any]],
+) -> ResearchCorpusOptions:
+    if options.selection_mode != "all_current":
+        requested = options.requested_current_count
+        if requested is None:
+            requested = options.current_count
+        return replace(options, requested_current_count=requested)
+    universe = current_universe(active_records)
+    if not universe.code_versions:
+        raise BankError("Active catalog contains no valid CodeVersion rows.")
+    return replace(
+        options,
+        current_count=len(universe.code_versions),
+        requested_current_count=len(universe.code_versions),
+    )
+
+
+def current_universe(records: list[dict[str, Any]]) -> CurrentUniverse:
+    by_code_version: dict[str, list[dict[str, Any]]] = {}
+    malformed_rows: list[dict[str, Any]] = []
+    for row_index, row in enumerate(records, start=1):
+        code_version = string_value(row.get("code_version")).strip()
+        malformed_kind = malformed_current_code_version_kind(code_version)
+        if malformed_kind is not None:
+            malformed_rows.append(
+                {
+                    "row_index": row_index,
+                    "source_record_id": source_record_id_from_catalog(row),
+                    "code_version": code_version,
+                    "malformed_kind": malformed_kind,
+                    "code": row.get("code"),
+                    "version": row.get("version"),
+                }
+            )
+            continue
+        by_code_version.setdefault(code_version, []).append(
+            {
+                "row_index": row_index,
+                "source_record_id": source_record_id_from_catalog(row),
+                "record": row,
+            }
+        )
+    code_versions = sorted(by_code_version, key=code_version_sort_key)
+    rows = [
+        {
+            "code_version": code_version,
+            "code": code_version_sort_key(code_version)[0],
+            "version": code_version_sort_key(code_version)[1],
+            "catalog_candidate_count": len(by_code_version[code_version]),
+            "catalog_row_indexes": [
+                row_index_value(candidate)
+                for candidate in by_code_version[code_version]
+            ],
+            "catalog_source_record_ids": [
+                candidate["source_record_id"] for candidate in by_code_version[code_version]
+            ],
+        }
+        for code_version in code_versions
+    ]
+    collision_rows = [row for row in rows if int_field(row, "catalog_candidate_count") > 1]
+    return CurrentUniverse(
+        code_versions=code_versions,
+        rows=rows,
+        malformed_rows=malformed_rows,
+        collision_rows=collision_rows,
+        valid_row_count=sum(len(items) for items in by_code_version.values()),
+    )
+
+
+def row_index_value(candidate: dict[str, Any]) -> int:
+    value = candidate.get("row_index")
+    return value if isinstance(value, int) else 0
+
+
+def int_field(row: dict[str, Any], key: str) -> int:
+    value = row.get(key)
+    return value if isinstance(value, int) else 0
+
+
+def write_current_universe_reports(
+    output: Path,
+    active_records: list[dict[str, Any]],
+    catalog_sha: str,
+) -> CurrentUniverse:
+    universe = current_universe(active_records)
+    root = reports_root(output)
+    write_json(
+        root / "current-universe.json",
+        {
+            "schema_version": RESEARCH_SCHEMA_VERSION,
+            "catalog_sha256": catalog_sha,
+            "active_catalog_rows": len(active_records),
+            "valid_rows": universe.valid_row_count,
+            "malformed_rows": len(universe.malformed_rows),
+            "unique_valid_code_versions": len(universe.code_versions),
+            "duplicate_code_version_groups": len(universe.collision_rows),
+            "code_versions": universe.code_versions,
+        },
+    )
+    write_report_jsonl(root / "current-universe.jsonl", universe.rows)
+    write_csv(
+        root / "catalog-malformed-current.csv",
+        universe.malformed_rows,
+        ("row_index", "source_record_id", "code_version", "malformed_kind", "code", "version"),
+    )
+    write_csv(
+        root / "catalog-current-collisions.csv",
+        universe.collision_rows,
+        (
+            "code_version",
+            "catalog_candidate_count",
+            "catalog_source_record_ids",
+            "catalog_row_indexes",
+        ),
+    )
+    return universe
+
+
+def malformed_current_code_version_kind(code_version: str) -> str | None:
+    if not code_version:
+        return "empty"
+    if "_" not in code_version:
+        return "missing version"
+    code_text, version_text = code_version.split("_", maxsplit=1)
+    if not code_text:
+        return "missing code"
+    if not version_text:
+        return "missing version"
+    if not code_text.isdigit():
+        return "non-numeric code"
+    if not version_text.isdigit():
+        return "non-numeric version"
+    if int(code_text) <= 0:
+        return "non-positive code"
+    if int(version_text) <= 0:
+        return "non-positive version"
+    return None
+
+
+def code_version_sort_key(code_version: str) -> tuple[int, int, str]:
+    if malformed_current_code_version_kind(code_version) is not None:
+        return (10**12, 10**12, code_version)
+    code_text, version_text = code_version.split("_", maxsplit=1)
+    return (int(code_text), int(version_text), code_version)
+
+
 def load_or_create_selection(
     output: Path,
     records: list[dict[str, Any]],
@@ -232,19 +401,22 @@ def load_or_create_selection(
             raise BankError("Research catalog hash changed; create a new corpus output.")
         return selection
     selected = select_current_records(records, options)
-    desired_quotas = stratum_targets(options.current_count)
+    desired_quotas = (
+        {} if options.selection_mode == "all_current" else stratum_targets(options.current_count)
+    )
     available_by_stratum = available_counts_by_stratum(records)
     selected_by_stratum = selected_counts_by_stratum(selected)
     all_statuses_path = output / "catalog" / "catalog-all-statuses.jsonl"
     selection = {
         "schema_version": RESEARCH_SCHEMA_VERSION,
         "algorithm_version": SELECTION_ALGORITHM_VERSION,
+        "selection_mode": options.selection_mode,
         "seed": options.seed,
         "catalog_sha256": catalog_sha,
         "catalog_all_statuses_sha256": sha256_file(all_statuses_path)
         if all_statuses_path.exists()
         else None,
-        "requested_current_count": options.current_count,
+        "requested_current_count": options.requested_current_count or options.current_count,
         "mandatory_includes": list(options.include),
         "desired_version_quotas": desired_quotas,
         "available_by_stratum": available_by_stratum,
@@ -268,6 +440,8 @@ def select_current_records(
     records: list[dict[str, Any]],
     options: ResearchCorpusOptions,
 ) -> list[str]:
+    if options.selection_mode == "all_current":
+        return current_universe(records).code_versions
     by_code_version = unique_records_by_code_version(records)
     forced = list(dict.fromkeys(options.include))
     missing = [code_version for code_version in forced if code_version not in by_code_version]
@@ -524,10 +698,16 @@ def download_current_documents(
     by_code_version = records_by_code_version(active_records)
     selected = list(selection.get("initially_selected") or [])
     final_selected: list[str] = list(selection.get("final_selected") or [])
+    failed_rows: list[Any] = []
+    for key in ("failed_candidates", "forced_failures"):
+        value = selection.get(key)
+        if isinstance(value, list):
+            failed_rows.extend(value)
     failed = {
         string_value(row.get("code_version"))
-        for row in selection.get("forced_failures", [])
+        for row in failed_rows
         if isinstance(row, dict)
+        and not should_retry_current_attempt(row, options)
     }
     attempted = set(final_selected) | failed
     pool = replacement_pool(active_records, selected, options.seed)
@@ -559,41 +739,42 @@ def download_current_documents(
             if code_version not in final_selected:
                 final_selected.append(code_version)
         else:
-            if code_version in options.include:
+            if code_version in options.include and options.selection_mode == "count":
                 forced_failures = list(selection.get("forced_failures") or [])
                 forced_failures.append(result)
                 selection["forced_failures"] = forced_failures
-            replacements = list(selection.get("replacements") or [])
-            replacement = stratum_replacement(
-                active_records,
-                selected=selected,
-                attempted=attempted,
-                final_selected=final_selected,
-                failed_code_version=code_version,
-                seed=options.seed,
-            )
-            if replacement is not None:
-                pending_replacements.append(replacement["replacement_code_version"])
-            replacements.append(
-                {
-                    "failed_code_version": code_version,
-                    "failed_result": result["result"],
-                    "failed_stratum": stratum_for_code_version(code_version),
-                    "replacement_code_version": replacement["replacement_code_version"]
-                    if replacement is not None
-                    else None,
-                    "replacement_stratum": replacement["replacement_stratum"]
-                    if replacement is not None
-                    else None,
-                    "relaxed_dimensions": replacement["relaxed_dimensions"]
-                    if replacement is not None
-                    else [],
-                    "selection_reason": replacement["selection_reason"]
-                    if replacement is not None
-                    else "no_replacement_available",
-                }
-            )
-            selection["replacements"] = replacements
+            if options.selection_mode == "count":
+                replacements = list(selection.get("replacements") or [])
+                replacement = stratum_replacement(
+                    active_records,
+                    selected=selected,
+                    attempted=attempted,
+                    final_selected=final_selected,
+                    failed_code_version=code_version,
+                    seed=options.seed,
+                )
+                if replacement is not None:
+                    pending_replacements.append(replacement["replacement_code_version"])
+                replacements.append(
+                    {
+                        "failed_code_version": code_version,
+                        "failed_result": result["result"],
+                        "failed_stratum": stratum_for_code_version(code_version),
+                        "replacement_code_version": replacement["replacement_code_version"]
+                        if replacement is not None
+                        else None,
+                        "replacement_stratum": replacement["replacement_stratum"]
+                        if replacement is not None
+                        else None,
+                        "relaxed_dimensions": replacement["relaxed_dimensions"]
+                        if replacement is not None
+                        else [],
+                        "selection_reason": replacement["selection_reason"]
+                        if replacement is not None
+                        else "no_replacement_available",
+                    }
+                )
+                selection["replacements"] = replacements
             failed_candidates = list(selection.get("failed_candidates") or [])
             failed_candidates.append(result)
             selection["failed_candidates"] = failed_candidates
@@ -706,18 +887,27 @@ def download_one_research_current(
     root = output / "current" / code_version
     raw_path = root / "getclinrec.json"
     manifest_path = root / "manifest.json"
+    started_at = utc_now()
     if (
         raw_path.exists()
         and manifest_path.exists()
         and research_manifest_matches(raw_path, manifest_path, code_version)
     ):
-        return {"code_version": code_version, "result": "already_valid"}
+        row = {
+            "code_version": code_version,
+            "result": "already_valid",
+            "http_status": None,
+            "response_size": raw_path.stat().st_size,
+        }
+        append_current_attempt(output, row, started_at=started_at, finished_at=utc_now())
+        return row
     result = client.fetch_clinrec_payload(code_version)
     if isinstance(result, ExternalApiError):
         row = result_row(code_version, classify_api_error(result), result.message, result)
         write_error(output, "current", row)
+        append_current_attempt(output, row, started_at=started_at, finished_at=utc_now())
         return row
-    return save_research_document(
+    row = save_research_document(
         root,
         code_version=code_version,
         catalog_candidates=catalog_candidates,
@@ -725,6 +915,8 @@ def download_one_research_current(
         http_status=result.status_code,
         content_type=result.content_type,
     )
+    append_current_attempt(output, row, started_at=started_at, finished_at=utc_now())
+    return row
 
 
 def save_research_document(
@@ -745,6 +937,8 @@ def save_research_document(
             "code_version": code_version,
             "result": "invalid_json",
             "error": "; ".join(errors),
+            "http_status": http_status,
+            "response_size": len(raw_content),
         }
         write_json(root / "manifest.json", {"validation": "invalid", **row})
         return row
@@ -786,10 +980,25 @@ def save_research_document(
         manifest,
     )
     if resolution.metadata_ambiguous or resolution.state == "missing":
-        return {"code_version": code_version, "result": "valid_with_identity_warning"}
+        return {
+            "code_version": code_version,
+            "result": "valid_with_identity_warning",
+            "http_status": http_status,
+            "response_size": len(raw_content),
+        }
     if db_id_state(catalog_source_id, info.db_id) == "mismatch":
-        return {"code_version": code_version, "result": "valid_with_identity_warning"}
-    return {"code_version": code_version, "result": "downloaded"}
+        return {
+            "code_version": code_version,
+            "result": "valid_with_identity_warning",
+            "http_status": http_status,
+            "response_size": len(raw_content),
+        }
+    return {
+        "code_version": code_version,
+        "result": "downloaded",
+        "http_status": http_status,
+        "response_size": len(raw_content),
+    }
 
 
 def research_manifest_matches(raw_path: Path, manifest_path: Path, code_version: str) -> bool:
@@ -967,6 +1176,8 @@ def result_row(
         "error": error,
         "http_status": api_error.status_code if api_error else None,
         "api_error_kind": api_error.kind.value if api_error else None,
+        "error_type": api_error.error_type if api_error else None,
+        "response_size": api_error.response_size_bytes if api_error else None,
         "attempted_at": utc_now(),
     }
 
@@ -1047,6 +1258,26 @@ def should_retry_previous_attempt(row: dict[str, Any], options: ResearchCorpusOp
     return result in {"timeout", "429", "5xx", "circuit_open", "invalid_json"}
 
 
+def should_retry_current_attempt(row: dict[str, Any], options: ResearchCorpusOptions) -> bool:
+    result = string_value(row.get("result"))
+    if result in {"downloaded", "already_valid", "valid_with_identity_warning", "403", "404"}:
+        return False
+    if not options.retry_failed:
+        return False
+    return result in {
+        "timeout",
+        "429",
+        "5xx",
+        "request_error",
+        "circuit_open",
+        "empty_response",
+        "html_error",
+        "unexpected_content_type",
+        "invalid_json",
+        "other_error",
+    }
+
+
 def profile_corpus(output: Path, all_records: list[dict[str, Any]]) -> None:
     _ = all_records
     profile_corpus_offline(output)
@@ -1065,9 +1296,10 @@ def write_reports(
     summary = {
         "schema_version": RESEARCH_SCHEMA_VERSION,
         "status": status,
+        "selection_mode": options.selection_mode,
         "active_catalog_total": len(active_records),
         "all_statuses_catalog_total": len(all_records),
-        "requested_current_count": options.current_count,
+        "requested_current_count": options.requested_current_count or options.current_count,
         "valid_current_count": len(valid_current),
         "legacy_target": options.legacy_target,
         "legacy_minimum": options.legacy_minimum,
@@ -1083,6 +1315,8 @@ def write_reports(
     }
     write_json(reports_root(output) / "corpus-summary.json", summary)
     write_selection_coverage(output, selection)
+    write_selection_provenance(output, active_records, selection, options)
+    write_current_coverage(output, active_records, selection)
     if not (reports_root(output) / "research-findings.md").exists():
         write_findings(output, summary)
     write_corpus_state(output, options, selection, "", status)
@@ -1135,6 +1369,173 @@ def write_selection_coverage(output: Path, selection: dict[str, Any]) -> None:
     )
 
 
+def write_selection_provenance(
+    output: Path,
+    active_records: list[dict[str, Any]],
+    selection: dict[str, Any],
+    options: ResearchCorpusOptions,
+) -> None:
+    universe_by_code_version = {
+        row["code_version"]: row for row in current_universe(active_records).rows
+    }
+    initially_selected = [
+        string_value(value)
+        for value in selection.get("initially_selected", [])
+        if isinstance(value, str)
+    ]
+    final_selected = {
+        string_value(value)
+        for value in selection.get("final_selected", [])
+        if isinstance(value, str)
+    }
+    failed_by_code_version = latest_rows_by_code_version(selection.get("failed_candidates"))
+    replacement_reasons = {
+        string_value(row.get("replacement_code_version")): string_value(row.get("selection_reason"))
+        for row in selection.get("replacements", [])
+        if isinstance(row, dict) and row.get("replacement_code_version")
+    }
+    rows: list[dict[str, Any]] = []
+    for code_version in initially_selected:
+        universe_row = universe_by_code_version.get(code_version, {})
+        rows.append(
+            {
+                "code_version": code_version,
+                "catalog_candidate_count": universe_row.get("catalog_candidate_count", 0),
+                "catalog_row_indexes": universe_row.get("catalog_row_indexes", []),
+                "selection_mode": selection.get("selection_mode") or options.selection_mode,
+                "selection_reason": selection_reason_for(
+                    code_version,
+                    initially_selected,
+                    options,
+                    replacement_reasons,
+                ),
+                "download_required": code_version not in final_selected,
+                "final_result": final_result_for(
+                    code_version,
+                    final_selected,
+                    failed_by_code_version,
+                ),
+            }
+        )
+    write_report_jsonl(reports_root(output) / "selection-provenance.jsonl", rows)
+
+
+def latest_rows_by_code_version(value: Any) -> dict[str, dict[str, Any]]:
+    rows = value if isinstance(value, list) else []
+    result: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        if isinstance(row, dict):
+            result[string_value(row.get("code_version"))] = row
+    return result
+
+
+def selection_reason_for(
+    code_version: str,
+    initially_selected: list[str],
+    options: ResearchCorpusOptions,
+    replacement_reasons: dict[str, str],
+) -> str:
+    if options.selection_mode == "all_current":
+        return "all_current_universe"
+    if code_version in options.include:
+        return "mandatory_include"
+    if code_version in replacement_reasons:
+        return replacement_reasons[code_version]
+    if code_version in initially_selected:
+        return "stratified_initial_selection"
+    return "unknown"
+
+
+def final_result_for(
+    code_version: str,
+    final_selected: set[str],
+    failed_by_code_version: dict[str, dict[str, Any]],
+) -> str:
+    if code_version in final_selected:
+        return "valid"
+    if code_version in failed_by_code_version:
+        return string_value(failed_by_code_version[code_version].get("result"))
+    return "not_attempted"
+
+
+def write_current_coverage(
+    output: Path,
+    active_records: list[dict[str, Any]],
+    selection: dict[str, Any],
+) -> None:
+    universe = current_universe(active_records)
+    latest_attempts = latest_attempt_rows(output / "attempts" / "current-attempts.jsonl")
+    final_selected = {
+        string_value(value)
+        for value in selection.get("final_selected", [])
+        if isinstance(value, str)
+    }
+    selected = set(universe.code_versions)
+    coverage = {
+        "schema_version": RESEARCH_SCHEMA_VERSION,
+        "selection_mode": selection.get("selection_mode") or "count",
+        "active_catalog_rows": len(active_records),
+        "unique_valid_code_versions": len(universe.code_versions),
+        "downloaded_valid": 0,
+        "already_valid": 0,
+        "valid_with_identity_warning": 0,
+        "permanent_unavailable": 0,
+        "transient_failed": 0,
+        "content_failed": 0,
+        "invalid_raw": 0,
+        "not_attempted": 0,
+        "malformed_rows": len(universe.malformed_rows),
+        "collision_count": len(universe.collision_rows),
+    }
+    rows: list[dict[str, Any]] = []
+    for code_version in universe.code_versions:
+        attempt = latest_attempts.get(code_version)
+        result = string_value(attempt.get("result")) if attempt else ""
+        bucket = current_coverage_bucket(result, code_version in final_selected)
+        coverage[bucket] = int(coverage[bucket]) + 1
+        rows.append(
+            {
+                "code_version": code_version,
+                "selected": code_version in selected,
+                "final_selected": code_version in final_selected,
+                "coverage_bucket": bucket,
+                "latest_result": result or None,
+                "http_status": attempt.get("http_status") if attempt else None,
+                "attempt_number": attempt.get("attempt_number") if attempt else None,
+            }
+        )
+    root = reports_root(output)
+    write_json(root / "current-coverage.json", coverage)
+    write_report_jsonl(root / "current-coverage.jsonl", rows)
+
+
+def latest_attempt_rows(path: Path) -> dict[str, dict[str, Any]]:
+    result: dict[str, dict[str, Any]] = {}
+    for row in read_jsonl(path):
+        result[string_value(row.get("code_version"))] = row
+    return result
+
+
+def current_coverage_bucket(result: str, valid_manifest: bool) -> str:
+    if result == "downloaded":
+        return "downloaded_valid"
+    if result == "already_valid":
+        return "already_valid"
+    if result == "valid_with_identity_warning":
+        return "valid_with_identity_warning"
+    if result in {"403", "404"}:
+        return "permanent_unavailable"
+    if result in {"timeout", "429", "5xx", "request_error", "circuit_open", "other_error"}:
+        return "transient_failed"
+    if result in {"empty_response", "html_error", "unexpected_content_type"}:
+        return "content_failed"
+    if result == "invalid_json":
+        return "invalid_raw"
+    if valid_manifest:
+        return "downloaded_valid"
+    return "not_attempted"
+
+
 def write_corpus_state(
     output: Path,
     options: ResearchCorpusOptions,
@@ -1155,7 +1556,8 @@ def write_corpus_state(
             "updated_at": utc_now(),
             "source": "GetJsonClinrecsFilterV2/GetClinrec2",
             "seed": options.seed,
-            "requested_current_count": options.current_count,
+            "selection_mode": options.selection_mode,
+            "requested_current_count": options.requested_current_count or options.current_count,
             "valid_current_count": len(valid_current),
             "legacy_target": options.legacy_target,
             "legacy_minimum": options.legacy_minimum,
@@ -1280,6 +1682,35 @@ def append_jsonl(path: Path, row: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8", newline="\n") as file:
         file.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def append_current_attempt(
+    output: Path,
+    row: dict[str, Any],
+    *,
+    started_at: str,
+    finished_at: str,
+) -> None:
+    path = output / "attempts" / "current-attempts.jsonl"
+    code_version = string_value(row.get("code_version"))
+    previous_attempts = [
+        item for item in read_jsonl(path) if item.get("code_version") == code_version
+    ]
+    append_jsonl(
+        path,
+        {
+            "code_version": code_version,
+            "attempt_number": len(previous_attempts) + 1,
+            "result": string_value(row.get("result")),
+            "http_status": row.get("http_status"),
+            "api_error_kind": row.get("api_error_kind"),
+            "error_type": row.get("error_type"),
+            "response_size": row.get("response_size"),
+            "error": row.get("error"),
+            "started_at": started_at,
+            "finished_at": finished_at,
+        },
+    )
 
 
 def write_error(output: Path, kind: str, row: dict[str, Any]) -> None:
