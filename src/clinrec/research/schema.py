@@ -18,6 +18,8 @@ class OfflineProfileSummary:
     raw_files: int
     raw_hash_set_before: set[str]
     raw_hash_set_after: set[str]
+    raw_hashes_by_path_before: dict[str, str]
+    raw_hashes_by_path_after: dict[str, str]
     raw_hashes_unchanged: bool
     catalog: CatalogProfile
     documents: int
@@ -32,7 +34,7 @@ def profile_corpus_offline(
     rebuild_reports: bool = True,
 ) -> OfflineProfileSummary:
     _ = rebuild_reports
-    before = raw_hash_set(corpus_root)
+    before_by_path = raw_hashes_by_path(corpus_root)
     catalog = write_catalog_indexes(corpus_root)
     artifacts = profile_sections(corpus_root)
     pair_rows = write_pair_reports(corpus_root)
@@ -44,13 +46,15 @@ def profile_corpus_offline(
         artifacts,
         pair_count=len(pair_rows),
     )
-    after = raw_hash_set(corpus_root)
+    after_by_path = raw_hashes_by_path(corpus_root)
     return OfflineProfileSummary(
         input=corpus_root,
         raw_files=count_raw_files(corpus_root),
-        raw_hash_set_before=before,
-        raw_hash_set_after=after,
-        raw_hashes_unchanged=before == after,
+        raw_hash_set_before=set(before_by_path.values()),
+        raw_hash_set_after=set(after_by_path.values()),
+        raw_hashes_by_path_before=before_by_path,
+        raw_hashes_by_path_after=after_by_path,
+        raw_hashes_unchanged=before_by_path == after_by_path,
         catalog=catalog,
         documents=len(artifacts.documents),
         sections=len(artifacts.sections),
@@ -62,6 +66,14 @@ def profile_corpus_offline(
 def raw_hash_set(corpus_root: Path) -> set[str]:
     return {
         sha256_file(path)
+        for path in sorted(corpus_root.rglob("getclinrec.json"))
+        if path.is_file()
+    }
+
+
+def raw_hashes_by_path(corpus_root: Path) -> dict[str, str]:
+    return {
+        path.relative_to(corpus_root).as_posix(): sha256_file(path)
         for path in sorted(corpus_root.rglob("getclinrec.json"))
         if path.is_file()
     }
@@ -170,7 +182,7 @@ def write_research_findings(
         f"- Fact: Previous documents profiled: {len(previous_docs)}.",
         (
             "- Fact: Raw JSON files are preserved by offline profiling: "
-            f"{len(raw_hash_set(corpus_root))}."
+            f"{count_raw_files(corpus_root)}."
         ),
         "",
         "## Catalog composition",

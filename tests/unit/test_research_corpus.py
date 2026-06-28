@@ -262,6 +262,55 @@ def test_research_profile_only_performs_no_http(tmp_path: Path) -> None:
     assert read_jsonl(output / "reports" / "documents.jsonl")
 
 
+def test_research_counts_failed_previous_attempts_without_previous_dir(
+    tmp_path: Path,
+) -> None:
+    settings = make_settings(tmp_path)
+    output = settings.paths.data_root / "research" / "corpora" / "failed-previous"
+    write_research_catalog(output, sample_rows())
+
+    class Client:
+        def fetch_clinrec_payload(
+            self,
+            code_version: str,
+        ) -> JsonPayloadResult | ExternalApiError:
+            if code_version == "100_1":
+                return ExternalApiError(
+                    endpoint="GetClinrec2",
+                    kind=ApiErrorKind.HTTP_STATUS,
+                    message="Service unavailable",
+                    status_code=503,
+                    code_version=code_version,
+                )
+            return json_result(code_version)
+
+    summary = build_research_corpus(
+        settings,
+        Client(),  # type: ignore[arg-type]
+        ResearchCorpusOptions(
+            output=output,
+            current_count=1,
+            legacy_target=1,
+            legacy_minimum=1,
+            legacy_attempt_limit=1,
+            seed=1,
+            include=("100_2",),
+        ),
+    )
+
+    attempts = read_jsonl(output / "attempts" / "previous-attempts.jsonl")
+    report = read_json_file(output / "reports" / "corpus-summary.json")
+
+    assert summary.status == "partial"
+    assert summary.legacy_attempts == 1
+    assert attempts[0]["previous_code_version"] == "100_1"
+    assert attempts[0]["result"] == "5xx"
+    assert report["previous_attempts"] == 1
+    assert report["status"] == "partial"
+    assert not (output / "previous").exists()
+    assert not (output / "attempts" / "legacy-attempts.jsonl").exists()
+
+
 def test_catalog_indexes_preserve_duplicate_code_versions_and_malformed_rows(
     tmp_path: Path,
 ) -> None:
@@ -403,6 +452,9 @@ def test_offline_profile_reports_current_previous_pair_and_keeps_raw_hashes(
     table_summary = read_json_file(output / "reports" / "table-summary.json")
     corpus = read_json_file(output / "corpus.json")
     assert summary.raw_hashes_unchanged
+    assert summary.raw_files == 3
+    assert len(summary.raw_hashes_by_path_before) == 3
+    assert len(summary.raw_hash_set_before) == 2
     assert pair["membership_relation"] == "both_active"
     assert set(pair["changed_section_ids"]) == {"doc_whole", "section_intro"}
     assert image_summary["base64_images"] == 1

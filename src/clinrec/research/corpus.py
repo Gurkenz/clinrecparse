@@ -2,13 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections import Counter
 from dataclasses import dataclass
-from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
-
-from bs4 import BeautifulSoup
 
 from clinrec.api.catalog_sync import sync_catalog, to_int, write_json
 from clinrec.api.client import ClinrecApiClient
@@ -18,7 +14,6 @@ from clinrec.bank.common import (
     bank_root,
     catalog_record_for_bank,
     db_id_state,
-    list_value,
     manifest_for_raw_json,
     minimal_validate_raw_document,
     parse_code_version_or_raise,
@@ -687,7 +682,10 @@ def existing_legacy_attempts(output: Path) -> list[dict[str, Any]]:
     layout = research_layout(output)
     if layout.previous_attempts_path.exists():
         return read_jsonl(layout.previous_attempts_path)
-    return read_jsonl(output / "attempts" / "legacy-attempts.jsonl")
+    legacy_attempts = output / "attempts" / "legacy-attempts.jsonl"
+    if legacy_attempts.exists():
+        return read_jsonl(legacy_attempts)
+    return []
 
 
 def latest_attempt(
@@ -716,208 +714,6 @@ def should_retry_previous_attempt(row: dict[str, Any], options: ResearchCorpusOp
 def profile_corpus(output: Path, all_records: list[dict[str, Any]]) -> None:
     _ = all_records
     profile_corpus_offline(output)
-
-
-def profile_document(
-    kind: str,
-    code_version: str,
-    raw_path: Path,
-    payload: dict[str, Any],
-    manifest: dict[str, Any],
-    catalog: dict[str, Any],
-) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    obj_value = payload.get("obj")
-    obj: dict[str, Any] = obj_value if isinstance(obj_value, dict) else {}
-    sections_value = obj.get("sections")
-    section_values: list[Any] = sections_value if isinstance(sections_value, list) else []
-    age_category = (
-        payload.get("age_category")
-        or obj.get("age_category")
-        or catalog.get("age_category")
-    )
-    document_row = {
-        "document_kind": kind,
-        "code_version": code_version,
-        "db_id": manifest.get("document_db_id"),
-        "catalog_source_record_id": manifest.get("catalog_source_record_id"),
-        "db_id_state": manifest.get("db_id_state"),
-        "code": manifest.get("code"),
-        "version": manifest.get("version"),
-        "raw_status": manifest.get("document_status_raw"),
-        "name": string_value(payload.get("name") or obj.get("name") or catalog.get("name")),
-        "adult": payload.get("adult") if "adult" in payload else obj.get("adult"),
-        "child": payload.get("child") if "child" in payload else obj.get("child"),
-        "age_category": age_category,
-        "publish_date": catalog.get("publish_date"),
-        "file_size_bytes": raw_path.stat().st_size,
-        "sha256": sha256_file(raw_path),
-        "top_level_keys": sorted(payload),
-        "obj_keys": sorted(obj.keys()),
-        "sections_count": len(section_values),
-        "mkb_count": len(payload.get("mkbs") or obj.get("mkbs") or catalog.get("mkbs") or []),
-        "professional_association_count": len(payload.get("proff_associations") or []),
-        "catalog_developer_count": len(catalog.get("developers") or []),
-    }
-    section_rows = [
-        profile_section(code_version, index, section)
-        for index, section in enumerate(section_values)
-        if isinstance(section, dict)
-    ]
-    return document_row, section_rows
-
-
-def profile_section(
-    code_version: str,
-    index: int,
-    section: dict[str, Any],
-) -> dict[str, Any]:
-    content = section.get("content") or section.get("Content") or section.get("text")
-    data = section.get("data") or section.get("Data")
-    html = content if isinstance(content, str) else ""
-    soup = BeautifulSoup(html, "html.parser") if html else None
-    return {
-        "document_code_version": code_version,
-        "section_index": index,
-        "section_id": section.get("id") or section.get("Id"),
-        "section_name": section.get("name") or section.get("Name") or section.get("title"),
-        "section_keys": sorted(section),
-        "content_present": content is not None,
-        "content_type": type(content).__name__ if content is not None else None,
-        "content_length_chars": len(html),
-        "data_present": data is not None,
-        "data_type": type(data).__name__ if data is not None else None,
-        "data_item_count": len(data) if isinstance(data, list) else None,
-        "html_table_count": len(soup.find_all("table")) if soup else 0,
-        "html_img_count": len(soup.find_all("img")) if soup else 0,
-        "base64_image_count": html.count("data:image/"),
-        "estimated_base64_bytes": estimated_base64_bytes(html),
-        "link_count": len(soup.find_all("a")) if soup else 0,
-        "ul_count": len(soup.find_all("ul")) if soup else 0,
-        "ol_count": len(soup.find_all("ol")) if soup else 0,
-        "li_count": len(soup.find_all("li")) if soup else 0,
-    }
-
-
-def estimated_base64_bytes(html: str) -> int:
-    total = 0
-    marker = "base64,"
-    for item in html.split(marker)[1:]:
-        token = item.split('"', 1)[0].split("'", 1)[0]
-        total += int(len(token) * 0.75)
-    return total
-
-
-def schema_profile(
-    documents: list[dict[str, Any]],
-    sections: list[dict[str, Any]],
-) -> dict[str, Any]:
-    return {
-        "document_count": len(documents),
-        "section_count": len(sections),
-        "top_level_keys": count_values(documents, "top_level_keys"),
-        "obj_keys": count_values(documents, "obj_keys"),
-        "section_keys": count_values(sections, "section_keys"),
-        "status_values": Counter(str(row.get("raw_status")) for row in documents),
-        "db_id_states": Counter(str(row.get("db_id_state")) for row in documents),
-        "documents_containing_tables": sum(
-            1
-            for row in documents
-            if section_count_for(sections, row["code_version"], "html_table_count")
-        ),
-        "documents_containing_base64_images": sum(
-            1
-            for row in documents
-            if section_count_for(sections, row["code_version"], "base64_image_count")
-        ),
-        "largest_documents": sorted(
-            documents,
-            key=lambda row: int(row.get("file_size_bytes") or 0),
-            reverse=True,
-        )[:10],
-        "largest_sections": sorted(
-            sections,
-            key=lambda row: int(row.get("content_length_chars") or 0),
-            reverse=True,
-        )[:10],
-    }
-
-
-def count_values(rows: list[dict[str, Any]], key: str) -> dict[str, int]:
-    counter: Counter[str] = Counter()
-    for row in rows:
-        value = row.get(key)
-        if isinstance(value, list):
-            counter.update(str(item) for item in value)
-    return dict(sorted(counter.items()))
-
-
-def section_count_for(sections: list[dict[str, Any]], code_version: str, key: str) -> int:
-    return sum(
-        int(row.get(key) or 0)
-        for row in sections
-        if row["document_code_version"] == code_version
-    )
-
-
-def pair_rows(output: Path) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
-    for current_code_version, previous_code_version in sorted(valid_legacy_pairs(output)):
-        current = load_research_payload(
-            output / "current" / current_code_version / "getclinrec.json"
-        )
-        previous = load_research_payload(
-            output / "legacy" / current_code_version / previous_code_version / "getclinrec.json"
-        )
-        current_obj_value = current.get("obj")
-        previous_obj_value = previous.get("obj")
-        current_obj: dict[str, Any] = (
-            current_obj_value if isinstance(current_obj_value, dict) else {}
-        )
-        previous_obj: dict[str, Any] = (
-            previous_obj_value if isinstance(previous_obj_value, dict) else {}
-        )
-        current_sections = list_value(current_obj.get("sections"))
-        previous_sections = list_value(previous_obj.get("sections"))
-        rows.append(
-            {
-                "current_code_version": current_code_version,
-                "previous_code_version": previous_code_version,
-                "current_db_id": current.get("db_id"),
-                "previous_db_id": previous.get("db_id"),
-                "current_raw_status": current.get("status"),
-                "previous_raw_status": previous.get("status"),
-                "title_similarity": title_similarity(current, previous),
-                "current_section_count": len(current_sections),
-                "previous_section_count": len(previous_sections),
-                "section_count_delta": len(current_sections) - len(previous_sections),
-                "file_size_delta": (
-                    output / "current" / current_code_version / "getclinrec.json"
-                ).stat().st_size
-                - (
-                    output
-                    / "legacy"
-                    / current_code_version
-                    / previous_code_version
-                    / "getclinrec.json"
-                ).stat().st_size,
-                "top_level_key_additions": sorted(set(current) - set(previous)),
-                "top_level_key_removals": sorted(set(previous) - set(current)),
-                "obj_key_additions": sorted(set(current_obj) - set(previous_obj)),
-                "obj_key_removals": sorted(set(previous_obj) - set(current_obj)),
-            }
-        )
-    return rows
-
-
-def load_research_payload(path: Path) -> dict[str, Any]:
-    value = json.loads(path.read_text(encoding="utf-8"))
-    return value if isinstance(value, dict) else {}
-
-
-def title_similarity(left: dict[str, Any], right: dict[str, Any]) -> float:
-    left_title = string_value(left.get("name") or left.get("title"))
-    right_title = string_value(right.get("name") or right.get("title"))
-    return round(SequenceMatcher(a=left_title, b=right_title).ratio() * 100, 1)
 
 
 def write_reports(
@@ -1058,7 +854,7 @@ def write_findings(output: Path, summary: dict[str, Any]) -> None:
         f"- Raw status values: {profile.get('status_values', {})}",
         "",
         "## Current/previous pair findings",
-        f"- Pairs profiled: {len(read_jsonl(reports_root(output) / 'current-legacy-pairs.jsonl'))}",
+        f"- Pairs profiled: {current_previous_pair_count(output)}",
         "",
         "## HTML and embedded asset findings",
         f"- Documents with tables: {profile.get('documents_containing_tables', 0)}",
@@ -1087,6 +883,13 @@ def write_findings(output: Path, summary: dict[str, Any]) -> None:
         "",
     ]
     (reports_root(output) / "research-findings.md").write_text("\n".join(lines), encoding="utf-8")
+
+
+def current_previous_pair_count(output: Path) -> int:
+    preferred = reports_root(output) / "current-previous-pairs.jsonl"
+    if preferred.exists():
+        return len(read_jsonl(preferred))
+    return len(read_jsonl(reports_root(output) / "current-legacy-pairs.jsonl"))
 
 
 def reports_root(output: Path) -> Path:

@@ -28,19 +28,30 @@ class MigrationSummary:
 def research_layout(root: Path) -> ResearchLayout:
     previous = root / "previous"
     legacy = root / "legacy"
+    previous_attempts = attempts_path(root, preferred=True)
+    legacy_attempts = attempts_path(root, preferred=False)
     if previous.exists():
         return ResearchLayout(
             root=root,
             current_root=root / "current",
             previous_root=previous,
-            previous_attempts_path=attempts_path(root, preferred=True),
+            previous_attempts_path=previous_attempts,
             used_legacy_compat=False,
         )
+    if not legacy.exists():
+        return ResearchLayout(
+            root=root,
+            current_root=root / "current",
+            previous_root=previous,
+            previous_attempts_path=previous_attempts,
+            used_legacy_compat=False,
+        )
+    attempts = previous_attempts if previous_attempts.exists() else legacy_attempts
     return ResearchLayout(
         root=root,
         current_root=root / "current",
         previous_root=legacy,
-        previous_attempts_path=attempts_path(root, preferred=False),
+        previous_attempts_path=attempts,
         used_legacy_compat=legacy.exists(),
     )
 
