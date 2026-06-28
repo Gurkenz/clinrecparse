@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import os
 import socket
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +26,7 @@ from clinrec.bank.common import (
     copy_directory,
     move_directory,
     read_json_file,
+    string_value,
     utc_now,
 )
 from clinrec.config import Settings
@@ -57,24 +59,26 @@ def acquire_writer_lock(
     transaction_id: str,
     *,
     recover_stale: bool = False,
-) -> None:
+) -> str:
     path = writer_lock_path(settings)
     path.parent.mkdir(parents=True, exist_ok=True)
     if recover_stale and path.exists():
-        path.unlink()
+        raise BankError("Writer lock stale recovery requires explicit audited force recovery.")
+    owner_token = uuid.uuid4().hex
+    created_at = utc_now()
     payload = {
+        "owner_token": owner_token,
         "transaction_id": transaction_id,
         "pid": os.getpid(),
         "hostname": socket.gethostname(),
-        "started_at": utc_now(),
+        "process_started_at": created_at,
+        "lock_created_at": created_at,
     }
     flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
     try:
         fd = os.open(path, flags)
     except FileExistsError as exc:
         existing = read_json_file(path)
-        if existing.get("transaction_id") == transaction_id:
-            return
         raise BankError(f"Another writer transaction is active: {existing}") from exc
     with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as file:
         import json
@@ -83,14 +87,15 @@ def acquire_writer_lock(
         file.write("\n")
         file.flush()
         os.fsync(file.fileno())
+    return owner_token
 
 
-def release_writer_lock(settings: Settings, transaction_id: str) -> None:
+def release_writer_lock(settings: Settings, transaction_id: str, owner_token: str) -> None:
     path = writer_lock_path(settings)
     if not path.exists():
         return
     payload = read_json_file(path)
-    if payload.get("transaction_id") != transaction_id:
+    if payload.get("transaction_id") != transaction_id or payload.get("owner_token") != owner_token:
         raise BankError("Writer lock belongs to another transaction.")
     path.unlink()
 
@@ -413,9 +418,20 @@ def ensure_area_backup(
 def ensure_state_backup(settings: Settings, transaction_id: str) -> dict[str, Any] | None:
     journal = read_journal(settings, transaction_id)
     state_backups: dict[str, Any] = journal.setdefault("backups", {}).setdefault("state", {})
+    key = "backup_state:accepted_pointer"
+    existing = operation_by_idempotency_key(settings, transaction_id, key)
     if "accepted_pointer" in state_backups:
         value = state_backups["accepted_pointer"]
-        return value if isinstance(value, dict) else None
+        pointer = value if isinstance(value, dict) else None
+        expected_hash = state_backups.get("accepted_pointer_sha256")
+        actual_hash = stable_payload_sha256(pointer)
+        if expected_hash and expected_hash != actual_hash:
+            raise BankError("State backup payload hash mismatch.")
+        if existing and existing.get("state") == "completed":
+            return pointer
+        if existing:
+            complete_operation(settings, transaction_id, string_operation_id(existing))
+            return pointer
     operation_id = begin_operation(
         settings,
         transaction_id,
@@ -423,12 +439,13 @@ def ensure_state_backup(settings: Settings, transaction_id: str) -> dict[str, An
         code_version="__accepted__",
         source=accepted_current_pointer_path(settings),
         target=None,
-        idempotency_key="backup_state:accepted_pointer",
+        idempotency_key=key,
     )
     pointer = read_accepted_pointer(settings)
     journal = read_journal(settings, transaction_id)
     state_backups = journal.setdefault("backups", {}).setdefault("state", {})
     state_backups["accepted_pointer"] = pointer
+    state_backups["accepted_pointer_sha256"] = stable_payload_sha256(pointer)
     write_journal(settings, transaction_id, journal)
     complete_operation(settings, transaction_id, operation_id)
     return pointer
@@ -674,13 +691,6 @@ def move_active_to_quarantine(
         code_version=code_version,
         source=source,
     )
-    ensure_area_backup(
-        settings,
-        transaction_id,
-        area="quarantine",
-        code_version=code_version,
-        source=target,
-    )
     operation_id = begin_operation(
         settings,
         transaction_id,
@@ -702,13 +712,14 @@ def move_active_to_quarantine(
         from clinrec.api.catalog_sync import write_json
 
         write_json(
-            target / "quarantine-event.json",
+            target.parent / f"{target.name}-quarantine-event.json",
             {
                 "code_version": code_version,
                 "event_type": "move_to_quarantine",
                 "transaction_id": transaction_id,
                 "reason": reason,
                 "source_path": source.as_posix(),
+                "target_path": target.as_posix(),
                 "moved_at": utc_now(),
             },
         )
@@ -716,9 +727,20 @@ def move_active_to_quarantine(
     return moved
 
 
-def rollback_transaction(settings: Settings, transaction_id: str) -> dict[str, Any]:
+def rollback_transaction(
+    settings: Settings,
+    transaction_id: str,
+    *,
+    owner_token: str | None = None,
+) -> dict[str, Any]:
+    acquired_owner_token: str | None = None
+    if owner_token is None:
+        acquired_owner_token = acquire_writer_lock(settings, transaction_id)
+        owner_token = acquired_owner_token
     journal = read_journal(settings, transaction_id)
     if journal.get("state") == "rolled_back":
+        if acquired_owner_token is not None:
+            release_writer_lock(settings, transaction_id, acquired_owner_token)
         return journal
     set_journal_state(settings, transaction_id, "rollback_started")
     try:
@@ -727,7 +749,6 @@ def rollback_transaction(settings: Settings, transaction_id: str) -> dict[str, A
         for area, root in (
             ("active", bank_active_root(settings)),
             ("legacy", bank_legacy_root(settings)),
-            ("quarantine", bank_quarantine_root(settings)),
         ):
             area_value = backups.get(area)
             area_backups: dict[str, Any] = area_value if isinstance(area_value, dict) else {}
@@ -759,6 +780,7 @@ def rollback_transaction(settings: Settings, transaction_id: str) -> dict[str, A
                         code_version=code_version,
                         target=target,
                     )
+        rollback_quarantine_targets(settings, transaction_id, journal)
         state_backup = backups.get("state") if isinstance(backups.get("state"), dict) else {}
         pointer = state_backup.get("accepted_pointer") if isinstance(state_backup, dict) else None
         rollback_restore_state(
@@ -777,10 +799,11 @@ def rollback_transaction(settings: Settings, transaction_id: str) -> dict[str, A
         write_journal(settings, transaction_id, journal)
         raise
     finally:
-        try:
-            release_writer_lock(settings, transaction_id)
-        except BankError:
-            pass
+        if acquired_owner_token is not None:
+            try:
+                release_writer_lock(settings, transaction_id, acquired_owner_token)
+            except BankError:
+                pass
     return read_journal(settings, transaction_id)
 
 
@@ -993,6 +1016,58 @@ def rollback_record_remove_created(
     complete_rollback_operation(settings, transaction_id, operation_id)
 
 
+def rollback_quarantine_targets(
+    settings: Settings,
+    transaction_id: str,
+    journal: dict[str, Any],
+) -> None:
+    for operation in journal.get("operations") or []:
+        if not isinstance(operation, dict):
+            continue
+        if operation.get("type") != "move_active_to_quarantine":
+            continue
+        target_value = operation.get("target")
+        code_version = string_value(operation.get("code_version"))
+        if not target_value:
+            continue
+        target = Path(str(target_value))
+        if not target.exists():
+            continue
+        key = f"rollback_archive_quarantine_target:{target.as_posix()}"
+        existing = rollback_operation_by_key(settings, transaction_id, key)
+        if existing and existing.get("state") == "completed":
+            continue
+        archive = (
+            transaction_root(settings, transaction_id)
+            / "rollback-displaced"
+            / "quarantine"
+            / target.parent.name
+            / target.name
+        )
+        operation_id = begin_rollback_operation(
+            settings,
+            transaction_id,
+            operation_type="rollback_archive_quarantine_target",
+            area="quarantine",
+            code_version=code_version,
+            source=target,
+            target=archive,
+            idempotency_key=key,
+        )
+        try:
+            moved = move_directory(target, archive)
+            sidecar = target.parent / f"{target.name}-quarantine-event.json"
+            if sidecar.exists():
+                archive.parent.mkdir(parents=True, exist_ok=True)
+                sidecar.replace(archive.parent / sidecar.name)
+            if moved and not archive.exists():
+                raise BankError("rollback_quarantine_archive_missing")
+        except Exception as exc:
+            fail_rollback_operation(settings, transaction_id, operation_id, str(exc))
+            raise
+        complete_rollback_operation(settings, transaction_id, operation_id)
+
+
 def rollback_restore_state(
     settings: Settings,
     transaction_id: str,
@@ -1029,44 +1104,56 @@ def run_rollback_qa(settings: Settings) -> None:
         raise BankError("Accepted QA failed after rollback.")
 
 
-def reconcile_started_operations(settings: Settings, transaction_id: str) -> None:
+def reconcile_started_operations(
+    settings: Settings,
+    transaction_id: str,
+    *,
+    owner_token: str | None = None,
+) -> None:
+    acquired_owner_token: str | None = None
+    if owner_token is None:
+        acquired_owner_token = acquire_writer_lock(settings, transaction_id)
     journal = read_journal(settings, transaction_id)
-    changed = False
-    for operation in journal.get("operations") or []:
-        if operation.get("state") != "started":
-            continue
-        source = Path(str(operation.get("source"))) if operation.get("source") else None
-        target = Path(str(operation.get("target"))) if operation.get("target") else None
-        expected_source_sha = operation.get("expected_source_sha256")
-        expected_target_sha = operation.get("expected_target_sha256")
-        if source and target and not source.exists() and target.exists():
-            actual_target_sha = path_sha256(target)
-            expected_sha = expected_source_sha or expected_target_sha
-            if expected_sha in {None, actual_target_sha}:
-                operation["state"] = "completed"
-                operation["completed_at"] = operation.get("completed_at") or utc_now()
+    try:
+        changed = False
+        for operation in journal.get("operations") or []:
+            if operation.get("state") != "started":
+                continue
+            source = Path(str(operation.get("source"))) if operation.get("source") else None
+            target = Path(str(operation.get("target"))) if operation.get("target") else None
+            expected_source_sha = operation.get("expected_source_sha256")
+            expected_target_sha = operation.get("expected_target_sha256")
+            if source and target and not source.exists() and target.exists():
+                actual_target_sha = path_sha256(target)
+                expected_sha = expected_source_sha or expected_target_sha
+                if expected_sha in {None, actual_target_sha}:
+                    operation["state"] = "completed"
+                    operation["completed_at"] = operation.get("completed_at") or utc_now()
+                    changed = True
+                else:
+                    operation["state"] = "failed"
+                    operation["error"] = "target_hash_mismatch"
+                    journal.setdefault("errors", []).append(operation)
+                    changed = True
+            elif source and source.exists() and target and not target.exists():
+                operation["state"] = "planned"
+                operation["started_at"] = None
                 changed = True
-            else:
+            elif source and source.exists() and target and target.exists():
                 operation["state"] = "failed"
-                operation["error"] = "target_hash_mismatch"
+                operation["error"] = "source_and_target_both_exist"
                 journal.setdefault("errors", []).append(operation)
                 changed = True
-        elif source and source.exists() and target and not target.exists():
-            operation["state"] = "planned"
-            operation["started_at"] = None
-            changed = True
-        elif source and source.exists() and target and target.exists():
-            operation["state"] = "failed"
-            operation["error"] = "source_and_target_both_exist"
-            journal.setdefault("errors", []).append(operation)
-            changed = True
-        elif source and not source.exists() and target and not target.exists():
-            operation["state"] = "failed"
-            operation["error"] = "source_and_target_missing"
-            journal.setdefault("errors", []).append(operation)
-            changed = True
-    if changed:
-        write_journal(settings, transaction_id, journal)
+            elif source and not source.exists() and target and not target.exists():
+                operation["state"] = "failed"
+                operation["error"] = "source_and_target_missing"
+                journal.setdefault("errors", []).append(operation)
+                changed = True
+        if changed:
+            write_journal(settings, transaction_id, journal)
+    finally:
+        if acquired_owner_token is not None:
+            release_writer_lock(settings, transaction_id, acquired_owner_token)
 
 
 def list_transactions(settings: Settings) -> list[dict[str, Any]]:
@@ -1124,6 +1211,16 @@ def file_sha256(path: Path) -> str:
         for chunk in iter(lambda: file.read(1024 * 1024), b""):
             hasher.update(chunk)
     return hasher.hexdigest()
+
+
+def stable_payload_sha256(payload: Any) -> str:
+    import json
+
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
+    ).hexdigest()
 
 
 def string_operation_id(operation: dict[str, Any]) -> str:

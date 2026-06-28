@@ -142,6 +142,8 @@ def verify_decisions(plan_path: Path, plan: dict[str, Any]) -> dict[str, Any] | 
         code_version = string_value(row.get("code_version"))
         if not code_version:
             raise BankError("Review decision code_version is required.")
+        if code_version not in required_by_code_version:
+            raise BankError(f"Unknown review decision CodeVersion: {code_version}")
         if code_version in by_code_version:
             raise BankError(f"Duplicate review decision for CodeVersion: {code_version}")
         by_code_version[code_version] = row

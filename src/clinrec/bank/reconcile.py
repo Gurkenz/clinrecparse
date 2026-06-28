@@ -339,8 +339,6 @@ def stage_update(
     verify_existing: bool = False,
 ) -> BankStageSummary:
     plan = load_verified_plan(plan_path)
-    if plan.get("identity_conflicts"):
-        raise BankError("Plan contains identity conflicts; resolve them with decisions.json.")
     if plan.get("state") not in {"created", "staged", "ready_to_apply"}:
         raise BankError(f"Plan state is not stageable: {plan.get('state')}")
     verify_candidate_hash(plan)
@@ -437,31 +435,34 @@ def apply_update_plan(
 
     transaction_id = string_value(plan["transaction_id"])
     execution_actions = build_execution_actions(settings, transaction_id, plan, decisions)
-    if journal_path(settings, transaction_id).exists():
-        journal = read_journal(settings, transaction_id)
-        if journal.get("state") == "completed":
-            raise BankError("Plan cannot be applied twice.")
-        if journal.get("state") in UNFINISHED_STATES and not resume:
-            raise BankError("Existing transaction requires --resume or rollback.")
-        if resume:
-            reconcile_started_operations(settings, transaction_id)
-    elif resume:
-        raise BankError("Cannot resume without an existing transaction journal.")
-
-    required = required_staging_set(plan, verify_existing=False)
-    invalid = strict_staging_failures(settings, transaction_id, required)
-    if invalid:
-        raise BankError(f"Required staging is incomplete or invalid: {invalid}")
-
     moved_to_legacy = 0
     reactivated = 0
     promoted = 0
-    lock_acquired = False
+    owner_token: str | None = None
     journal_created = False
     mutation_started = False
     try:
-        acquire_writer_lock(settings, transaction_id, recover_stale=recover_stale_lock)
-        lock_acquired = True
+        owner_token = acquire_writer_lock(
+            settings,
+            transaction_id,
+            recover_stale=recover_stale_lock,
+        )
+        if journal_path(settings, transaction_id).exists():
+            journal = read_journal(settings, transaction_id)
+            if journal.get("state") == "completed":
+                raise BankError("Plan cannot be applied twice.")
+            if journal.get("state") in UNFINISHED_STATES and not resume:
+                raise BankError("Existing transaction requires --resume or rollback.")
+            if resume:
+                reconcile_started_operations(settings, transaction_id, owner_token=owner_token)
+        elif resume:
+            raise BankError("Cannot resume without an existing transaction journal.")
+
+        required = required_staging_set(plan, verify_existing=False)
+        invalid = strict_staging_failures(settings, transaction_id, required)
+        if invalid:
+            raise BankError(f"Required staging is incomplete or invalid: {invalid}")
+
         create_journal(
             settings,
             transaction_id=transaction_id,
@@ -601,12 +602,12 @@ def apply_update_plan(
 
         set_journal_state(settings, transaction_id, "completed")
         update_plan_state(plan_path, "applied")
-        release_writer_lock(settings, transaction_id)
-        lock_acquired = False
+        release_writer_lock(settings, transaction_id, owner_token)
+        owner_token = None
     except Exception as exc:
         if rollback_on_error and journal_created and mutation_started:
             try:
-                rollback_transaction(settings, transaction_id)
+                rollback_transaction(settings, transaction_id, owner_token=owner_token)
                 update_plan_state(plan_path, "rolled_back")
             except Exception as rollback_exc:
                 exc.add_note(f"Rollback failed: {rollback_exc}")
@@ -621,8 +622,8 @@ def apply_update_plan(
                 update_plan_state(plan_path, "failed")
             except BankError:
                 pass
-            if lock_acquired:
-                release_writer_lock(settings, transaction_id)
+            if owner_token is not None:
+                release_writer_lock(settings, transaction_id, owner_token)
         raise
 
     return BankApplySummary(
@@ -1161,7 +1162,9 @@ def stage_summary_payload(
         row for row in documents if row["status"] not in {"downloaded", "already_valid"}
     ]
     technical_failed = len(failed_documents) + len(invalid)
-    manual_review_required = len(staged_identity_conflicts)
+    manual_review_required = len(staged_identity_conflicts) + len(
+        plan_actions(plan, "identity_conflicts")
+    )
     failed = technical_failed
     return {
         "transaction_id": plan["transaction_id"],
@@ -1194,7 +1197,7 @@ def stage_summary_payload(
             failed,
             not_attempted,
             invalid,
-            [],
+            plan_actions(plan, "identity_conflicts") + staged_identity_conflicts,
         ),
     }
 

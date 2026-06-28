@@ -24,6 +24,7 @@ from clinrec.bank.common import (
     write_jsonl,
 )
 from clinrec.bank.current import download_current_documents
+from clinrec.bank.decisions import decisions_path_for_plan, verify_decisions
 from clinrec.bank.identities import analyze_identities
 from clinrec.bank.previous import check_previous_documents, relation_status_for_error
 from clinrec.bank.qa import run_bank_qa
@@ -1448,6 +1449,42 @@ def test_decisions_hash_is_bound_to_existing_journal(tmp_path: Path) -> None:
         )
 
 
+def test_decisions_reject_unknown_code_version(tmp_path: Path) -> None:
+    plan_path = tmp_path / "plan.json"
+    plan = {
+        "transaction_id": "tx-decisions",
+        "plan_id": "plan-tx-decisions",
+        "actions": {"orphaned_local": ["100_1"]},
+        "orphaned_local": ["100_1"],
+    }
+    plan_path.write_text("{}", encoding="utf-8")
+    write_json(
+        decisions_path_for_plan(plan_path),
+        {
+            "schema_version": "2.0",
+            "transaction_id": "tx-decisions",
+            "plan_id": "plan-tx-decisions",
+            "decisions": [
+                {
+                    "code_version": "100_1",
+                    "conflicts": ["orphaned_local"],
+                    "final_action": "move_orphan_to_quarantine",
+                    "reason": "fixture",
+                },
+                {
+                    "code_version": "999_1",
+                    "conflicts": ["orphaned_local"],
+                    "final_action": "move_orphan_to_quarantine",
+                    "reason": "wrong transaction",
+                },
+            ],
+        },
+    )
+
+    with pytest.raises(BankError, match="Unknown review decision"):
+        verify_decisions(plan_path, plan)
+
+
 def test_execution_actions_reject_double_mutation(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
     plan = {
@@ -1504,12 +1541,18 @@ def test_direct_force_history_preserves_complete_bundle(tmp_path: Path) -> None:
 def test_writer_lock_rejects_concurrent_transaction(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
 
-    acquire_writer_lock(settings, "tx-one")
+    owner_token = acquire_writer_lock(settings, "tx-one")
     try:
         with pytest.raises(BankError, match="Another writer"):
+            acquire_writer_lock(settings, "tx-one")
+        with pytest.raises(BankError, match="Another writer"):
             acquire_writer_lock(settings, "tx-two")
+        with pytest.raises(BankError, match="stale recovery"):
+            acquire_writer_lock(settings, "tx-two", recover_stale=True)
+        with pytest.raises(BankError, match="Writer lock belongs"):
+            release_writer_lock(settings, "tx-one", "not-owner")
     finally:
-        release_writer_lock(settings, "tx-one")
+        release_writer_lock(settings, "tx-one", owner_token)
 
 
 def test_bootstrap_refuses_existing_bank(tmp_path: Path) -> None:
