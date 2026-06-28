@@ -4,11 +4,18 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from clinrec.bank.common import atomic_write_json, read_json_file, sha256_file, utc_now
+from clinrec.bank.common import (
+    BankError,
+    atomic_write_json,
+    read_json_file,
+    sha256_file,
+    string_value,
+    utc_now,
+)
 from clinrec.research.catalog import CatalogProfile, write_catalog_indexes
 from clinrec.research.migration import research_layout
 from clinrec.research.pairs import write_pair_reports
-from clinrec.research.reports import read_jsonl, reports_root, write_csv
+from clinrec.research.reports import read_jsonl, reports_root, write_csv, write_json
 from clinrec.research.sections import ProfileArtifacts, profile_sections
 
 
@@ -18,8 +25,8 @@ class OfflineProfileSummary:
     raw_files: int
     raw_hash_set_before: set[str]
     raw_hash_set_after: set[str]
-    raw_hashes_by_path_before: dict[str, str]
-    raw_hashes_by_path_after: dict[str, str]
+    raw_hashes_by_path_before: dict[str, dict[str, Any]]
+    raw_hashes_by_path_after: dict[str, dict[str, Any]]
     raw_hashes_unchanged: bool
     catalog: CatalogProfile
     documents: int
@@ -33,25 +40,43 @@ def profile_corpus_offline(
     *,
     rebuild_reports: bool = True,
 ) -> OfflineProfileSummary:
-    _ = rebuild_reports
     before_by_path = raw_hashes_by_path(corpus_root)
-    catalog = write_catalog_indexes(corpus_root)
-    artifacts = profile_sections(corpus_root)
-    pair_rows = write_pair_reports(corpus_root)
-    write_previous_attempts_report(corpus_root)
-    update_corpus_metadata(corpus_root, catalog, artifacts, pair_count=len(pair_rows))
-    findings_path = write_research_findings(
-        corpus_root,
-        catalog,
-        artifacts,
-        pair_count=len(pair_rows),
-    )
+    if rebuild_reports:
+        catalog = write_catalog_indexes(corpus_root)
+        artifacts = profile_sections(corpus_root)
+        pair_rows = write_pair_reports(corpus_root)
+        write_previous_attempts_report(corpus_root)
+        update_corpus_metadata(corpus_root, catalog, artifacts, pair_count=len(pair_rows))
+        findings_path = write_research_findings(
+            corpus_root,
+            catalog,
+            artifacts,
+            pair_count=len(pair_rows),
+        )
+    else:
+        catalog = catalog_profile_from_files(corpus_root)
+        root = reports_root(corpus_root)
+        artifacts = ProfileArtifacts(
+            documents=read_jsonl(root / "documents.jsonl"),
+            sections=read_jsonl(root / "sections.jsonl"),
+            tables=read_jsonl(root / "tables.jsonl"),
+            images=read_jsonl(root / "images.jsonl"),
+            title_fields=read_jsonl(root / "doc-title-fields.jsonl"),
+            title_anomalies=read_jsonl(root / "doc-title-anomalies.jsonl"),
+            doc_whole_rows=read_jsonl(root / "doc-whole-analysis.jsonl"),
+        )
+        pair_rows = read_jsonl(root / "current-previous-pairs.jsonl")
+        findings_path = root / "research-findings.md"
     after_by_path = raw_hashes_by_path(corpus_root)
+    if before_by_path != after_by_path:
+        diff = raw_map_diff(before_by_path, after_by_path)
+        write_json(reports_root(corpus_root) / "raw-integrity-diff.json", diff)
+        raise BankError("Raw getclinrec.json files changed during offline profiling.")
     return OfflineProfileSummary(
         input=corpus_root,
-        raw_files=count_raw_files(corpus_root),
-        raw_hash_set_before=set(before_by_path.values()),
-        raw_hash_set_after=set(after_by_path.values()),
+        raw_files=len(after_by_path),
+        raw_hash_set_before={row["sha256"] for row in before_by_path.values()},
+        raw_hash_set_after={row["sha256"] for row in after_by_path.values()},
         raw_hashes_by_path_before=before_by_path,
         raw_hashes_by_path_after=after_by_path,
         raw_hashes_unchanged=before_by_path == after_by_path,
@@ -71,16 +96,76 @@ def raw_hash_set(corpus_root: Path) -> set[str]:
     }
 
 
-def raw_hashes_by_path(corpus_root: Path) -> dict[str, str]:
+def raw_hashes_by_path(corpus_root: Path) -> dict[str, dict[str, Any]]:
     return {
-        path.relative_to(corpus_root).as_posix(): sha256_file(path)
+        path.relative_to(corpus_root).as_posix(): {
+            "sha256": sha256_file(path),
+            "size": path.stat().st_size,
+        }
         for path in sorted(corpus_root.rglob("getclinrec.json"))
-        if path.is_file()
+        if path.is_file() and not path.is_symlink()
     }
 
 
 def count_raw_files(corpus_root: Path) -> int:
     return sum(1 for path in corpus_root.rglob("getclinrec.json") if path.is_file())
+
+
+def raw_map_diff(
+    before: dict[str, dict[str, Any]],
+    after: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    before_paths = set(before)
+    after_paths = set(after)
+    changed = []
+    for path in sorted(before_paths & after_paths):
+        if before[path] != after[path]:
+            changed.append(
+                {
+                    "path": path,
+                    "before_sha256": before[path].get("sha256"),
+                    "after_sha256": after[path].get("sha256"),
+                    "before_size": before[path].get("size"),
+                    "after_size": after[path].get("size"),
+                }
+            )
+    return {
+        "added_paths": sorted(after_paths - before_paths),
+        "removed_paths": sorted(before_paths - after_paths),
+        "changed_paths": changed,
+    }
+
+
+def catalog_profile_from_files(corpus_root: Path) -> CatalogProfile:
+    from clinrec.research.catalog import read_active_catalog, read_all_statuses_catalog
+
+    active = read_active_catalog(corpus_root)
+    all_rows = read_all_statuses_catalog(corpus_root)
+    code_versions = [
+        string_value(row.get("code_version"))
+        for row in all_rows
+        if string_value(row.get("code_version"))
+    ]
+    source_ids = [
+        string_value(row.get("source_record_id"))
+        for row in all_rows
+        if string_value(row.get("source_record_id"))
+    ]
+    return CatalogProfile(
+        active_records=len(active),
+        all_statuses_records=len(all_rows),
+        unique_source_record_ids=len(set(source_ids)),
+        duplicate_source_record_ids=sum(
+            1 for source_id in set(source_ids) if source_ids.count(source_id) > 1
+        ),
+        unique_code_versions=len(set(code_versions)),
+        duplicate_code_versions=sum(
+            1 for code_version in set(code_versions) if code_versions.count(code_version) > 1
+        ),
+        malformed_code_versions=sum(
+            1 for row in all_rows if not string_value(row.get("code_version"))
+        ),
+    )
 
 
 def update_corpus_metadata(
@@ -226,8 +311,11 @@ def write_research_findings(
         f"- Fact: Images found: {image_summary.get('images_total')}.",
         f"- Fact: Base64 images found: {image_summary.get('base64_images')}.",
         "",
-        "## Observed stable fields",
-        "- Inference: 31-section structure is stable only within this local 60-document corpus.",
+        "## Observed section structure",
+        (
+            "- Inference: section structure should be treated as corpus-specific evidence "
+            f"for {len(current_docs)} current and {len(previous_docs)} previous documents."
+        ),
         "",
         "## Observed unstable fields",
         (

@@ -9,11 +9,12 @@ from typing import Any
 
 from clinrec.bank.common import (
     parse_code_version_or_raise,
+    read_json_file,
     sha256_file,
     stable_json_dumps,
     string_value,
 )
-from clinrec.research.catalog import active_code_versions, all_status_records_by_code_version
+from clinrec.research.catalog import active_code_versions
 from clinrec.research.html_profile import image_rows_for_html, table_rows_for_html
 from clinrec.research.migration import research_layout
 from clinrec.research.reports import reports_root, write_csv, write_json, write_jsonl
@@ -25,7 +26,6 @@ def write_pair_reports(corpus_root: Path) -> list[dict[str, Any]]:
     section_rows: list[dict[str, Any]] = []
     anomaly_rows: list[dict[str, Any]] = []
     active = active_code_versions(corpus_root)
-    catalog_by_cv = all_status_records_by_code_version(corpus_root)
     layout = research_layout(corpus_root)
     if layout.previous_root.exists():
         for current_dir in sorted(layout.previous_root.iterdir()):
@@ -49,7 +49,6 @@ def write_pair_reports(corpus_root: Path) -> list[dict[str, Any]]:
                     current_raw,
                     previous_raw,
                     active=active,
-                    catalog_by_cv=catalog_by_cv,
                 )
                 rows.append(row)
                 section_rows.extend(sections)
@@ -73,6 +72,7 @@ def write_pair_reports(corpus_root: Path) -> list[dict[str, Any]]:
             "current_code_version",
             "previous_code_version",
             "section_id",
+            "section_occurrence_key",
             "content_changed",
             "data_changed",
         ),
@@ -119,7 +119,6 @@ def pair_row(
     previous_raw: Path,
     *,
     active: set[str],
-    catalog_by_cv: dict[str, list[dict[str, Any]]],
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     current = load_payload(current_raw)
     previous = load_payload(previous_raw)
@@ -127,14 +126,15 @@ def pair_row(
     previous_code_version = previous_raw.parent.name
     current_code, current_version = parse_code_version_or_raise(current_code_version)
     previous_code, previous_version = parse_code_version_or_raise(previous_code_version)
-    current_sections = sections_by_id(current)
-    previous_sections = sections_by_id(previous)
+    current_sections = sections_by_occurrence(current)
+    previous_sections = sections_by_occurrence(previous)
     section_rows: list[dict[str, Any]] = []
-    changed_section_ids: list[str] = []
-    unchanged_section_ids: list[str] = []
-    for section_id in sorted(set(current_sections) | set(previous_sections)):
-        current_section = current_sections.get(section_id)
-        previous_section = previous_sections.get(section_id)
+    changed_section_occurrences: list[str] = []
+    unchanged_section_occurrences: list[str] = []
+    for occurrence_key in sorted(set(current_sections) | set(previous_sections)):
+        current_section = current_sections.get(occurrence_key)
+        previous_section = previous_sections.get(occurrence_key)
+        section_id = occurrence_key.rsplit("#", maxsplit=1)[0]
         content_changed = section_hash(current_section, "content") != section_hash(
             previous_section,
             "content",
@@ -144,22 +144,25 @@ def pair_row(
             "data",
         )
         if content_changed or data_changed:
-            changed_section_ids.append(section_id)
+            changed_section_occurrences.append(occurrence_key)
         else:
-            unchanged_section_ids.append(section_id)
+            unchanged_section_occurrences.append(occurrence_key)
         section_rows.append(
             {
                 "current_code_version": current_code_version,
                 "previous_code_version": previous_code_version,
                 "section_id": section_id,
+                "section_occurrence_key": occurrence_key,
                 "content_changed": content_changed,
                 "data_changed": data_changed,
             }
         )
     current_tables, current_images = html_counts(current, current_code_version, "current")
     previous_tables, previous_images = html_counts(previous, previous_code_version, "previous")
-    current_catalog = first_catalog(catalog_by_cv, current_code_version)
-    previous_catalog = first_catalog(catalog_by_cv, previous_code_version)
+    current_catalog = read_json_file(current_raw.parent / "catalog-record.json")
+    previous_catalog = read_json_file(previous_raw.parent / "catalog-record.json")
+    current_manifest = read_json_file(current_raw.parent / "manifest.json")
+    previous_manifest = read_json_file(previous_raw.parent / "manifest.json")
     current_mkb = mkb_codes(current, current_catalog)
     previous_mkb = mkb_codes(previous, previous_catalog)
     current_developers = developer_keys(current_catalog)
@@ -181,7 +184,9 @@ def pair_row(
         ),
         "current_status_raw": current.get("status"),
         "previous_status_raw": previous.get("status"),
-        "status_transition_raw": f"{current.get('status')}->{previous.get('status')}",
+        "status_transition_raw": f"{previous.get('status')}->{current.get('status')}",
+        "current_catalog_resolution_state": current_manifest.get("catalog_resolution_state"),
+        "previous_catalog_resolution_state": previous_manifest.get("catalog_resolution_state"),
         "title_similarity": title_similarity(current, previous),
         "title_changed": title_similarity(current, previous) < 100,
         "adult_consistent": current.get("adult") == previous.get("adult"),
@@ -200,13 +205,29 @@ def pair_row(
         "developers_added": sorted(set(current_developers) - set(previous_developers)),
         "developers_removed": sorted(set(previous_developers) - set(current_developers)),
         "developer_jaccard": jaccard(current_developers, previous_developers),
-        "current_section_ids": sorted(current_sections),
-        "previous_section_ids": sorted(previous_sections),
-        "section_ids_added": sorted(set(current_sections) - set(previous_sections)),
-        "section_ids_removed": sorted(set(previous_sections) - set(current_sections)),
+        "current_section_ids": sorted(
+            section_id for section_id, _index, _section in section_occurrence_items(current)
+        ),
+        "previous_section_ids": sorted(
+            section_id
+            for section_id, _index, _section in section_occurrence_items(previous)
+        ),
+        "duplicate_section_ids_current": duplicate_section_ids(current),
+        "duplicate_section_ids_previous": duplicate_section_ids(previous),
+        "section_ids_added": sorted(
+            {key.rsplit('#', maxsplit=1)[0] for key in current_sections}
+            - {key.rsplit('#', maxsplit=1)[0] for key in previous_sections}
+        ),
+        "section_ids_removed": sorted(
+            {key.rsplit('#', maxsplit=1)[0] for key in previous_sections}
+            - {key.rsplit('#', maxsplit=1)[0] for key in current_sections}
+        ),
         "section_order_changed": section_order(current) != section_order(previous),
-        "changed_section_ids": changed_section_ids,
-        "unchanged_section_ids": unchanged_section_ids,
+        "changed_section_ids": sorted(
+            {key.rsplit("#", maxsplit=1)[0] for key in changed_section_occurrences}
+        ),
+        "changed_section_occurrences": changed_section_occurrences,
+        "unchanged_section_occurrences": unchanged_section_occurrences,
         "raw_size_delta": current_raw.stat().st_size - previous_raw.stat().st_size,
         "html_length_delta": html_length(current) - html_length(previous),
         "base64_size_delta": base64_size(current) - base64_size(previous),
@@ -224,20 +245,38 @@ def load_payload(path: Path) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
-def sections_by_id(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
+def sections_by_occurrence(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
     result: dict[str, dict[str, Any]] = {}
-    for section in raw_sections(payload):
-        if isinstance(section, dict):
-            result[section_id_for(section)] = section
+    for section_id, index, section in section_occurrence_items(payload):
+        result[f"{section_id}#{index}"] = section
     return result
 
 
 def section_order(payload: dict[str, Any]) -> list[str]:
     return [
-        section_id_for(section)
-        for section in raw_sections(payload)
-        if isinstance(section, dict)
+        f"{section_id}#{index}"
+        for section_id, index, _section in section_occurrence_items(payload)
     ]
+
+
+def section_occurrence_items(payload: dict[str, Any]) -> list[tuple[str, int, dict[str, Any]]]:
+    seen: Counter[str] = Counter()
+    rows: list[tuple[str, int, dict[str, Any]]] = []
+    for section in raw_sections(payload):
+        if not isinstance(section, dict):
+            continue
+        section_id = section_id_for(section)
+        index = seen[section_id]
+        seen[section_id] += 1
+        rows.append((section_id, index, section))
+    return rows
+
+
+def duplicate_section_ids(payload: dict[str, Any]) -> list[str]:
+    counts = Counter(
+        section_id for section_id, _index, _section in section_occurrence_items(payload)
+    )
+    return sorted(section_id for section_id, count in counts.items() if count > 1)
 
 
 def section_hash(section: dict[str, Any] | None, kind: str) -> str | None:
@@ -268,14 +307,6 @@ def membership_relation(
     if not current_active and not previous_active:
         return "neither_active"
     return "unknown"
-
-
-def first_catalog(
-    catalog_by_cv: dict[str, list[dict[str, Any]]],
-    code_version: str,
-) -> dict[str, Any]:
-    rows = catalog_by_cv.get(code_version) or []
-    return rows[0] if rows else {}
 
 
 def title_similarity(left: dict[str, Any], right: dict[str, Any]) -> float:

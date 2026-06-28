@@ -16,6 +16,7 @@ def table_rows_for_html(
     document_kind: str,
     section_id: str,
     html: str,
+    current_code_version: str | None = None,
 ) -> list[dict[str, Any]]:
     if not html:
         return []
@@ -23,31 +24,37 @@ def table_rows_for_html(
     rows: list[dict[str, Any]] = []
     for index, table in enumerate(soup.find_all("table")):
         table_html = str(table)
-        tr_items = table.find_all("tr")
-        cell_items = table.find_all(["td", "th"])
-        rowspans = [int_value(cell.get("rowspan")) for cell in cell_items if cell.get("rowspan")]
-        colspans = [int_value(cell.get("colspan")) for cell in cell_items if cell.get("colspan")]
+        tr_items = [row for row in table.find_all("tr") if nearest_table(row) == table]
+        cell_items = [
+            cell for cell in table.find_all(["td", "th"]) if nearest_table(cell) == table
+        ]
+        rowspans, invalid_rowspans = span_values(cell_items, "rowspan")
+        colspans, invalid_colspans = span_values(cell_items, "colspan")
+        invalid_spans = invalid_rowspans + invalid_colspans
         rows.append(
             {
                 "code_version": code_version,
                 "document_kind": document_kind,
+                "current_code_version": current_code_version,
                 "section_id": section_id,
                 "table_index": index,
                 "rows": len(tr_items),
                 "cells": len(cell_items),
-                "th_count": len(table.find_all("th")),
-                "td_count": len(table.find_all("td")),
+                "th_count": sum(1 for cell in cell_items if cell.name == "th"),
+                "td_count": sum(1 for cell in cell_items if cell.name == "td"),
                 "rowspan_count": len(rowspans),
                 "colspan_count": len(colspans),
                 "max_rowspan": max(rowspans) if rowspans else 1,
                 "max_colspan": max(colspans) if colspans else 1,
-                "nested_table_count": max(0, len(table.find_all("table")) - 1),
+                "nested_table_count": len(table.find_all("table")),
                 "empty_cell_count": sum(
                     1 for cell in cell_items if not cell.get_text(strip=True)
                 ),
                 "text_length": len(table.get_text(" ", strip=True)),
                 "html_sha256": sha256_text(table_html),
-                "malformed": len(tr_items) == 0 or len(cell_items) == 0,
+                "invalid_span_count": len(invalid_spans),
+                "invalid_spans": invalid_spans,
+                "malformed": len(tr_items) == 0 or len(cell_items) == 0 or bool(invalid_spans),
             }
         )
     return rows
@@ -59,6 +66,7 @@ def image_rows_for_html(
     document_kind: str,
     section_id: str,
     html: str,
+    current_code_version: str | None = None,
 ) -> list[dict[str, Any]]:
     if not html:
         return []
@@ -84,6 +92,7 @@ def image_rows_for_html(
             {
                 "code_version": code_version,
                 "document_kind": document_kind,
+                "current_code_version": current_code_version,
                 "section_id": section_id,
                 "image_index": index,
                 "src_class": src_class,
@@ -131,11 +140,38 @@ def split_data_uri(src: str) -> tuple[str | None, str]:
     return mime_type or None, token
 
 
-def int_value(value: Any) -> int:
+def span_values(cells: list[Any], attribute: str) -> tuple[list[int], list[dict[str, Any]]]:
+    values: list[int] = []
+    invalid: list[dict[str, Any]] = []
+    for cell_index, cell in enumerate(cells):
+        if not cell.has_attr(attribute):
+            continue
+        raw = cell.get(attribute)
+        value = int_value(raw)
+        if value is None or value <= 0:
+            invalid.append(
+                {
+                    "cell_index": cell_index,
+                    "attribute": attribute,
+                    "raw_value": raw,
+                    "normalized_value": 1,
+                }
+            )
+            values.append(1)
+        else:
+            values.append(value)
+    return values, invalid
+
+
+def nearest_table(tag: Any) -> Any:
+    return tag.find_parent("table")
+
+
+def int_value(value: Any) -> int | None:
     try:
         return int(str(value))
     except (TypeError, ValueError):
-        return 1
+        return None
 
 
 def sha256_text(value: str) -> str:

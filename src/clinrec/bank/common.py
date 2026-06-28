@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import shutil
 import unicodedata
@@ -420,8 +421,25 @@ def existing_manifest_matches(path: Path, manifest: dict[str, Any]) -> bool:
 def write_atomic_bytes(path: Path, content: bytes) -> Path:
     part_path = path.with_suffix(path.suffix + ".part")
     part_path.parent.mkdir(parents=True, exist_ok=True)
-    part_path.write_bytes(content)
+    with part_path.open("wb") as file:
+        file.write(content)
+        file.flush()
+        try:
+            os.fsync(file.fileno())
+        except OSError:
+            pass
     part_path.replace(path)
+    try:
+        directory = os.open(str(path.parent), os.O_RDONLY)
+    except OSError:
+        return path
+    try:
+        try:
+            os.fsync(directory)
+        except OSError:
+            pass
+    finally:
+        os.close(directory)
     return path
 
 

@@ -602,8 +602,8 @@ def research_build_corpus(
     typer.echo(f"output: {summary.output}")
     typer.echo(f"status: {summary.status}")
     typer.echo(f"valid_current_count: {summary.valid_current_count}")
-    typer.echo(f"valid_legacy_count: {summary.valid_legacy_count}")
-    typer.echo(f"legacy_attempts: {summary.legacy_attempts}")
+    typer.echo(f"valid_previous_count: {summary.valid_legacy_count}")
+    typer.echo(f"previous_attempts: {summary.legacy_attempts}")
     typer.echo(f"corpus: {summary.corpus_path}")
     typer.echo(f"summary: {summary.summary_path}")
 

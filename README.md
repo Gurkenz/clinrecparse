@@ -211,54 +211,91 @@ predecessor confirmation, or automatic replacement links in the raw-bank lifecyc
 diff, and identity-design work. It is not an accepted production bank and must not be
 used with `bank-apply-update`.
 
+Smoke command:
+
 ```powershell
 clinrec research-build-corpus `
-  --current-count 50 `
-  --previous-target 10 `
-  --previous-minimum 5 `
-  --previous-attempt-limit 20 `
-  --seed 20260627 `
-  --include 773_2 `
-  --include 843_1 `
+  --current-count 10 `
+  --previous-target 3 `
+  --previous-minimum 2 `
+  --previous-attempt-limit 6 `
+  --seed 20260628 `
   --include 270_2 `
   --include 270_3 `
-  --output data/research/corpora/live-json-50
+  --output data/research/corpora/live-smoke-10-v2
 ```
 
-Research output must live outside `data/bank`. Catalog snapshots, selected current
-JSON, nearest previous-version attempts, manifests, profiling JSONL files, schema
-summaries, pair observations, and `reports/research-findings.md` are written under
-the selected output directory. Raw `GetClinrec2` responses are saved byte-for-byte;
-HTML inside source JSON is counted for structure only and is not normalized or
-extracted.
-
-Selection is deterministic for a fixed seed. Forced `--include` records are selected
-first, then the remaining sample is balanced across Version 1, Version 2, and Version
-3+ records. If a selected non-forced current document fails after retry policy, the
-builder records the failure and first tries a replacement from the same version
-stratum. Previous attempts use only the nearest `Version - 1` candidate, stop at
-`--previous-target` or `--previous-attempt-limit`, and record partial results honestly.
-The deprecated `--legacy-*` aliases are accepted for one compatibility period, but
-new research output is written to `previous/`.
-
-Useful research controls:
+Full 250 command, prepared for external audit and not run automatically:
 
 ```powershell
-clinrec research-build-corpus --output data/research/corpora/live-json-50 --resume
-clinrec research-build-corpus --output data/research/corpora/live-json-50 --profile-only
-clinrec research-build-corpus --output data/research/corpora/live-json-50 --dry-run
-clinrec research-validate-corpus --input data/research/corpora/live-json-50
-clinrec research-migrate-layout --input data/research/corpora/live-json-50
-clinrec research-profile-corpus --input data/research/corpora/live-json-50 --rebuild-reports
+clinrec research-build-corpus `
+  --current-count 250 `
+  --previous-target 50 `
+  --previous-minimum 35 `
+  --previous-attempt-limit 100 `
+  --seed 20260628 `
+  --include 270_2 `
+  --include 270_3 `
+  --include 773_2 `
+  --include 843_1 `
+  --output data/research/corpora/live-json-250
 ```
+
+Resume, profile-only, and validation commands:
+
+```powershell
+clinrec research-build-corpus --output data/research/corpora/live-json-250 --resume
+clinrec research-profile-corpus --input data/research/corpora/live-json-250 --no-rebuild-reports
+clinrec research-profile-corpus --input data/research/corpora/live-json-250 --rebuild-reports
+clinrec research-validate-corpus --input data/research/corpora/live-json-250
+clinrec research-migrate-layout --input data/research/corpora/live-json-250
+```
+
+Research output must live outside `data/bank`, and `data/bank` must not be nested
+inside the research output. A normal non-resume build requires an absent or clean
+output path; preloaded catalog files are allowed, but stale `current/`, `previous/`,
+`legacy/`, attempts, or selection files require `--resume` or a new output path.
+Raw `GetClinrec2` responses are saved byte-for-byte and manifests hash exactly those
+bytes.
+
+Selection is deterministic for a fixed seed and catalog. Forced `--include` records
+are inserted first, then selection balances unique CodeVersion values across Version
+1, Version 2, and Version 3+ records with date-bucket and age-group provenance.
+Replacement attempts prefer the same version, date bucket, and age group, then relax
+dimensions in a recorded order. Catalog duplicate CodeVersion rows are preserved;
+raw `db_id` resolves duplicate candidates when it uniquely matches, otherwise
+metadata ambiguity remains visible in manifests and reports.
+
+Previous attempts use only the nearest `Version - 1` candidate as a retrieval
+experiment. This is not proof of a lifecycle predecessor relation. The deprecated
+`--legacy-*` aliases are accepted for compatibility, but new research output and
+reports use `previous/` and `previous-*` names.
+
+Status meanings:
+
+- `completed`: all selected current documents are valid, previous minimum is met,
+  and validation has no hard errors.
+- `partial`: all selected current documents are valid, previous target is not met,
+  previous minimum is met, attempts are exhausted, and validation has no hard errors.
+- `failed`: selected current identity is incomplete or invalid, previous minimum is
+  missed after attempts are exhausted, or validation has hard errors.
+
+Raw status values from catalog and documents are opaque. Reports may count and compare
+the raw values, but they must not assign semantic labels or decide lifecycle policy
+from numeric status values.
 
 `research-validate-corpus`, `research-migrate-layout`, and
 `research-profile-corpus` are offline commands. They do not open an HTTP client.
 Validation writes `reports/validation.json` and `reports/validation.md`; warnings do
 not fail the command, while invalid raw/manifests exit with code `2`.
 
-Research reports preserve source JSON and catalog JSONL files byte-for-byte. Derived
-indexes keep every all-statuses row by `source_record_id` and maintain a
+Research profiling captures `relative path -> sha256, size` maps for every current
+and previous `getclinrec.json` before and after report generation. Any raw path,
+hash, or size drift is a hard error with `reports/raw-integrity-diff.json`.
+`--no-rebuild-reports` performs read-only inspection and must not rewrite reports or
+`corpus.json`.
+
+Derived indexes keep every all-statuses row by `source_record_id` and maintain a
 `CodeVersion -> source_record_id[]` index so duplicate and malformed CodeVersion
 values are reported instead of overwritten. The empirical parser profile records the
 observed section registry, `doc_title.data` item shapes, `doc_whole` duplicate

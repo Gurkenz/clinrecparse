@@ -7,7 +7,7 @@ from typing import Any
 import pytest
 
 from clinrec.api.client import JsonPayloadResult
-from clinrec.bank.common import BankError, read_json_file, read_jsonl, write_jsonl
+from clinrec.bank.common import BankError, read_json_file, read_jsonl, sha256_file, write_jsonl
 from clinrec.config import (
     ConcurrencySettings,
     DiscoverySettings,
@@ -18,13 +18,18 @@ from clinrec.config import (
     Settings,
 )
 from clinrec.models.external import ApiErrorKind, ExternalApiError
-from clinrec.research.catalog import write_catalog_indexes
+from clinrec.research.catalog import (
+    records_by_code_version,
+    resolve_catalog_candidates,
+    write_catalog_indexes,
+)
 from clinrec.research.corpus import (
     ResearchCorpusOptions,
     build_research_corpus,
     ensure_research_output_safe,
     select_current_records,
 )
+from clinrec.research.html_profile import table_rows_for_html
 from clinrec.research.migration import migrate_layout
 from clinrec.research.schema import profile_corpus_offline
 from clinrec.research.sections import analyze_doc_whole, parse_title_data
@@ -179,11 +184,48 @@ def test_research_selection_missing_forced_fails() -> None:
         )
 
 
+def test_research_option_relationships_fail_before_output_mutation(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    output = settings.paths.data_root / "research" / "corpora" / "bad-options"
+
+    with pytest.raises(BankError, match="previous_minimum"):
+        build_research_corpus(
+            settings,
+            None,
+            ResearchCorpusOptions(
+                output=output,
+                current_count=3,
+                legacy_target=3,
+                legacy_minimum=5,
+                dry_run=True,
+            ),
+        )
+
+    assert not output.exists()
+
+
+def test_research_malformed_include_fails_before_output_mutation(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    output = settings.paths.data_root / "research" / "corpora" / "bad-include"
+
+    with pytest.raises(BankError, match="Malformed mandatory include"):
+        build_research_corpus(
+            settings,
+            None,
+            ResearchCorpusOptions(output=output, include=("not-a-code-version",), dry_run=True),
+        )
+
+    assert not output.exists()
+
+
 def test_research_output_must_not_be_inside_bank(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
 
     with pytest.raises(BankError, match="data/bank"):
         ensure_research_output_safe(settings, settings.paths.data_root / "bank" / "research")
+
+    with pytest.raises(BankError, match="data/bank"):
+        ensure_research_output_safe(settings, settings.paths.data_root)
 
 
 def test_research_build_corpus_replaces_failed_current_and_profiles(tmp_path: Path) -> None:
@@ -250,7 +292,13 @@ def test_research_profile_only_performs_no_http(tmp_path: Path) -> None:
     build_research_corpus(
         settings,
         Client(),  # type: ignore[arg-type]
-        ResearchCorpusOptions(output=output, current_count=3, legacy_target=0, seed=1),
+        ResearchCorpusOptions(
+            output=output,
+            current_count=3,
+            legacy_target=0,
+            legacy_minimum=0,
+            seed=1,
+        ),
     )
     summary = build_research_corpus(
         settings,
@@ -301,12 +349,12 @@ def test_research_counts_failed_previous_attempts_without_previous_dir(
     attempts = read_jsonl(output / "attempts" / "previous-attempts.jsonl")
     report = read_json_file(output / "reports" / "corpus-summary.json")
 
-    assert summary.status == "partial"
+    assert summary.status == "failed"
     assert summary.legacy_attempts == 1
     assert attempts[0]["previous_code_version"] == "100_1"
     assert attempts[0]["result"] == "5xx"
     assert report["previous_attempts"] == 1
-    assert report["status"] == "partial"
+    assert report["status"] == "failed"
     assert not (output / "previous").exists()
     assert not (output / "attempts" / "legacy-attempts.jsonl").exists()
 
@@ -334,6 +382,23 @@ def test_catalog_indexes_preserve_duplicate_code_versions_and_malformed_rows(
     assert collision["records_count"] == 2
     assert collision["source_record_ids"] == [2702, 2703]
     assert anomalies["malformed_code_versions"] == 1
+
+
+def test_catalog_resolution_uses_document_db_id_and_preserves_ambiguity() -> None:
+    rows = [
+        catalog_row(270, 2),
+        {**catalog_row(270, 2), "source_record_id": 2703},
+    ]
+    indexed = records_by_code_version(rows)
+
+    resolved = resolve_catalog_candidates(indexed, "270_2", document_db_id=2703)
+    ambiguous = resolve_catalog_candidates(indexed, "270_2", document_db_id=9999)
+
+    assert resolved.state == "resolved_by_document_db_id"
+    assert resolved.resolved_source_record_id == 2703
+    assert ambiguous.state == "ambiguous_no_db_id_match"
+    assert ambiguous.resolved_record is None
+    assert ambiguous.candidate_source_record_ids == [2702, 2703]
 
 
 def test_research_migration_renames_legacy_layout(tmp_path: Path) -> None:
@@ -366,7 +431,13 @@ def test_validation_detects_manifest_sha_mismatch(tmp_path: Path) -> None:
     build_research_corpus(
         settings,
         Client(),  # type: ignore[arg-type]
-        ResearchCorpusOptions(output=output, current_count=1, legacy_target=0, seed=1),
+        ResearchCorpusOptions(
+            output=output,
+            current_count=1,
+            legacy_target=0,
+            legacy_minimum=0,
+            seed=1,
+        ),
     )
     manifest_path = next(output.glob("current/*/manifest.json"))
     manifest = read_json_file(manifest_path)
@@ -460,6 +531,36 @@ def test_offline_profile_reports_current_previous_pair_and_keeps_raw_hashes(
     assert image_summary["base64_images"] == 1
     assert table_summary["tables_total"] == 1
     assert corpus["catalog_active_total"] == 2
+    report_hashes = {
+        path.name: sha256_file(path)
+        for path in (output / "reports").iterdir()
+        if path.is_file()
+    }
+    read_only = profile_corpus_offline(output, rebuild_reports=False)
+    assert read_only.raw_hashes_unchanged
+    assert report_hashes == {
+        path.name: sha256_file(path)
+        for path in (output / "reports").iterdir()
+        if path.is_file()
+    }
+
+
+def test_html_table_profile_counts_nested_tables_and_invalid_spans() -> None:
+    rows = table_rows_for_html(
+        code_version="100_1",
+        document_kind="current",
+        section_id="section_tables",
+        html=(
+            "<table><tr><td colspan='bad'>A<table><tr><td>B</td></tr></table></td></tr>"
+            "<tr><td rowspan='0'>C</td></tr></table>"
+        ),
+    )
+
+    assert rows[0]["rows"] == 2
+    assert rows[0]["cells"] == 2
+    assert rows[0]["nested_table_count"] == 1
+    assert rows[0]["invalid_span_count"] == 2
+    assert rows[0]["malformed"]
 
 
 def save_fixture_document(root: Path, code_version: str, sections: list[dict[str, Any]]) -> None:

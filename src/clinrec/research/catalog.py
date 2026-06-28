@@ -5,7 +5,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from clinrec.bank.common import read_jsonl, source_record_id_from_catalog, string_value
+from clinrec.bank.common import (
+    catalog_record_for_bank,
+    read_jsonl,
+    source_record_id_from_catalog,
+    string_value,
+)
 from clinrec.research.reports import reports_root, write_csv, write_json, write_jsonl
 
 
@@ -18,6 +23,35 @@ class CatalogProfile:
     unique_code_versions: int
     duplicate_code_versions: int
     malformed_code_versions: int
+
+
+@dataclass(frozen=True)
+class CatalogResolution:
+    code_version: str
+    state: str
+    candidates: list[dict[str, Any]]
+    resolved_record: dict[str, Any] | None
+    resolved_source_record_id: int | None
+
+    @property
+    def candidate_source_record_ids(self) -> list[int | None]:
+        return [source_record_id_from_catalog(row) for row in self.candidates]
+
+    @property
+    def metadata_ambiguous(self) -> bool:
+        return self.state in {
+            "ambiguous_no_db_id_match",
+            "ambiguous_multiple_db_id_matches",
+        }
+
+    def manifest_fields(self) -> dict[str, Any]:
+        return {
+            "catalog_candidates_count": len(self.candidates),
+            "catalog_candidate_source_record_ids": self.candidate_source_record_ids,
+            "catalog_resolution_state": self.state,
+            "catalog_resolved_source_record_id": self.resolved_source_record_id,
+            "catalog_metadata_ambiguous": self.metadata_ambiguous,
+        }
 
 
 def catalog_root(corpus_root: Path) -> Path:
@@ -45,16 +79,12 @@ def write_catalog_indexes(corpus_root: Path) -> CatalogProfile:
     all_rows = read_all_statuses_catalog(corpus_root)
     indexed_rows: list[dict[str, Any]] = []
     malformed_rows: list[dict[str, Any]] = []
-    by_source_id: dict[int, list[int]] = defaultdict(list)
-    by_code_version: dict[str, list[int]] = defaultdict(list)
+    by_source_id = source_record_id_index(all_rows)
+    by_code_version = code_version_index(all_rows)
 
     for index, row in enumerate(all_rows, start=1):
         source_record_id = source_record_id_from_catalog(row)
         code_version = string_value(row.get("code_version"))
-        if source_record_id is not None:
-            by_source_id[source_record_id].append(index)
-        if code_version:
-            by_code_version[code_version].append(index)
         malformed_kind = classify_code_version(row)
         if malformed_kind is not None:
             malformed_rows.append(
@@ -82,7 +112,7 @@ def write_catalog_indexes(corpus_root: Path) -> CatalogProfile:
 
     source_counts = Counter(source_record_id_from_catalog(row) for row in all_rows)
     source_counts.pop(None, None)
-    code_version_index = [
+    code_version_rows = [
         {
             "code_version": code_version,
             "source_record_ids": source_ids_for_rows(all_rows, row_indexes),
@@ -93,7 +123,7 @@ def write_catalog_indexes(corpus_root: Path) -> CatalogProfile:
     ]
     collision_rows = [
         row
-        for row in code_version_index
+        for row in code_version_rows
         if records_count(row) > 1
     ]
     duplicate_source_rows = [
@@ -108,7 +138,7 @@ def write_catalog_indexes(corpus_root: Path) -> CatalogProfile:
     root = catalog_root(corpus_root)
     report_root = reports_root(corpus_root)
     write_jsonl(root / "all-statuses-by-source-id.jsonl", indexed_rows)
-    write_jsonl(root / "code-version-index.jsonl", code_version_index)
+    write_jsonl(root / "code-version-index.jsonl", code_version_rows)
     write_json(
         report_root / "catalog-anomalies.json",
         {
@@ -155,6 +185,86 @@ def source_ids_for_rows(rows: list[dict[str, Any]], row_indexes: list[int]) -> l
     for row_index in row_indexes:
         result.append(source_record_id_from_catalog(rows[row_index - 1]))
     return result
+
+
+def code_version_index(rows: list[dict[str, Any]]) -> dict[str, list[int]]:
+    result: dict[str, list[int]] = defaultdict(list)
+    for index, row in enumerate(rows, start=1):
+        code_version = string_value(row.get("code_version"))
+        if code_version:
+            result[code_version].append(index)
+    return dict(result)
+
+
+def source_record_id_index(rows: list[dict[str, Any]]) -> dict[int, list[int]]:
+    result: dict[int, list[int]] = defaultdict(list)
+    for index, row in enumerate(rows, start=1):
+        source_record_id = source_record_id_from_catalog(row)
+        if source_record_id is not None:
+            result[source_record_id].append(index)
+    return dict(result)
+
+
+def records_by_code_version(rows: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    result: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        code_version = string_value(row.get("code_version"))
+        if code_version:
+            result[code_version].append(row)
+    return dict(result)
+
+
+def resolve_catalog_candidates(
+    rows_by_code_version: dict[str, list[dict[str, Any]]],
+    code_version: str,
+    *,
+    document_db_id: int | None,
+) -> CatalogResolution:
+    candidates = [
+        catalog_record_for_bank(row)
+        for row in rows_by_code_version.get(code_version, [])
+    ]
+    if not candidates:
+        return CatalogResolution(
+            code_version=code_version,
+            state="missing",
+            candidates=[],
+            resolved_record=None,
+            resolved_source_record_id=None,
+        )
+    if len(candidates) == 1:
+        source_record_id = source_record_id_from_catalog(candidates[0])
+        return CatalogResolution(
+            code_version=code_version,
+            state="unique",
+            candidates=candidates,
+            resolved_record=candidates[0],
+            resolved_source_record_id=source_record_id,
+        )
+    matches = [
+        row for row in candidates if source_record_id_from_catalog(row) == document_db_id
+    ]
+    if len(matches) == 1:
+        source_record_id = source_record_id_from_catalog(matches[0])
+        return CatalogResolution(
+            code_version=code_version,
+            state="resolved_by_document_db_id",
+            candidates=candidates,
+            resolved_record=matches[0],
+            resolved_source_record_id=source_record_id,
+        )
+    state = (
+        "ambiguous_multiple_db_id_matches"
+        if len(matches) > 1
+        else "ambiguous_no_db_id_match"
+    )
+    return CatalogResolution(
+        code_version=code_version,
+        state=state,
+        candidates=candidates,
+        resolved_record=None,
+        resolved_source_record_id=None,
+    )
 
 
 def records_count(row: dict[str, Any]) -> int:

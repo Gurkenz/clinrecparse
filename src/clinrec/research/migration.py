@@ -66,19 +66,57 @@ def migrate_layout(root: Path) -> MigrationSummary:
     previous = root / "previous"
     if legacy.exists() and previous.exists():
         raise BankError("Research migration found both legacy and previous paths.")
-    migrated = False
-    if legacy.exists():
-        legacy.replace(previous)
-        migrated = True
     legacy_attempts = attempts_path(root, preferred=False)
     previous_attempts = attempts_path(root, preferred=True)
     if legacy_attempts.exists() and previous_attempts.exists():
         raise BankError("Research migration found both legacy and previous attempts files.")
+    if previous.exists() and legacy_attempts.exists():
+        raise BankError("Research migration found previous directory with legacy attempts file.")
+    marker = root / "migration-journal.json"
+    payload = read_json_file(marker)
+    completed_steps = payload.get("completed_steps") if isinstance(payload, dict) else []
+    steps = set(completed_steps if isinstance(completed_steps, list) else [])
+    operation_id = string_operation_id(payload) or f"migration-{utc_now()}"
+    migrated = False
+    write_migration_marker(
+        marker,
+        operation_id=operation_id,
+        steps=steps,
+        state="started",
+        root=root,
+    )
+    if legacy.exists() and "directory_renamed" not in steps:
+        legacy.replace(previous)
+        steps.add("directory_renamed")
+        migrated = True
+        write_migration_marker(
+            marker,
+            operation_id=operation_id,
+            steps=steps,
+            state="started",
+            root=root,
+        )
     if legacy_attempts.exists():
         previous_attempts.parent.mkdir(parents=True, exist_ok=True)
         legacy_attempts.replace(previous_attempts)
+        steps.add("attempts_renamed")
         migrated = True
+        write_migration_marker(
+            marker,
+            operation_id=operation_id,
+            steps=steps,
+            state="started",
+            root=root,
+        )
     update_corpus_layout_metadata(root, migrated=migrated)
+    steps.add("metadata_updated")
+    write_migration_marker(
+        marker,
+        operation_id=operation_id,
+        steps=steps,
+        state="completed",
+        root=root,
+    )
     return MigrationSummary(
         input=root,
         migrated=migrated,
@@ -107,3 +145,36 @@ def update_corpus_layout_metadata(root: Path, *, migrated: bool) -> None:
         payload["layout_migrated_at"] = utc_now()
     payload["updated_at"] = utc_now()
     atomic_write_json(path, payload)
+
+
+def string_operation_id(payload: dict[str, Any]) -> str:
+    value = payload.get("operation_id")
+    return value if isinstance(value, str) else ""
+
+
+def write_migration_marker(
+    path: Path,
+    *,
+    operation_id: str,
+    steps: set[str],
+    state: str,
+    root: Path,
+) -> None:
+    atomic_write_json(
+        path,
+        {
+            "schema_version": "1.0",
+            "operation_id": operation_id,
+            "state": state,
+            "source_paths": {
+                "legacy": (root / "legacy").as_posix(),
+                "legacy_attempts": attempts_path(root, preferred=False).as_posix(),
+            },
+            "target_paths": {
+                "previous": (root / "previous").as_posix(),
+                "previous_attempts": attempts_path(root, preferred=True).as_posix(),
+            },
+            "completed_steps": sorted(steps),
+            "updated_at": utc_now(),
+        },
+    )

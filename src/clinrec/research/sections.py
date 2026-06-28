@@ -18,7 +18,6 @@ from clinrec.bank.common import (
     stable_json_dumps,
     string_value,
 )
-from clinrec.research.catalog import all_status_records_by_code_version
 from clinrec.research.html_profile import image_rows_for_html, table_rows_for_html
 from clinrec.research.migration import research_layout
 from clinrec.research.reports import reports_root, write_csv, write_json, write_jsonl
@@ -41,7 +40,6 @@ class ProfileArtifacts:
 
 
 def profile_sections(corpus_root: Path) -> ProfileArtifacts:
-    all_by_code_version = all_status_records_by_code_version(corpus_root)
     documents: list[dict[str, Any]] = []
     sections: list[dict[str, Any]] = []
     tables: list[dict[str, Any]] = []
@@ -54,8 +52,10 @@ def profile_sections(corpus_root: Path) -> ProfileArtifacts:
         code_version = raw_path.parent.name
         payload = load_payload(raw_path)
         manifest = read_json_file(raw_path.parent / "manifest.json")
-        catalog_candidates = all_by_code_version.get(code_version, [])
-        catalog = catalog_candidates[0] if catalog_candidates else {}
+        catalog = read_json_file(raw_path.parent / "catalog-record.json")
+        candidates_payload = read_json_file(raw_path.parent / "catalog-candidates.json")
+        raw_candidates = candidates_payload.get("candidates")
+        catalog_candidates = raw_candidates if isinstance(raw_candidates, list) else []
         document_row, section_rows = profile_document(
             kind=kind,
             code_version=code_version,
@@ -77,6 +77,7 @@ def profile_sections(corpus_root: Path) -> ProfileArtifacts:
                 table_rows_for_html(
                     code_version=code_version,
                     document_kind=kind,
+                    current_code_version=current_code_version,
                     section_id=section_id,
                     html=html,
                 )
@@ -85,6 +86,7 @@ def profile_sections(corpus_root: Path) -> ProfileArtifacts:
                 image_rows_for_html(
                     code_version=code_version,
                     document_kind=kind,
+                    current_code_version=current_code_version,
                     section_id=section_id,
                     html=html,
                 )
@@ -180,10 +182,13 @@ def profile_document(
         "professional_association_count": len(payload.get("proff_associations") or []),
         "catalog_developer_count": len(catalog.get("developers") or []),
         "catalog_candidates_count": catalog_candidates_count,
-        "catalog_metadata_ambiguous": catalog_candidates_count > 1,
+        "catalog_candidate_source_record_ids": manifest.get("catalog_candidate_source_record_ids"),
+        "catalog_resolution_state": manifest.get("catalog_resolution_state"),
+        "catalog_resolved_source_record_id": manifest.get("catalog_resolved_source_record_id"),
+        "catalog_metadata_ambiguous": bool(manifest.get("catalog_metadata_ambiguous")),
     }
     section_rows = [
-        profile_section(code_version, kind, index, section)
+        profile_section(code_version, kind, current_code_version, index, section)
         for index, section in enumerate(sections)
     ]
     return document_row, section_rows
@@ -192,6 +197,7 @@ def profile_document(
 def profile_section(
     code_version: str,
     document_kind: str,
+    current_code_version: str | None,
     index: int,
     section: dict[str, Any],
 ) -> dict[str, Any]:
@@ -203,8 +209,11 @@ def profile_section(
     return {
         "document_code_version": code_version,
         "document_kind": document_kind,
+        "current_code_version": current_code_version,
+        "document_identity": document_identity(document_kind, code_version, current_code_version),
         "section_index": index,
         "section_id": section_id,
+        "section_occurrence_key": section_occurrence_key(section_id, index),
         "section_name": first_present(section, "name", "Name", "title"),
         "section_keys": sorted(section),
         "content_present": content is not None,
@@ -477,8 +486,10 @@ def write_section_registry(root: Path, sections: list[dict[str, Any]]) -> None:
         (
             "document_code_version",
             "document_kind",
+            "current_code_version",
             "section_index",
             "section_id",
+            "section_occurrence_key",
             "section_name",
             "content_length_chars",
             "data_type",
@@ -598,6 +609,7 @@ def write_html_reports(
         (
             "code_version",
             "document_kind",
+            "current_code_version",
             "section_id",
             "table_index",
             "rows",
@@ -605,6 +617,7 @@ def write_html_reports(
             "rowspan_count",
             "colspan_count",
             "nested_table_count",
+            "invalid_span_count",
             "text_length",
             "html_sha256",
         ),
@@ -615,10 +628,13 @@ def write_html_reports(
         (
             "code_version",
             "document_kind",
+            "current_code_version",
             "section_id",
             "table_index",
             "malformed",
             "nested_table_count",
+            "invalid_span_count",
+            "invalid_spans",
         ),
     )
     write_json(
@@ -657,6 +673,7 @@ def write_html_reports(
         (
             "code_version",
             "document_kind",
+            "current_code_version",
             "section_id",
             "image_index",
             "src_class",
@@ -691,6 +708,9 @@ def write_status_reports(root: Path, documents: list[dict[str, Any]]) -> None:
             "catalog_source_record_id",
             "db_id_state",
             "catalog_candidates_count",
+            "catalog_candidate_source_record_ids",
+            "catalog_resolution_state",
+            "catalog_resolved_source_record_id",
             "catalog_metadata_ambiguous",
         ),
     )
@@ -765,7 +785,13 @@ def count_list_values(rows: list[dict[str, Any]], key: str) -> dict[str, int]:
 def count_documents_with(sections: list[dict[str, Any]], key: str) -> int:
     grouped: dict[str, int] = defaultdict(int)
     for row in sections:
-        grouped[string_value(row["document_code_version"])] += int(row.get(key) or 0)
+        grouped[
+            document_identity(
+                string_value(row.get("document_kind")),
+                string_value(row.get("document_code_version")),
+                string_value(row.get("current_code_version")) or None,
+            )
+        ] += int(row.get(key) or 0)
     return sum(1 for value in grouped.values() if value > 0)
 
 
@@ -789,6 +815,20 @@ def section_id_for(section: dict[str, Any]) -> str:
     return string_value(first_present(section, "id", "Id"))
 
 
+def section_occurrence_key(section_id: str, index: int) -> str:
+    return f"{section_id}#{index}"
+
+
+def document_identity(
+    document_kind: str,
+    code_version: str,
+    current_code_version: str | None,
+) -> str:
+    if document_kind == "previous":
+        return f"previous:{current_code_version}:{code_version}"
+    return f"current:{code_version}"
+
+
 def section_html(section: dict[str, Any] | None) -> str:
     if section is None:
         return ""
@@ -801,7 +841,7 @@ def index_by_default(section_id: str) -> bool:
 
 
 def known_empirical_section(section_id: str) -> bool:
-    return bool(section_id and (section_id.startswith("doc_") or section_id.startswith("section_")))
+    return section_id in KNOWN_SPECIAL_SECTIONS
 
 
 def title_label(item: dict[str, Any]) -> str:
