@@ -214,9 +214,9 @@ used with `bank-apply-update`.
 ```powershell
 clinrec research-build-corpus `
   --current-count 50 `
-  --legacy-target 10 `
-  --legacy-minimum 5 `
-  --legacy-attempt-limit 20 `
+  --previous-target 10 `
+  --previous-minimum 5 `
+  --previous-attempt-limit 20 `
   --seed 20260627 `
   --include 773_2 `
   --include 843_1 `
@@ -235,9 +235,11 @@ extracted.
 Selection is deterministic for a fixed seed. Forced `--include` records are selected
 first, then the remaining sample is balanced across Version 1, Version 2, and Version
 3+ records. If a selected non-forced current document fails after retry policy, the
-builder records the failure and chooses a replacement. Legacy attempts use only the
-nearest `Version - 1` candidate, stop at `--legacy-target` or
-`--legacy-attempt-limit`, and record partial results honestly.
+builder records the failure and first tries a replacement from the same version
+stratum. Previous attempts use only the nearest `Version - 1` candidate, stop at
+`--previous-target` or `--previous-attempt-limit`, and record partial results honestly.
+The deprecated `--legacy-*` aliases are accepted for one compatibility period, but
+new research output is written to `previous/`.
 
 Useful research controls:
 
@@ -245,7 +247,24 @@ Useful research controls:
 clinrec research-build-corpus --output data/research/corpora/live-json-50 --resume
 clinrec research-build-corpus --output data/research/corpora/live-json-50 --profile-only
 clinrec research-build-corpus --output data/research/corpora/live-json-50 --dry-run
+clinrec research-validate-corpus --input data/research/corpora/live-json-50
+clinrec research-migrate-layout --input data/research/corpora/live-json-50
+clinrec research-profile-corpus --input data/research/corpora/live-json-50 --rebuild-reports
 ```
+
+`research-validate-corpus`, `research-migrate-layout`, and
+`research-profile-corpus` are offline commands. They do not open an HTTP client.
+Validation writes `reports/validation.json` and `reports/validation.md`; warnings do
+not fail the command, while invalid raw/manifests exit with code `2`.
+
+Research reports preserve source JSON and catalog JSONL files byte-for-byte. Derived
+indexes keep every all-statuses row by `source_record_id` and maintain a
+`CodeVersion -> source_record_id[]` index so duplicate and malformed CodeVersion
+values are reported instead of overwritten. The empirical parser profile records the
+observed section registry, `doc_title.data` item shapes, `doc_whole` duplicate
+signals, table and image inventories, raw status distributions, identity warnings,
+and current/previous pair metrics. `doc_whole` is preserved but is not indexable by
+default.
 
 `data/` is ignored by Git, so downloaded research JSON and generated reports remain
 local artifacts. Verify with `git status --short` before committing source changes.

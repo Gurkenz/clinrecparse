@@ -29,10 +29,11 @@ from clinrec.bank.common import (
     source_record_id_from_catalog,
     string_value,
     utc_now,
-    write_jsonl,
 )
 from clinrec.config import PathSettings, Settings
 from clinrec.models.external import ApiErrorKind, ExternalApiError
+from clinrec.research.migration import research_layout
+from clinrec.research.schema import profile_corpus_offline
 
 RESEARCH_SCHEMA_VERSION = "1.0"
 
@@ -72,6 +73,19 @@ def build_research_corpus(
     ensure_research_output_safe(settings, output)
     output.mkdir(parents=True, exist_ok=True)
     reports_root(output).mkdir(parents=True, exist_ok=True)
+    existing_status = corpus_status(output)
+    if (
+        existing_status
+        and existing_status not in {"created", "dry_run"}
+        and not options.resume
+        and not options.profile_only
+        and not options.dry_run
+    ):
+        if existing_status == "completed":
+            active_records, all_records, _ = load_or_sync_research_catalog(settings, None, options)
+            profile_corpus(output, all_records)
+            return write_reports(output, active_records, all_records, options, existing_status)
+        raise BankError("Existing incomplete corpus requires --resume or a new output path.")
 
     active_records, all_records, catalog_sha = load_or_sync_research_catalog(
         settings,
@@ -269,8 +283,17 @@ def download_current_documents(
     attempted = set(final_selected) | failed
     pool = replacement_pool(active_records, selected, options.seed)
     cursor = 0
+    pending_replacements: list[str] = []
     while len(valid_current_code_versions(output)) < options.current_count:
-        code_version = next_selection_candidate(selected, final_selected, attempted, pool, cursor)
+        code_version = next_pending_replacement(pending_replacements, final_selected, attempted)
+        if code_version is None:
+            code_version = next_selection_candidate(
+                selected,
+                final_selected,
+                attempted,
+                pool,
+                cursor,
+            )
         if code_version is None:
             break
         if code_version in pool:
@@ -278,7 +301,7 @@ def download_current_documents(
         attempted.add(code_version)
         record = by_code_version[code_version]
         result = download_one_research_current(output, client, record, options)
-        if result["result"] in {"downloaded", "already_valid"}:
+        if result["result"] in {"downloaded", "already_valid", "valid_with_identity_warning"}:
             if code_version not in final_selected:
                 final_selected.append(code_version)
         else:
@@ -287,7 +310,27 @@ def download_current_documents(
                 forced_failures.append(result)
                 selection["forced_failures"] = forced_failures
             replacements = list(selection.get("replacements") or [])
-            replacements.append({"failed": code_version, "result": result["result"]})
+            replacement = stratum_replacement(
+                active_records,
+                selected=selected,
+                attempted=attempted,
+                final_selected=final_selected,
+                failed_code_version=code_version,
+                seed=options.seed,
+            )
+            if replacement is not None:
+                pending_replacements.append(replacement)
+            replacements.append(
+                {
+                    "failed": code_version,
+                    "result": result["result"],
+                    "original_stratum": stratum_for_record(by_code_version[code_version]),
+                    "replacement": replacement,
+                    "replacement_stratum": stratum_for_record(by_code_version[replacement])
+                    if replacement is not None
+                    else None,
+                }
+            )
             selection["replacements"] = replacements
             if result["result"] == "circuit_open":
                 break
@@ -323,6 +366,49 @@ def next_selection_candidate(
     return None
 
 
+def next_pending_replacement(
+    pending: list[str],
+    final_selected: list[str],
+    attempted: set[str],
+) -> str | None:
+    while pending:
+        code_version = pending.pop(0)
+        if code_version not in final_selected and code_version not in attempted:
+            return code_version
+    return None
+
+
+def stratum_replacement(
+    records: list[dict[str, Any]],
+    *,
+    selected: list[str],
+    attempted: set[str],
+    final_selected: list[str],
+    failed_code_version: str,
+    seed: int,
+) -> str | None:
+    by_code_version = {string_value(row.get("code_version")): row for row in records}
+    failed_record = by_code_version[failed_code_version]
+    failed_stratum = stratum_for_record(failed_record)
+    unavailable = set(selected) | attempted | set(final_selected)
+    same_stratum = [
+        string_value(row.get("code_version"))
+        for row in records
+        if stratum_for_record(row) == failed_stratum
+        and string_value(row.get("code_version")) not in unavailable
+    ]
+    for code_version in deterministic_order(same_stratum, seed):
+        return code_version
+    fallback = [
+        string_value(row.get("code_version"))
+        for row in records
+        if string_value(row.get("code_version")) not in unavailable
+    ]
+    for code_version in deterministic_order(fallback, seed):
+        return code_version
+    return None
+
+
 def download_one_research_current(
     output: Path,
     client: ClinrecApiClient,
@@ -336,7 +422,6 @@ def download_one_research_current(
     if (
         raw_path.exists()
         and manifest_path.exists()
-        and not options.retry_failed
         and research_manifest_matches(raw_path, manifest_path, code_version)
     ):
         return {"code_version": code_version, "result": "already_valid"}
@@ -400,7 +485,7 @@ def save_research_document(
         ),
     )
     if db_id_state(catalog_source_id, info.db_id) == "mismatch":
-        return {"code_version": code_version, "result": "db_id_mismatch"}
+        return {"code_version": code_version, "result": "valid_with_identity_warning"}
     return {"code_version": code_version, "result": "downloaded"}
 
 
@@ -454,7 +539,13 @@ def download_legacy_documents(
         previous_code_version = f"{code}_{version - 1}"
         if (current_code_version, previous_code_version) in valid:
             continue
-        root = output / "legacy" / current_code_version / previous_code_version
+        existing_attempt = latest_attempt(attempts, current_code_version, previous_code_version)
+        if existing_attempt is not None and not should_retry_previous_attempt(
+            existing_attempt,
+            options,
+        ):
+            continue
+        root = output / "previous" / current_code_version / previous_code_version
         result = download_one_legacy(
             root,
             client,
@@ -463,8 +554,8 @@ def download_legacy_documents(
             catalog_record=all_by_code_version.get(previous_code_version),
         )
         attempts.append(result)
-        append_jsonl(output / "attempts" / "legacy-attempts.jsonl", result)
-        if result["result"] in {"downloaded", "already_valid"}:
+        append_jsonl(output / "attempts" / "previous-attempts.jsonl", result)
+        if result["result"] in {"downloaded", "already_valid", "valid_with_identity_warning"}:
             valid.add((current_code_version, previous_code_version))
         if result["result"] == "circuit_open":
             break
@@ -573,7 +664,7 @@ def legacy_result(
 
 
 def valid_legacy_pairs(output: Path) -> set[tuple[str, str]]:
-    root = output / "legacy"
+    root = research_layout(output).previous_root
     pairs: set[tuple[str, str]] = set()
     if not root.exists():
         return pairs
@@ -593,39 +684,38 @@ def valid_legacy_pairs(output: Path) -> set[tuple[str, str]]:
 
 
 def existing_legacy_attempts(output: Path) -> list[dict[str, Any]]:
+    layout = research_layout(output)
+    if layout.previous_attempts_path.exists():
+        return read_jsonl(layout.previous_attempts_path)
     return read_jsonl(output / "attempts" / "legacy-attempts.jsonl")
 
 
+def latest_attempt(
+    attempts: list[dict[str, Any]],
+    current_code_version: str,
+    previous_code_version: str,
+) -> dict[str, Any] | None:
+    for row in reversed(attempts):
+        if (
+            row.get("current_code_version") == current_code_version
+            and row.get("previous_code_version") == previous_code_version
+        ):
+            return row
+    return None
+
+
+def should_retry_previous_attempt(row: dict[str, Any], options: ResearchCorpusOptions) -> bool:
+    result = string_value(row.get("result"))
+    if result in {"downloaded", "already_valid", "valid_with_identity_warning", "403", "404"}:
+        return False
+    if not options.retry_failed:
+        return False
+    return result in {"timeout", "429", "5xx", "circuit_open", "invalid_json"}
+
+
 def profile_corpus(output: Path, all_records: list[dict[str, Any]]) -> None:
-    documents: list[dict[str, Any]] = []
-    sections: list[dict[str, Any]] = []
-    all_by_code_version = {string_value(row.get("code_version")): row for row in all_records}
-    for kind, root in (("current", output / "current"), ("legacy", output / "legacy")):
-        if not root.exists():
-            continue
-        if kind == "current":
-            raw_files = sorted(root.glob("*/getclinrec.json"))
-        else:
-            raw_files = sorted(root.glob("*/*/getclinrec.json"))
-        for raw_path in raw_files:
-            code_version = raw_path.parent.name
-            payload = json.loads(raw_path.read_text(encoding="utf-8"))
-            manifest = read_json_file(raw_path.parent / "manifest.json")
-            catalog = all_by_code_version.get(code_version, {})
-            document_row, section_rows = profile_document(
-                kind,
-                code_version,
-                raw_path,
-                payload,
-                manifest,
-                catalog,
-            )
-            documents.append(document_row)
-            sections.extend(section_rows)
-    write_jsonl(reports_root(output) / "documents.jsonl", documents)
-    write_jsonl(reports_root(output) / "sections.jsonl", sections)
-    write_json(reports_root(output) / "schema-profile.json", schema_profile(documents, sections))
-    write_jsonl(reports_root(output) / "current-legacy-pairs.jsonl", pair_rows(output))
+    _ = all_records
+    profile_corpus_offline(output)
 
 
 def profile_document(
@@ -849,12 +939,18 @@ def write_reports(
         "legacy_target": options.legacy_target,
         "legacy_minimum": options.legacy_minimum,
         "legacy_attempt_limit": options.legacy_attempt_limit,
+        "previous_target": options.legacy_target,
+        "previous_minimum": options.legacy_minimum,
+        "previous_attempt_limit": options.legacy_attempt_limit,
         "legacy_attempts": len(existing_legacy_attempts(output)),
+        "previous_attempts": len(existing_legacy_attempts(output)),
         "valid_legacy_count": len(valid_legacy),
+        "valid_previous_count": len(valid_legacy),
         "updated_at": utc_now(),
     }
     write_json(reports_root(output) / "corpus-summary.json", summary)
-    write_findings(output, summary)
+    if not (reports_root(output) / "research-findings.md").exists():
+        write_findings(output, summary)
     write_corpus_state(output, options, read_json_file(output / "selection.json"), "", status)
     return ResearchCorpusSummary(
         output=output,
@@ -890,9 +986,18 @@ def write_corpus_state(
             "legacy_target": options.legacy_target,
             "legacy_minimum": options.legacy_minimum,
             "legacy_attempt_limit": options.legacy_attempt_limit,
+            "previous_target": options.legacy_target,
+            "previous_minimum": options.legacy_minimum,
+            "previous_attempt_limit": options.legacy_attempt_limit,
             "valid_legacy_count": len(valid_legacy_pairs(output)),
+            "valid_previous_count": len(valid_legacy_pairs(output)),
             "forced_code_versions": list(options.include),
-            "catalog_active_total": len(selection.get("initially_selected") or []),
+            "catalog_active_total": catalog_active_total(output, selection),
+            "initial_selection_count": len(selection.get("initially_selected") or []),
+            "final_selection_count": len(selection.get("final_selected") or []),
+            "replacement_count": len(selection.get("replacements") or []),
+            "forced_failure_count": len(selection.get("forced_failures") or []),
+            "layout_version": "2.0" if (output / "previous").exists() else "1.0",
             "selection_sha256": sha256_bytes(
                 json.dumps(selection, ensure_ascii=False, sort_keys=True).encode("utf-8")
             )
@@ -902,6 +1007,13 @@ def write_corpus_state(
             "status": status,
         },
     )
+
+
+def catalog_active_total(output: Path, selection: dict[str, Any]) -> int:
+    active_path = output / "catalog" / "catalog-active.jsonl"
+    if active_path.exists():
+        return len(read_jsonl(active_path))
+    return len(selection.get("initially_selected") or [])
 
 
 def final_status(output: Path, options: ResearchCorpusOptions) -> str:

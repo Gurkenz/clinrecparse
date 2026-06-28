@@ -44,12 +44,16 @@ from clinrec.bank.transaction import (
     begin_operation,
     create_journal,
     ensure_area_backup,
+    ensure_state_backup,
     journal_path,
+    move_active_to_legacy,
     promote_staged_to_active,
     read_journal,
     reconcile_started_operations,
     release_writer_lock,
+    rollback_transaction,
     transaction_root,
+    write_lifecycle_file,
     writer_lock_path,
 )
 from clinrec.config import (
@@ -1159,6 +1163,102 @@ def test_completed_promotion_resume_does_not_archive_active_target(tmp_path: Pat
     )
     assert (bank_active_root(settings) / "843_1").exists()
     assert not bank_history_root(settings).exists()
+
+
+def test_lifecycle_write_resumes_after_completed_move(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    create_journal(
+        settings,
+        transaction_id="tx-lifecycle",
+        plan_id="plan-tx-lifecycle",
+        candidate_catalog_sha256="candidate",
+        previous_catalog_sha256=None,
+    )
+    active = bank_active_root(settings) / "100_1"
+    active.mkdir(parents=True)
+    (active / "payload.txt").write_text("payload", encoding="utf-8")
+
+    assert move_active_to_legacy(settings, "tx-lifecycle", code_version="100_1")
+    assert not move_active_to_legacy(settings, "tx-lifecycle", code_version="100_1")
+
+    payload = {
+        "code_version": "100_1",
+        "first_seen_active_at": None,
+        "last_seen_active_at": "2026-01-01T00:00:00Z",
+        "removed_from_active_catalog_at": "2026-01-01T00:00:00Z",
+        "removal_snapshot": "tx-lifecycle",
+        "replacement_status": "unresolved",
+        "replacement_candidates": [],
+        "events": [
+            {
+                "event_type": "removed_from_catalog",
+                "recorded_at": "2026-01-01T00:00:00Z",
+                "transaction_id": "tx-lifecycle",
+            }
+        ],
+    }
+    assert write_lifecycle_file(
+        settings,
+        "tx-lifecycle",
+        code_version="100_1",
+        payload=payload,
+    )
+
+    journal = read_journal(settings, "tx-lifecycle")
+    assert (bank_legacy_root(settings) / "100_1" / "lifecycle.json").exists()
+    assert any(
+        row["idempotency_key"] == "lifecycle_write:100_1"
+        and row["state"] == "completed"
+        for row in journal["operations"]
+    )
+
+
+def test_rollback_records_operations_before_restore_and_runs_qa(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    accept_current_catalog(
+        settings,
+        timestamp="tx-before",
+        records=[catalog_row("100_1", 100, 1, 0, source_record_id=1001)],
+    )
+    document_root = bank_active_root(settings) / "100_1"
+    write_valid_bank_document(
+        document_root,
+        "100_1",
+        code=100,
+        version=1,
+        source_record_id=1001,
+        db_id=1001,
+    )
+    create_journal(
+        settings,
+        transaction_id="tx-rollback",
+        plan_id="plan-tx-rollback",
+        candidate_catalog_sha256="candidate",
+        previous_catalog_sha256=None,
+    )
+    ensure_state_backup(settings, "tx-rollback")
+    backup = ensure_area_backup(
+        settings,
+        "tx-rollback",
+        area="active",
+        code_version="100_1",
+        source=document_root,
+    )
+    assert backup is not None
+    shutil.rmtree(document_root)
+    replacement = bank_active_root(settings) / "100_1"
+    replacement.mkdir(parents=True)
+    (replacement / "wrong.txt").write_text("wrong", encoding="utf-8")
+
+    journal = rollback_transaction(settings, "tx-rollback")
+
+    rollback_operations = journal["rollback_operations"]
+    assert journal["state"] == "rolled_back"
+    assert rollback_operations
+    assert all(row["state"] == "completed" for row in rollback_operations)
+    assert sha256_file(document_root / "current" / "getclinrec.json") == sha256_file(
+        backup / "current" / "getclinrec.json"
+    )
 
 
 def test_reconcile_started_move_uses_expected_source_hash(tmp_path: Path) -> None:

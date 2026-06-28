@@ -286,6 +286,13 @@ def complete_operation(settings: Settings, transaction_id: str, operation_id: st
     raise BankError(f"Unknown journal operation: {operation_id}")
 
 
+def complete_operation_by_key(settings: Settings, transaction_id: str, key: str) -> None:
+    operation = operation_by_idempotency_key(settings, transaction_id, key)
+    if operation is None:
+        raise BankError(f"Unknown journal operation: {key}")
+    complete_operation(settings, transaction_id, string_operation_id(operation))
+
+
 def fail_operation(
     settings: Settings,
     transaction_id: str,
@@ -566,6 +573,61 @@ def move_active_to_legacy(
     return moved
 
 
+def write_lifecycle_file(
+    settings: Settings,
+    transaction_id: str,
+    *,
+    code_version: str,
+    payload: dict[str, Any],
+) -> bool:
+    target = bank_legacy_root(settings) / code_version
+    lifecycle_path = target / "lifecycle.json"
+    key = f"lifecycle_write:{code_version}"
+    operation = operation_by_idempotency_key(settings, transaction_id, key)
+    if operation and operation.get("state") == "completed":
+        if not lifecycle_file_matches(lifecycle_path, payload):
+            raise BankError(f"transaction_inconsistent: completed {key} content mismatch")
+        return False
+    if not target.exists():
+        raise BankError(f"Cannot write lifecycle for missing legacy document: {code_version}")
+    operation_id = begin_operation(
+        settings,
+        transaction_id,
+        operation_type="lifecycle_write",
+        code_version=code_version,
+        source=None,
+        target=lifecycle_path,
+        idempotency_key=key,
+    )
+    try:
+        atomic_write_json_fsync(lifecycle_path, payload)
+        if not lifecycle_file_matches(lifecycle_path, payload):
+            raise BankError("lifecycle_content_mismatch")
+    except Exception as exc:
+        fail_operation(settings, transaction_id, operation_id, str(exc))
+        raise
+    complete_operation(settings, transaction_id, operation_id)
+    return True
+
+
+def lifecycle_file_matches(path: Path, expected: dict[str, Any]) -> bool:
+    if not path.exists():
+        return False
+    actual = read_json_file(path)
+    required_keys = (
+        "code_version",
+        "removal_snapshot",
+        "replacement_status",
+        "replacement_candidates",
+    )
+    for key in required_keys:
+        if actual.get(key) != expected.get(key):
+            return False
+    expected_events = expected.get("events")
+    actual_events = actual.get("events")
+    return isinstance(expected_events, list) and actual_events == expected_events
+
+
 def remove_legacy_for_reactivation(
     settings: Settings,
     transaction_id: str,
@@ -662,7 +724,6 @@ def rollback_transaction(settings: Settings, transaction_id: str) -> dict[str, A
     try:
         backups_value = journal.get("backups")
         backups: dict[str, Any] = backups_value if isinstance(backups_value, dict) else {}
-        rollback_rows: list[dict[str, Any]] = []
         for area, root in (
             ("active", bank_active_root(settings)),
             ("legacy", bank_legacy_root(settings)),
@@ -673,39 +734,40 @@ def rollback_transaction(settings: Settings, transaction_id: str) -> dict[str, A
             for code_version, backup_value in sorted(area_backups.items()):
                 target = root / code_version
                 if target.exists():
-                    rollback_archive = (
-                        transaction_root(settings, transaction_id)
-                        / "rollback-displaced"
-                        / area
-                        / code_version
+                    rollback_archive_existing(
+                        settings,
+                        transaction_id,
+                        area=area,
+                        code_version=code_version,
+                        target=target,
                     )
-                    move_directory(target, unique_path(rollback_archive))
                 if backup_value:
                     backup = Path(str(backup_value))
-                    copy_directory(backup, target)
-                    rollback_rows.append(
-                        {
-                            "type": "restore_backup",
-                            "area": area,
-                            "code_version": code_version,
-                            "backup": backup.as_posix(),
-                            "target": target.as_posix(),
-                        }
+                    rollback_restore_backup(
+                        settings,
+                        transaction_id,
+                        area=area,
+                        code_version=code_version,
+                        backup=backup,
+                        target=target,
                     )
                 else:
-                    rollback_rows.append(
-                        {
-                            "type": "remove_created_target",
-                            "area": area,
-                            "code_version": code_version,
-                            "target": target.as_posix(),
-                        }
+                    rollback_record_remove_created(
+                        settings,
+                        transaction_id,
+                        area=area,
+                        code_version=code_version,
+                        target=target,
                     )
         state_backup = backups.get("state") if isinstance(backups.get("state"), dict) else {}
         pointer = state_backup.get("accepted_pointer") if isinstance(state_backup, dict) else None
-        restore_accepted_pointer(settings, pointer if isinstance(pointer, dict) else None)
+        rollback_restore_state(
+            settings,
+            transaction_id,
+            pointer if isinstance(pointer, dict) else None,
+        )
+        run_rollback_qa(settings)
         journal = read_journal(settings, transaction_id)
-        journal["rollback_operations"].extend(rollback_rows)
         journal["state"] = "rolled_back"
         write_journal(settings, transaction_id, journal)
     except Exception as exc:
@@ -720,6 +782,251 @@ def rollback_transaction(settings: Settings, transaction_id: str) -> dict[str, A
         except BankError:
             pass
     return read_journal(settings, transaction_id)
+
+
+def rollback_operation_by_key(
+    settings: Settings,
+    transaction_id: str,
+    key: str,
+) -> dict[str, Any] | None:
+    journal = read_journal(settings, transaction_id)
+    for operation in journal.get("rollback_operations") or []:
+        if isinstance(operation, dict) and operation.get("idempotency_key") == key:
+            return operation
+    return None
+
+
+def begin_rollback_operation(
+    settings: Settings,
+    transaction_id: str,
+    *,
+    operation_type: str,
+    area: str,
+    code_version: str,
+    source: Path | None,
+    target: Path | None,
+    backup: Path | None = None,
+    idempotency_key: str,
+) -> str:
+    journal = read_journal(settings, transaction_id)
+    for operation in journal.get("rollback_operations") or []:
+        if not isinstance(operation, dict) or operation.get("idempotency_key") != idempotency_key:
+            continue
+        if operation.get("state") == "completed":
+            return string_operation_id(operation)
+        operation["state"] = "started"
+        operation["started_at"] = operation.get("started_at") or utc_now()
+        write_journal(settings, transaction_id, journal)
+        return string_operation_id(operation)
+    operation_id = f"rollback-op-{len(journal.setdefault('rollback_operations', [])) + 1:04d}"
+    operation = {
+        "operation_id": operation_id,
+        "idempotency_key": idempotency_key,
+        "type": operation_type,
+        "area": area,
+        "code_version": code_version,
+        "source": source.as_posix() if source is not None else None,
+        "target": target.as_posix() if target is not None else None,
+        "backup": backup.as_posix() if backup is not None else None,
+        "expected_source_sha256": path_sha256(source),
+        "expected_target_sha256": path_sha256(target),
+        "expected_backup_sha256": path_sha256(backup),
+        "state": "planned",
+        "created_at": utc_now(),
+        "started_at": None,
+        "completed_at": None,
+        "error": None,
+    }
+    journal["rollback_operations"].append(operation)
+    write_journal(settings, transaction_id, journal)
+    journal = read_journal(settings, transaction_id)
+    for item in journal.get("rollback_operations") or []:
+        if item.get("operation_id") == operation_id:
+            item["state"] = "started"
+            item["started_at"] = utc_now()
+            break
+    write_journal(settings, transaction_id, journal)
+    return operation_id
+
+
+def complete_rollback_operation(
+    settings: Settings,
+    transaction_id: str,
+    operation_id: str,
+) -> None:
+    journal = read_journal(settings, transaction_id)
+    for operation in journal.get("rollback_operations") or []:
+        if operation.get("operation_id") == operation_id:
+            operation["state"] = "completed"
+            operation["completed_at"] = utc_now()
+            operation["error"] = None
+            write_journal(settings, transaction_id, journal)
+            return
+    raise BankError(f"Unknown rollback operation: {operation_id}")
+
+
+def fail_rollback_operation(
+    settings: Settings,
+    transaction_id: str,
+    operation_id: str,
+    error: str,
+) -> None:
+    journal = read_journal(settings, transaction_id)
+    for operation in journal.get("rollback_operations") or []:
+        if operation.get("operation_id") == operation_id:
+            operation["state"] = "failed"
+            operation["error"] = error
+            journal.setdefault("errors", []).append(operation)
+            write_journal(settings, transaction_id, journal)
+            return
+    raise BankError(f"Unknown rollback operation: {operation_id}")
+
+
+def rollback_archive_existing(
+    settings: Settings,
+    transaction_id: str,
+    *,
+    area: str,
+    code_version: str,
+    target: Path,
+) -> None:
+    key = f"rollback_archive_existing:{area}:{code_version}"
+    existing = rollback_operation_by_key(settings, transaction_id, key)
+    if existing and existing.get("state") == "completed":
+        return
+    archive = (
+        transaction_root(settings, transaction_id)
+        / "rollback-displaced"
+        / area
+        / code_version
+    )
+    if existing and existing.get("target"):
+        archive = Path(str(existing["target"]))
+    elif archive.exists():
+        archive = unique_path(archive)
+    operation_id = begin_rollback_operation(
+        settings,
+        transaction_id,
+        operation_type="rollback_archive_existing",
+        area=area,
+        code_version=code_version,
+        source=target,
+        target=archive,
+        idempotency_key=key,
+    )
+    try:
+        moved = move_directory(target, archive)
+        if moved and not archive.exists():
+            raise BankError("rollback_archive_missing")
+    except Exception as exc:
+        fail_rollback_operation(settings, transaction_id, operation_id, str(exc))
+        raise
+    complete_rollback_operation(settings, transaction_id, operation_id)
+
+
+def rollback_restore_backup(
+    settings: Settings,
+    transaction_id: str,
+    *,
+    area: str,
+    code_version: str,
+    backup: Path,
+    target: Path,
+) -> None:
+    key = f"rollback_restore_backup:{area}:{code_version}"
+    existing = rollback_operation_by_key(settings, transaction_id, key)
+    expected_sha = path_sha256(backup)
+    if existing and existing.get("state") == "completed":
+        if path_sha256(target) != expected_sha:
+            raise BankError(f"rollback_inconsistent: restored {area}/{code_version} hash mismatch")
+        return
+    operation_id = begin_rollback_operation(
+        settings,
+        transaction_id,
+        operation_type="rollback_restore_backup",
+        area=area,
+        code_version=code_version,
+        source=backup,
+        target=target,
+        backup=backup,
+        idempotency_key=key,
+    )
+    try:
+        if target.exists():
+            if path_sha256(target) != expected_sha:
+                raise BankError("rollback_target_exists_with_wrong_hash")
+        else:
+            copy_directory(backup, target)
+        if path_sha256(target) != expected_sha:
+            raise BankError("rollback_restore_hash_mismatch")
+    except Exception as exc:
+        fail_rollback_operation(settings, transaction_id, operation_id, str(exc))
+        raise
+    complete_rollback_operation(settings, transaction_id, operation_id)
+
+
+def rollback_record_remove_created(
+    settings: Settings,
+    transaction_id: str,
+    *,
+    area: str,
+    code_version: str,
+    target: Path,
+) -> None:
+    key = f"rollback_remove_created_target:{area}:{code_version}"
+    existing = rollback_operation_by_key(settings, transaction_id, key)
+    if existing and existing.get("state") == "completed":
+        return
+    operation_id = begin_rollback_operation(
+        settings,
+        transaction_id,
+        operation_type="rollback_remove_created_target",
+        area=area,
+        code_version=code_version,
+        source=None,
+        target=target,
+        idempotency_key=key,
+    )
+    if target.exists():
+        fail_rollback_operation(settings, transaction_id, operation_id, "target_still_exists")
+        raise BankError(f"Rollback target still exists after archive: {target}")
+    complete_rollback_operation(settings, transaction_id, operation_id)
+
+
+def rollback_restore_state(
+    settings: Settings,
+    transaction_id: str,
+    pointer: dict[str, Any] | None,
+) -> None:
+    key = "rollback_restore_state:accepted_pointer"
+    existing = rollback_operation_by_key(settings, transaction_id, key)
+    if existing and existing.get("state") == "completed":
+        return
+    operation_id = begin_rollback_operation(
+        settings,
+        transaction_id,
+        operation_type="rollback_restore_state",
+        area="state",
+        code_version="__accepted__",
+        source=None,
+        target=accepted_current_pointer_path(settings),
+        idempotency_key=key,
+    )
+    try:
+        restore_accepted_pointer(settings, pointer)
+    except Exception as exc:
+        fail_rollback_operation(settings, transaction_id, operation_id, str(exc))
+        raise
+    complete_rollback_operation(settings, transaction_id, operation_id)
+
+
+def run_rollback_qa(settings: Settings) -> None:
+    from clinrec.bank.common import BankRecordFilter
+    from clinrec.bank.qa import run_bank_qa
+
+    qa = run_bank_qa(settings, BankRecordFilter(all_records=True), against="accepted")
+    if qa.fatal or qa.errors:
+        raise BankError("Accepted QA failed after rollback.")
 
 
 def reconcile_started_operations(settings: Settings, transaction_id: str) -> None:

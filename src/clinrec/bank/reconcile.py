@@ -73,6 +73,7 @@ from clinrec.bank.transaction import (
     rollback_transaction,
     set_journal_state,
     transaction_root,
+    write_lifecycle_file,
 )
 from clinrec.bank.transaction import (
     move_active_to_legacy as tx_move_active_to_legacy,
@@ -334,13 +335,12 @@ def stage_update(
     *,
     force: bool = False,
     retry_failed: bool = False,
-    allow_identity_conflict: bool = False,
     dry_run: bool = False,
     verify_existing: bool = False,
 ) -> BankStageSummary:
     plan = load_verified_plan(plan_path)
-    if plan.get("identity_conflicts") and not allow_identity_conflict:
-        raise BankError("Plan contains identity conflicts; explicit override is required.")
+    if plan.get("identity_conflicts"):
+        raise BankError("Plan contains identity conflicts; resolve them with decisions.json.")
     if plan.get("state") not in {"created", "staged", "ready_to_apply"}:
         raise BankError(f"Plan state is not stageable: {plan.get('state')}")
     verify_candidate_hash(plan)
@@ -422,7 +422,6 @@ def apply_update_plan(
     *,
     allow_manual_review: bool = False,
     accept_catalog: bool = True,
-    allow_identity_conflict: bool = False,
     resume: bool = False,
     rollback_on_error: bool = True,
     recover_stale_lock: bool = False,
@@ -430,7 +429,6 @@ def apply_update_plan(
     plan = load_verified_plan(plan_path)
     if plan.get("requires_manual_review") and not allow_manual_review:
         raise BankError("Plan requires manual review before apply.")
-    _ = allow_identity_conflict
     if plan.get("state") not in {"staged", "review_required", "ready_to_apply", "applying"}:
         raise BankError(f"Plan state is not applicable: {plan.get('state')}")
     verify_candidate_hash(plan, reject_pilot=True)
@@ -505,8 +503,13 @@ def apply_update_plan(
                     transaction_id,
                     code_version=action.code_version,
                 ):
-                    write_lifecycle(settings, action.code_version, plan)
                     moved_to_legacy += 1
+                write_lifecycle_file(
+                    settings,
+                    transaction_id,
+                    code_version=action.code_version,
+                    payload=lifecycle_payload(settings, action.code_version, plan),
+                )
             elif action.action == "promote_reactivated":
                 remove_legacy_for_reactivation(
                     settings,
@@ -1353,35 +1356,52 @@ def cleanup_empty_staging(settings: Settings, transaction_id: str) -> None:
     root.rmdir()
 
 
-def write_lifecycle(settings: Settings, code_version: str, plan: dict[str, Any]) -> None:
+def lifecycle_payload(
+    settings: Settings,
+    code_version: str,
+    plan: dict[str, Any],
+) -> dict[str, Any]:
     target = bank_legacy_root(settings) / code_version
     lifecycle_path = target / "lifecycle.json"
     existing = read_json_file(lifecycle_path)
     events_value = existing.get("events")
     events: list[Any] = events_value if isinstance(events_value, list) else []
-    events.append(
-        {
-            "event_type": "removed_from_catalog",
-            "recorded_at": utc_now(),
-            "transaction_id": plan["transaction_id"],
-        }
-    )
-    write_json(
-        lifecycle_path,
-        {
-            "code_version": code_version,
-            "first_seen_active_at": existing.get("first_seen_active_at"),
-            "last_seen_active_at": utc_now(),
-            "removed_from_active_catalog_at": utc_now(),
-            "removal_snapshot": plan.get("transaction_id"),
-            "replacement_status": replacement_status_for(code_version, plan),
-            "replacement_candidates": (plan.get("replacement_candidates") or {}).get(
-                code_version,
-                [],
-            ),
-            "events": events,
-        },
-    )
+    if not any(
+        isinstance(event, dict)
+        and event.get("event_type") == "removed_from_catalog"
+        and event.get("transaction_id") == plan["transaction_id"]
+        for event in events
+    ):
+        events.append(
+            {
+                "event_type": "removed_from_catalog",
+                "recorded_at": utc_now(),
+                "transaction_id": plan["transaction_id"],
+            }
+        )
+    timestamp = utc_now()
+    return {
+        "code_version": code_version,
+        "first_seen_active_at": existing.get("first_seen_active_at"),
+        "last_seen_active_at": timestamp,
+        "removed_from_active_catalog_at": timestamp,
+        "removal_snapshot": plan.get("transaction_id"),
+        "replacement_status": replacement_status_for(code_version, plan),
+        "replacement_candidates": (plan.get("replacement_candidates") or {}).get(
+            code_version,
+            [],
+        ),
+        "events": events,
+    }
+
+
+def write_lifecycle(settings: Settings, code_version: str, plan: dict[str, Any]) -> None:
+    """Compatibility wrapper for tests and external callers."""
+    from clinrec.bank.common import atomic_write_json
+
+    target = bank_legacy_root(settings) / code_version
+    lifecycle_path = target / "lifecycle.json"
+    atomic_write_json(lifecycle_path, lifecycle_payload(settings, code_version, plan))
 
 
 def identity_conflicts_in_catalog(records: list[dict[str, Any]]) -> list[dict[str, Any]]:

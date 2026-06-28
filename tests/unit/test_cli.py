@@ -18,6 +18,19 @@ def test_cli_help() -> None:
     assert result.exit_code == 0
     assert "sync-catalog" in result.output
     assert "run-all" in result.output
+    assert "research-validate-corpus" in result.output
+    assert "research-migrate-layout" in result.output
+    assert "research-profile-corpus" in result.output
+
+
+def test_identity_conflict_bypass_flags_are_not_exposed() -> None:
+    apply_help = runner.invoke(app, ["bank-apply-update", "--help"])
+    stage_help = runner.invoke(app, ["bank-stage-update", "--help"])
+
+    assert apply_help.exit_code == 0
+    assert stage_help.exit_code == 0
+    assert "--allow-identity-conflict" not in apply_help.output
+    assert "--allow-identity-conflict" not in stage_help.output
 
 
 def test_qa_command_with_empty_temp_data(tmp_path: Path) -> None:

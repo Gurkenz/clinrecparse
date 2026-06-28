@@ -60,6 +60,9 @@ from clinrec.qa.checks import QaOptions
 from clinrec.qa.checks import run_qa as run_qa_checks
 from clinrec.research.corpus import ResearchCorpusOptions
 from clinrec.research.corpus import build_research_corpus as run_research_build_corpus
+from clinrec.research.migration import migrate_layout as run_research_migrate_layout
+from clinrec.research.schema import profile_corpus_offline as run_research_profile_corpus
+from clinrec.research.validation import validate_corpus as run_research_validate_corpus
 
 app = typer.Typer(help="Clinical recommendations pipeline CLI.")
 
@@ -309,10 +312,6 @@ def bank_apply_update(
         bool,
         typer.Option("--allow-manual-review", help="Apply a plan marked as manual review."),
     ] = False,
-    allow_identity_conflict: Annotated[
-        bool,
-        typer.Option("--allow-identity-conflict", help="Override identity conflict block."),
-    ] = False,
     resume: Annotated[
         bool,
         typer.Option("--resume", help="Resume an interrupted transaction."),
@@ -333,7 +332,6 @@ def bank_apply_update(
             settings,
             plan,
             allow_manual_review=allow_manual_review,
-            allow_identity_conflict=allow_identity_conflict,
             resume=resume,
             rollback_on_error=rollback_on_error,
             recover_stale_lock=recover_stale_lock,
@@ -368,10 +366,6 @@ def bank_stage_update(
         bool,
         typer.Option("--retry-failed", help="Retry documents with previous failed attempts."),
     ] = False,
-    allow_identity_conflict: Annotated[
-        bool,
-        typer.Option("--allow-identity-conflict", help="Stage despite identity conflicts."),
-    ] = False,
     dry_run: Annotated[
         bool,
         typer.Option("--dry-run", help="Write a dry-run staging summary only."),
@@ -391,7 +385,6 @@ def bank_stage_update(
                 plan,
                 force=force,
                 retry_failed=retry_failed,
-                allow_identity_conflict=allow_identity_conflict,
                 dry_run=dry_run,
                 verify_existing=verify_existing,
             )
@@ -531,9 +524,34 @@ def research_build_corpus(
     ],
     config: ConfigOption = DEFAULT_CONFIG_PATH,
     current_count: Annotated[int, typer.Option("--current-count", min=1)] = 50,
-    legacy_target: Annotated[int, typer.Option("--legacy-target", min=0)] = 10,
-    legacy_minimum: Annotated[int, typer.Option("--legacy-minimum", min=0)] = 5,
-    legacy_attempt_limit: Annotated[int, typer.Option("--legacy-attempt-limit", min=0)] = 20,
+    previous_target: Annotated[
+        int | None,
+        typer.Option("--previous-target", min=0, help="Preferred previous-version target."),
+    ] = None,
+    previous_minimum: Annotated[
+        int | None,
+        typer.Option("--previous-minimum", min=0, help="Preferred previous-version minimum."),
+    ] = None,
+    previous_attempt_limit: Annotated[
+        int | None,
+        typer.Option("--previous-attempt-limit", min=0, help="Preferred previous attempt limit."),
+    ] = None,
+    legacy_target: Annotated[
+        int | None,
+        typer.Option("--legacy-target", min=0, help="Deprecated alias for --previous-target."),
+    ] = None,
+    legacy_minimum: Annotated[
+        int | None,
+        typer.Option("--legacy-minimum", min=0, help="Deprecated alias for --previous-minimum."),
+    ] = None,
+    legacy_attempt_limit: Annotated[
+        int | None,
+        typer.Option(
+            "--legacy-attempt-limit",
+            min=0,
+            help="Deprecated alias for --previous-attempt-limit.",
+        ),
+    ] = None,
     seed: Annotated[int, typer.Option("--seed")] = 20260627,
     include: Annotated[
         list[str] | None,
@@ -546,12 +564,23 @@ def research_build_corpus(
 ) -> None:
     """Build an isolated raw JSON research corpus without touching the production bank."""
     settings = bootstrap(config)
+    effective_previous_target = previous_target if previous_target is not None else legacy_target
+    effective_previous_minimum = (
+        previous_minimum if previous_minimum is not None else legacy_minimum
+    )
+    effective_previous_attempt_limit = (
+        previous_attempt_limit
+        if previous_attempt_limit is not None
+        else legacy_attempt_limit
+    )
     options = ResearchCorpusOptions(
         output=output,
         current_count=current_count,
-        legacy_target=legacy_target,
-        legacy_minimum=legacy_minimum,
-        legacy_attempt_limit=legacy_attempt_limit,
+        legacy_target=effective_previous_target if effective_previous_target is not None else 10,
+        legacy_minimum=effective_previous_minimum if effective_previous_minimum is not None else 5,
+        legacy_attempt_limit=effective_previous_attempt_limit
+        if effective_previous_attempt_limit is not None
+        else 20,
         seed=seed,
         include=tuple(include or ()),
         resume=resume,
@@ -577,6 +606,103 @@ def research_build_corpus(
     typer.echo(f"legacy_attempts: {summary.legacy_attempts}")
     typer.echo(f"corpus: {summary.corpus_path}")
     typer.echo(f"summary: {summary.summary_path}")
+
+
+@app.command("research-validate-corpus")
+def research_validate_corpus(
+    input: Annotated[
+        Path,
+        typer.Option(
+            "--input",
+            help="Research corpus directory, e.g. data/research/corpora/live-json-50.",
+            exists=True,
+            file_okay=False,
+            dir_okay=True,
+            readable=True,
+        ),
+    ],
+) -> None:
+    """Validate a local research corpus without opening an HTTP client."""
+    try:
+        summary = run_research_validate_corpus(input)
+    except BankError as exc:
+        typer.echo(f"research-validate-corpus failed: {exc}", err=True)
+        raise typer.Exit(bank_exit_code(exc)) from exc
+    typer.echo("research-validate-corpus completed")
+    typer.echo(f"input: {summary.input}")
+    typer.echo(f"valid: {summary.valid}")
+    typer.echo(f"errors: {summary.errors}")
+    typer.echo(f"warnings: {summary.warnings}")
+    typer.echo(f"report: {summary.report_json}")
+    typer.echo(f"markdown: {summary.report_markdown}")
+    if not summary.valid:
+        raise typer.Exit(2)
+
+
+@app.command("research-migrate-layout")
+def research_migrate_layout(
+    input: Annotated[
+        Path,
+        typer.Option(
+            "--input",
+            help="Research corpus directory, e.g. data/research/corpora/live-json-50.",
+            exists=True,
+            file_okay=False,
+            dir_okay=True,
+            readable=True,
+            writable=True,
+        ),
+    ],
+) -> None:
+    """Migrate a research corpus from legacy/ to previous/."""
+    try:
+        summary = run_research_migrate_layout(input)
+    except BankError as exc:
+        typer.echo(f"research-migrate-layout failed: {exc}", err=True)
+        raise typer.Exit(bank_exit_code(exc)) from exc
+    typer.echo("research-migrate-layout completed")
+    typer.echo(f"input: {summary.input}")
+    typer.echo(f"migrated: {summary.migrated}")
+    typer.echo(f"previous: {summary.previous_root}")
+    typer.echo(f"attempts: {summary.attempts_path}")
+    typer.echo(f"corpus: {summary.corpus_path}")
+
+
+@app.command("research-profile-corpus")
+def research_profile_corpus(
+    input: Annotated[
+        Path,
+        typer.Option(
+            "--input",
+            help="Research corpus directory, e.g. data/research/corpora/live-json-50.",
+            exists=True,
+            file_okay=False,
+            dir_okay=True,
+            readable=True,
+            writable=True,
+        ),
+    ],
+    rebuild_reports: Annotated[
+        bool,
+        typer.Option("--rebuild-reports/--no-rebuild-reports"),
+    ] = True,
+) -> None:
+    """Rebuild local research reports without opening an HTTP client."""
+    try:
+        summary = run_research_profile_corpus(input, rebuild_reports=rebuild_reports)
+    except BankError as exc:
+        typer.echo(f"research-profile-corpus failed: {exc}", err=True)
+        raise typer.Exit(bank_exit_code(exc)) from exc
+    typer.echo("research-profile-corpus completed")
+    typer.echo(f"input: {summary.input}")
+    typer.echo(f"raw_files: {summary.raw_files}")
+    typer.echo(f"raw_hashes_unchanged: {summary.raw_hashes_unchanged}")
+    typer.echo(f"active_catalog_records: {summary.catalog.active_records}")
+    typer.echo(f"all_statuses_records: {summary.catalog.all_statuses_records}")
+    typer.echo(f"documents: {summary.documents}")
+    typer.echo(f"sections: {summary.sections}")
+    typer.echo(f"pairs: {summary.pairs}")
+    typer.echo(f"findings: {summary.findings_path}")
 
 
 @app.command("bank-update")
