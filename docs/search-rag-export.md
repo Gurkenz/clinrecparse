@@ -40,3 +40,7 @@ Showcase text chunks exclude full table bodies. Tables are indexed through
 `image-chunks.jsonl` using source alt text, section context, and asset metadata
 only. No image descriptions, summaries, embeddings, model selection, or vector
 database writes are produced by the showcase command.
+
+Chunking is lossless. Oversized source units are split deterministically and
+record source fragments instead of trimming text. Text coverage, table coverage,
+and image occurrence coverage must each be 100% for a valid showcase build.

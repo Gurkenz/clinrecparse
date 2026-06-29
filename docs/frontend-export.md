@@ -27,3 +27,6 @@ production UI contract.
 Frontend consumers must resolve local paths relative to the frontend package.
 The normalized HTML must not contain base64 image data, unsafe tags, event
 handlers, or `javascript:` URLs.
+
+Every decoded local image occurrence must be present in frontend HTML with its
+`data-image-id`, and every referenced asset path must resolve inside the package.

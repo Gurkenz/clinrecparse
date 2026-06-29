@@ -30,3 +30,8 @@ Included packages:
 
 The command does not download PDFs, fetch external images, compute embeddings,
 create a vector index, update a production database, or generate summaries.
+
+The command uses `clinrec.parsed.pipeline.parse_document()` and shares the same
+canonical parser with `clinrec parsed-build`. Validation fails closed when raw
+occurrence counts, visible text preservation, block coverage, table-cell coverage,
+image coverage, citation titles, or deterministic rebuild checks fail.

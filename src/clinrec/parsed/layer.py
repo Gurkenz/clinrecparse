@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import base64
-import binascii
 import hashlib
 import json
 import re
@@ -23,10 +21,18 @@ from clinrec.bank.common import (
     sha256_bytes,
     sha256_file,
     string_value,
-    write_atomic_bytes,
+)
+from clinrec.parsed.pipeline import (
+    ParseConfig,
+    ParsedShowcaseOptions,
+    is_javascript_url,
+    resolve_showcase_input,
+)
+from clinrec.parsed.pipeline import (
+    parse_document as parse_canonical_document,
 )
 from clinrec.research.reports import write_json, write_jsonl
-from clinrec.research.sections import raw_sections, section_html, section_id_for
+from clinrec.research.sections import raw_sections, section_html
 
 PARSED_SCHEMA_VERSION = "1.0"
 PARSER_VERSION = "parsed-layer-1"
@@ -212,59 +218,44 @@ def select_raw_documents(options: ParsedBuildOptions) -> list[RawDocumentRef]:
 
 
 def parse_raw_document(state: BuildState, ref: RawDocumentRef) -> None:
-    raw_bytes = ref.raw_path.read_bytes()
-    payload_value = json.loads(raw_bytes.decode("utf-8"))
-    if not isinstance(payload_value, dict):
-        raise BankError("raw JSON root is not an object")
-    payload: dict[str, Any] = payload_value
-    raw_sha = sha256_bytes(raw_bytes)
     raw_relative = source_raw_path(state.source_root, ref.raw_path)
-    sections = [section for section in raw_sections(payload) if isinstance(section, dict)]
-    document_uid = document_uid_for(ref.kind, ref.code_version, ref.current_code_version)
+    source_root = ref.raw_path.parent
+    source = resolve_showcase_input(
+        ParsedShowcaseOptions(
+            output=state.output,
+            raw_json=ref.raw_path,
+            manifest=source_root / "manifest.json",
+            catalog_record=source_root / "catalog-record.json",
+            catalog_candidates=source_root / "catalog-candidates.json",
+            code_version=ref.code_version,
+        )
+    )
+    bundle = parse_canonical_document(
+        source,
+        ParseConfig(
+            root=state.output,
+            dataset_id=state.output.name,
+            created_at="",
+            repository_commit="",
+            build_config_sha256="",
+            document_kind=ref.kind,
+            current_code_version=ref.current_code_version,
+            source_raw_path=raw_relative,
+        ),
+    )
     document_dir = document_output_dir(state.output, ref)
     document_dir.mkdir(parents=True, exist_ok=True)
-    document_section_ids: list[str] = []
-    document: dict[str, Any] = {
-        "schema_version": PARSED_SCHEMA_VERSION,
-        "document_id": document_uid,
-        "document_kind": ref.kind,
-        "code_version": ref.code_version,
-        "current_code_version": ref.current_code_version,
-        "code": first_int(payload, "code", "Code"),
-        "version": first_int(payload, "version", "Version", "ver", "Ver"),
-        "db_id": first_int(payload, "db_id", "dbId", "DbId", "DB_ID"),
-        "title": document_title(payload),
-        "source_raw_path": raw_relative,
-        "source_raw_sha256": raw_sha,
-        "source_section_count": len(sections),
-        "sections": document_section_ids,
-        "warnings": [],
-    }
-    document_sections: list[dict[str, Any]] = []
-    document_tables: list[dict[str, Any]] = []
-    document_images: list[dict[str, Any]] = []
-    section_occurrences: Counter[str] = Counter()
-    for source_order, section in enumerate(sections, start=1):
-        source_section_id = section_id_for(section) or f"section_{source_order:04d}"
-        occurrence_index = section_occurrences[source_section_id]
-        section_occurrences[source_section_id] += 1
-        parsed_section, table_rows, image_rows = parse_section(
-            state,
-            ref,
-            section,
-            source_order=source_order,
-            source_section_id=source_section_id,
-            occurrence_index=occurrence_index,
-            raw_relative=raw_relative,
-            raw_sha=raw_sha,
-        )
-        document_sections.append(parsed_section)
-        document_tables.extend(table_rows)
-        document_images.extend(image_rows)
-        document_section_ids.append(string_value(parsed_section["section_id"]))
-    document["section_count"] = len(document_sections)
-    document["table_count"] = len(document_tables)
-    document["image_count"] = len(document_images)
+    document = dict(bundle.document)
+    document["schema_version"] = PARSED_SCHEMA_VERSION
+    document["sections"] = [string_value(row["section_id"]) for row in bundle.sections]
+    document["source_section_count"] = len(bundle.sections)
+    document["image_count"] = len(bundle.images)
+    document_sections = [layer_section_row(row, ref) for row in bundle.sections]
+    document_tables = [layer_table_row(row, ref) for row in bundle.tables]
+    document_images = [layer_image_row(row, ref, raw_relative) for row in bundle.images]
+    rag_chunks = [layer_chunk_row(row, ref) for row in bundle.chunks]
+    search_chunks = [search_chunk_from_rag(row) for row in rag_chunks]
+    copy_bundle_assets(state.output, bundle.assets)
     write_json(document_dir / "document.json", document)
     write_jsonl(document_dir / "sections.jsonl", document_sections)
     write_jsonl(document_dir / "tables.jsonl", document_tables)
@@ -273,361 +264,72 @@ def parse_raw_document(state: BuildState, ref: RawDocumentRef) -> None:
     state.sections.extend(document_sections)
     state.tables.extend(document_tables)
     state.images.extend(document_images)
+    state.rag_chunks.extend(rag_chunks)
+    state.search_chunks.extend(search_chunks)
+    state.citation_rows.extend(citation_row(row) for row in rag_chunks)
 
 
-def parse_section(
-    state: BuildState,
+def layer_section_row(row: dict[str, Any], ref: RawDocumentRef) -> dict[str, Any]:
+    section = dict(row)
+    section["schema_version"] = PARSED_SCHEMA_VERSION
+    section["document_kind"] = ref.kind
+    section["code_version"] = ref.code_version
+    section["current_code_version"] = ref.current_code_version
+    section["section_title"] = section.get("title")
+    section["source_order"] = int(section.get("source_order") or 0) + 1
+    return section
+
+
+def layer_table_row(row: dict[str, Any], ref: RawDocumentRef) -> dict[str, Any]:
+    table = dict(row)
+    table["schema_version"] = PARSED_SCHEMA_VERSION
+    table["document_kind"] = ref.kind
+    table["code_version"] = ref.code_version
+    table["current_code_version"] = ref.current_code_version
+    table["source_order"] = int(table.get("source_order") or 0) + 1
+    return table
+
+
+def layer_image_row(
+    row: dict[str, Any],
     ref: RawDocumentRef,
-    section: dict[str, Any],
-    *,
-    source_order: int,
-    source_section_id: str,
-    occurrence_index: int,
     raw_relative: str,
-    raw_sha: str,
-) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
-    section_key = f"{safe_id(source_section_id)}#{occurrence_index}"
-    document_uid = document_uid_for(ref.kind, ref.code_version, ref.current_code_version)
-    section_uid = f"{document_uid}:{section_key}"
-    raw_html = section_html(section)
-    normalized_html, image_rows = normalize_html(
-        state,
-        raw_html,
-        ref=ref,
-        section_uid=section_uid,
-        section_key=section_key,
-        source_order=source_order,
-        raw_relative=raw_relative,
-        raw_sha=raw_sha,
-    )
-    plain_text = visible_text(normalized_html)
-    table_rows = extract_tables(
-        normalized_html,
-        ref=ref,
-        section_uid=section_uid,
-        section_key=section_key,
-        source_order=source_order,
-        raw_relative=raw_relative,
-        raw_sha=raw_sha,
-    )
-    section_row = {
-        "schema_version": PARSED_SCHEMA_VERSION,
-        "section_id": section_uid,
-        "document_id": document_uid,
-        "document_kind": ref.kind,
-        "code_version": ref.code_version,
-        "current_code_version": ref.current_code_version,
-        "source_order": source_order,
-        "source_section_id": source_section_id,
-        "occurrence_index": occurrence_index,
-        "section_key": section_key,
-        "section_title": section_title(section),
-        "raw_html_sha256": sha256_text(raw_html),
-        "normalized_html": normalized_html,
-        "normalized_html_sha256": sha256_text(normalized_html),
-        "plain_text": plain_text,
-        "plain_text_sha256": sha256_text(plain_text),
-        "source_raw_path": raw_relative,
-        "source_raw_sha256": raw_sha,
-        "table_ids": [row["table_id"] for row in table_rows],
-        "image_ids": [row["image_id"] for row in image_rows],
-    }
-    append_chunks_for_section(state, section_row, table_rows)
-    return section_row, table_rows, image_rows
-
-
-def normalize_html(
-    state: BuildState,
-    raw_html: str,
-    *,
-    ref: RawDocumentRef,
-    section_uid: str,
-    section_key: str,
-    source_order: int,
-    raw_relative: str,
-    raw_sha: str,
-) -> tuple[str, list[dict[str, Any]]]:
-    soup = BeautifulSoup(raw_html, "html.parser")
-    for tag in soup.find_all(["script", "style"]):
-        tag.decompose()
-    image_rows: list[dict[str, Any]] = []
-    for image_index, image in enumerate(soup.find_all("img")):
-        if not isinstance(image, Tag):
-            continue
-        image_rows.append(
-            normalize_image(
-                state,
-                image,
-                ref=ref,
-                section_uid=section_uid,
-                section_key=section_key,
-                source_order=source_order,
-                image_index=image_index,
-                raw_relative=raw_relative,
-                raw_sha=raw_sha,
-            )
-        )
-    for tag in soup.find_all(True):
-        if not isinstance(tag, Tag):
-            continue
-        sanitize_attributes(tag)
-    return stable_html_fragment(soup), image_rows
-
-
-def normalize_image(
-    state: BuildState,
-    image: Tag,
-    *,
-    ref: RawDocumentRef,
-    section_uid: str,
-    section_key: str,
-    source_order: int,
-    image_index: int,
-    raw_relative: str,
-    raw_sha: str,
 ) -> dict[str, Any]:
-    src_present = image.has_attr("src")
-    src = string_value(image.get("src")) if src_present else ""
-    source_type = classify_image_src(src, src_present=src_present)
-    mime_type: str | None = None
-    asset_sha: str | None = None
-    asset_path: str | None = None
-    decoded_size: int | None = None
-    decode_error: str | None = None
-    if source_type == "base64":
-        mime_type, token = split_data_uri(src)
-        try:
-            decoded = base64.b64decode(token, validate=True)
-            decoded_size = len(decoded)
-            asset_sha = sha256_bytes(decoded)
-            asset_path = write_asset(state.output, decoded, mime_type)
-            image["src"] = asset_path
-            image["data-clinrec-asset-sha256"] = asset_sha
-        except (binascii.Error, ValueError) as exc:
-            decode_error = str(exc)
-            image["src"] = ""
-            image["data-clinrec-image-status"] = "decode_failed"
-    image_id = f"{section_uid}:image#{image_index:04d}"
-    image["data-clinrec-image-id"] = image_id
-    return {
-        "schema_version": PARSED_SCHEMA_VERSION,
-        "image_id": image_id,
-        "occurrence_id": image_id,
-        "section_id": section_uid,
-        "document_id": document_uid_for(ref.kind, ref.code_version, ref.current_code_version),
-        "document_kind": ref.kind,
-        "code_version": ref.code_version,
-        "current_code_version": ref.current_code_version,
-        "section_key": section_key,
-        "source_order": source_order,
-        "image_index": image_index,
-        "source_type": source_type,
-        "mime_type": mime_type,
-        "asset_id": f"sha256:{asset_sha}" if asset_sha is not None else None,
-        "asset_sha256": asset_sha,
-        "asset_path": asset_path,
-        "decoded_size_bytes": decoded_size,
-        "decode_error": decode_error,
-        "alt": string_value(image.get("alt")),
-        "source_raw_path": raw_relative,
-        "source_raw_sha256": raw_sha,
-    }
+    image = dict(row)
+    image["schema_version"] = PARSED_SCHEMA_VERSION
+    image["document_kind"] = ref.kind
+    image["code_version"] = ref.code_version
+    image["current_code_version"] = ref.current_code_version
+    image["source_raw_path"] = raw_relative
+    image["source_order"] = int(image.get("source_order") or 0) + 1
+    return image
 
 
-def sanitize_attributes(tag: Tag) -> None:
-    for attr in list(tag.attrs):
-        lowered = attr.casefold()
-        value = tag.get(attr)
-        if lowered.startswith("on"):
-            del tag.attrs[attr]
+def layer_chunk_row(row: dict[str, Any], ref: RawDocumentRef) -> dict[str, Any]:
+    chunk = dict(row)
+    chunk["schema_version"] = PARSED_SCHEMA_VERSION
+    chunk["document_kind"] = ref.kind
+    chunk["current_code_version"] = ref.current_code_version
+    chunk["section_title"] = chunk.get("section_title")
+    chunk["context_text"] = string_value(chunk.get("section_title"))
+    table_id = string_value(chunk.get("table_id"))
+    image_id = string_value(chunk.get("image_id"))
+    chunk["table_ids"] = [table_id] if table_id else []
+    chunk["image_ids"] = [image_id] if image_id else []
+    return chunk
+
+
+def copy_bundle_assets(output: Path, assets: list[dict[str, Any]]) -> None:
+    for asset in assets:
+        relative = string_value(asset.get("path"))
+        if not relative:
             continue
-        if lowered in {"href", "src"} and javascript_url(value):
-            del tag.attrs[attr]
-
-
-def javascript_url(value: Any) -> bool:
-    if isinstance(value, list):
-        text = " ".join(str(item) for item in value)
-    else:
-        text = str(value or "")
-    return text.strip().casefold().startswith("javascript:")
-
-
-def stable_html_fragment(soup: BeautifulSoup) -> str:
-    root = soup.body if soup.body is not None else soup
-    return "".join(str(child) for child in root.children)
-
-
-def write_asset(output: Path, content: bytes, mime_type: str | None) -> str:
-    asset_sha = sha256_bytes(content)
-    extension = extension_for_mime(mime_type)
-    relative = f"assets/by-sha256/{asset_sha}.{extension}"
-    write_atomic_bytes(output / relative, content)
-    return relative
-
-
-def extract_tables(
-    html: str,
-    *,
-    ref: RawDocumentRef,
-    section_uid: str,
-    section_key: str,
-    source_order: int,
-    raw_relative: str,
-    raw_sha: str,
-) -> list[dict[str, Any]]:
-    soup = BeautifulSoup(html, "html.parser")
-    rows: list[dict[str, Any]] = []
-    for table_index, table in enumerate(soup.find_all("table")):
-        if not isinstance(table, Tag):
+        source = output / "canonical" / relative
+        target = output / relative
+        if not source.exists() or target.exists():
             continue
-        table_id = f"{section_uid}:table#{table_index + 1:04d}"
-        table_rows = table_grid(table)
-        classification = table_classification(table, table_rows)
-        row = {
-            "schema_version": PARSED_SCHEMA_VERSION,
-            "table_id": table_id,
-            "section_id": section_uid,
-            "document_id": document_uid_for(ref.kind, ref.code_version, ref.current_code_version),
-            "document_kind": ref.kind,
-            "code_version": ref.code_version,
-            "current_code_version": ref.current_code_version,
-            "section_key": section_key,
-            "source_order": source_order,
-            "table_index": table_index,
-            "classification": classification,
-            "rows": table_rows,
-            "row_count": len(table_rows),
-            "column_count": max((len(item) for item in table_rows), default=0),
-            "html_sha256": sha256_text(str(table)),
-            "plain_text_sha256": sha256_text(table.get_text(" ", strip=True)),
-            "source_raw_path": raw_relative,
-            "source_raw_sha256": raw_sha,
-        }
-        rows.append(row)
-    return rows
-
-
-def table_grid(table: Tag) -> list[list[dict[str, Any]]]:
-    rows: list[list[dict[str, Any]]] = []
-    tr_items = [
-        item
-        for item in table.find_all("tr")
-        if isinstance(item, Tag) and nearest_table(item) == table
-    ]
-    for row_index, tr in enumerate(tr_items):
-        if not isinstance(tr, Tag):
-            continue
-        cells: list[dict[str, Any]] = []
-        cell_items = [
-            item
-            for item in tr.find_all(["td", "th"])
-            if isinstance(item, Tag) and nearest_table(item) == table
-        ]
-        for column_index, cell in enumerate(cell_items):
-            if not isinstance(cell, Tag):
-                continue
-            cells.append(
-                {
-                    "row_index": row_index,
-                    "column_index": column_index,
-                    "tag": cell.name,
-                    "text": visible_text(str(cell)),
-                    "rowspan": positive_int(cell.get("rowspan")),
-                    "colspan": positive_int(cell.get("colspan")),
-                }
-            )
-        rows.append(cells)
-    return rows
-
-
-def nearest_table(tag: Tag) -> Tag | None:
-    parent = tag.find_parent("table")
-    return parent if isinstance(parent, Tag) else None
-
-
-def table_classification(table: Tag, rows: list[list[dict[str, Any]]]) -> str:
-    if not rows or not any(rows):
-        return "malformed"
-    if table.find("table") is not None:
-        return "nested"
-    widths = {sum(int(cell.get("colspan") or 1) for cell in row) for row in rows}
-    has_spans = any(
-        int(cell.get("rowspan") or 1) > 1 or int(cell.get("colspan") or 1) > 1
-        for row in rows
-        for cell in row
-    )
-    if len(widths) == 1 and not has_spans:
-        return "simple_rectangular"
-    return "complex"
-
-
-def append_chunks_for_section(
-    state: BuildState,
-    section: dict[str, Any],
-    tables: list[dict[str, Any]],
-) -> None:
-    text = string_value(section.get("plain_text"))
-    if text:
-        chunk_index = next_chunk_index(state.rag_chunks, string_value(section["section_id"]))
-        chunk = chunk_for_text(section, text, chunk_index=chunk_index, table_ids=[])
-        state.search_chunks.append(search_chunk_from_rag(chunk))
-        state.rag_chunks.append(chunk)
-        state.citation_rows.append(citation_row(chunk))
-    for table in tables:
-        table_text = table_text_for_chunk(table)
-        if not table_text:
-            continue
-        chunk_index = next_chunk_index(state.rag_chunks, string_value(section["section_id"]))
-        chunk = chunk_for_text(
-            section,
-            table_text,
-            chunk_index=chunk_index,
-            table_ids=[string_value(table.get("table_id"))],
-        )
-        state.search_chunks.append(search_chunk_from_rag(chunk))
-        state.rag_chunks.append(chunk)
-        state.citation_rows.append(citation_row(chunk))
-
-
-def chunk_for_text(
-    section: dict[str, Any],
-    text: str,
-    *,
-    chunk_index: int,
-    table_ids: list[str],
-) -> dict[str, Any]:
-    code_version = string_value(section.get("code_version"))
-    section_key = string_value(section.get("section_key"))
-    chunk_id = f"{code_version}:{section_key}:chunk#{chunk_index:04d}"
-    return {
-        "schema_version": PARSED_SCHEMA_VERSION,
-        "chunk_id": chunk_id,
-        "code_version": code_version,
-        "document_kind": section.get("document_kind"),
-        "current_code_version": section.get("current_code_version"),
-        "document_title": None,
-        "section_id": section.get("section_id"),
-        "section_key": section_key,
-        "section_title": section.get("section_title"),
-        "chunk_index": chunk_index,
-        "text": text,
-        "context_text": string_value(section.get("section_title")),
-        "token_estimate": estimate_tokens(text),
-        "source_raw_path": section.get("source_raw_path"),
-        "source_raw_sha256": section.get("source_raw_sha256"),
-        "section_html_sha256": section.get("normalized_html_sha256"),
-        "plain_text_sha256": section.get("plain_text_sha256"),
-        "table_ids": table_ids,
-        "image_ids": section.get("image_ids") or [],
-        "citation": {
-            "code_version": code_version,
-            "section_key": section_key,
-            "section_title": section.get("section_title"),
-            "source_order": section.get("source_order"),
-            "source_raw_sha256": section.get("source_raw_sha256"),
-        },
-    }
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, target)
 
 
 def search_chunk_from_rag(chunk: dict[str, Any]) -> dict[str, Any]:
@@ -651,20 +353,6 @@ def citation_row(chunk: dict[str, Any]) -> dict[str, Any]:
         "chunk_id": chunk["chunk_id"],
         "citation": chunk["citation"],
     }
-
-
-def next_chunk_index(chunks: list[dict[str, Any]], section_id: str) -> int:
-    return 1 + sum(1 for chunk in chunks if chunk.get("section_id") == section_id)
-
-
-def table_text_for_chunk(table: dict[str, Any]) -> str:
-    lines: list[str] = []
-    for row in table.get("rows", []):
-        if isinstance(row, list):
-            text = " | ".join(string_value(cell.get("text")) for cell in row if cell.get("text"))
-            if text:
-                lines.append(text)
-    return "\n".join(lines)
 
 
 def build_relations(documents: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -883,7 +571,7 @@ def validate_section_html(section: dict[str, Any], errors: list[dict[str, Any]])
                 errors.append(
                     issue(string_value(section.get("section_id")), "unsafe_event_handler", attr)
                 )
-            if attr.casefold() in {"href", "src"} and javascript_url(tag.get(attr)):
+            if attr.casefold() in {"href", "src"} and is_javascript_url(tag.get(attr)):
                 errors.append(
                     issue(string_value(section.get("section_id")), "unsafe_javascript_url", attr)
                 )

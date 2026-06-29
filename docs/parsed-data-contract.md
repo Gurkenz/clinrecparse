@@ -25,6 +25,7 @@ Showcase-only files:
 - `canonical/recommendations.jsonl`
 - `canonical/references.jsonl`
 - `canonical/chunks.jsonl`
+- `canonical/coverage-map.json`
 - `canonical/tables/{table_safe_id}/table.html`
 - `canonical/tables/{table_safe_id}/table.json`
 - `canonical/tables/{table_safe_id}/table.csv`
@@ -51,3 +52,7 @@ asset can appear more than once in a document.
 Tables are represented both as table records and physical cell records.
 Showcase ML exports keep normal text chunks, table chunks, and image-context
 chunks separate so full tables are not duplicated into ordinary text chunks.
+
+`parsed-build` and `parsed-build-showcase` both consume the same
+`ParsedDocumentBundle`. Export layers must not re-parse raw JSON. Coverage is
+reported in `coverage-map.json` and the validation reports under `reports/`.

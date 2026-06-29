@@ -37,3 +37,6 @@ Image occurrence IDs and asset IDs are separate. Backends should import both
 relationships if they need to distinguish repeated placements of the same file.
 The showcase contract is a pilot import contract and must not be treated as a
 production-final schema.
+
+Backend packages are written from the canonical parsed bundle. They must not
+sanitize HTML, rebuild tables, decode images, or create chunks independently.

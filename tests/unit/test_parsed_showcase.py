@@ -121,3 +121,50 @@ def test_showcase_builds_zip_and_keeps_occurrence_identity(tmp_path: Path) -> No
     assert "data:image/" not in (output / "frontend" / "document.json").read_text(
         encoding="utf-8"
     )
+
+
+def test_showcase_preserves_long_text_grades_and_wrapped_images(tmp_path: Path) -> None:
+    corpus = tmp_path / "corpus"
+    long_text = " ".join(f"source-word-{index}" for index in range(1800))
+    sections = [
+        {
+            "id": "treatment",
+            "title": "3. Treatment",
+            "content": (
+                f"<p>{long_text}</p>"
+                "<p><strong>Рекомендуется</strong> выполнить контроль [1].</p>"
+                "<p>Уровень убедительности рекомендаций – С "
+                "(уровень достоверности доказательств – 5)</p>"
+                "<p><img alt='wrapped scan' src='data:image/png;base64,"
+                f"{PNG_1X1}'></p>"
+            ),
+        }
+    ]
+    write_corpus_document(corpus, "270_3", sections)
+
+    summary = build_parsed_showcase(
+        ParsedShowcaseOptions(
+            input_corpus=corpus,
+            code_version="270_3",
+            output=tmp_path / "showcase" / "270_3",
+        )
+    )
+
+    output = summary.output
+    chunks = read_jsonl(output / "canonical" / "chunks.jsonl")
+    recommendations = read_jsonl(output / "canonical" / "recommendations.jsonl")
+    validation = json.loads(
+        (output / "reports" / "showcase-validation.json").read_text(encoding="utf-8")
+    )
+    frontend = (output / "frontend" / "document.json").read_text(encoding="utf-8")
+
+    assert validation["valid"]
+    assert validation["summary"]["text_index_coverage_percent"] == 100.0
+    assert validation["summary"]["silent_truncations"] == 0
+    assert max(chunk["token_estimate"] for chunk in chunks) <= 1100
+    assert all(chunk["citation"]["document_title"] for chunk in chunks)
+    assert any("source-word-1799" in chunk["text"] for chunk in chunks)
+    assert recommendations[0]["uur"] == "C"
+    assert recommendations[0]["udd"] == "5"
+    assert "data-image-id" in frontend
+    assert "wrapped scan" in frontend

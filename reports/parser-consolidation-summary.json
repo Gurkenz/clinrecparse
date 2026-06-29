@@ -1,0 +1,113 @@
+{
+  "architecture": {
+    "duplicated_layer_parser_removed": true,
+    "layer_line_count_after": 1064,
+    "modules_created": [
+      "src/clinrec/parsed/models.py",
+      "src/clinrec/parsed/pipeline.py"
+    ],
+    "showcase_line_count_after": 25,
+    "showcase_line_count_before": 2578
+  },
+  "artifact": {
+    "archive_path": "data/showcase/clinrec-showcase-843_1.zip",
+    "archive_sha256": "d289ff940507d78b31a5ee7b0ff99fe9101dab6c3543a3838cb48e76f901d85b",
+    "archive_size": 8189521,
+    "dataset_repository_commit": "a19174efc59d780d4fd416b0beff6e76140873e2",
+    "output_path": "data/showcase/843_1",
+    "zip_verified": true
+  },
+  "coverage": {
+    "image_occurrence_percent": 100.0,
+    "silent_truncations": 0,
+    "table_index_percent": 100.0,
+    "text_index_percent": 100.0,
+    "visible_text_percent": 100
+  },
+  "real_document": {
+    "assets": 30,
+    "blocks": 832,
+    "code_version": "843_1",
+    "image_chunks": 30,
+    "image_occurrences": 30,
+    "max_chunk_tokens": 1097,
+    "raw_sha256": "05783d290cae2e7cf5120220291d41fc0bf44e6e0462e9b8c872d6d684291956",
+    "recommendations": 112,
+    "recommendations_with_udd": 96,
+    "recommendations_with_uur": 96,
+    "sections": 31,
+    "table_cells": 348,
+    "table_chunks": 16,
+    "tables": 14,
+    "text_chunks": 78,
+    "title": "Глаукомы вторичные"
+  },
+  "remaining_risks": [
+    {
+      "code": "empty_section",
+      "details": null,
+      "path": "current:843_1:doc_whole#0"
+    },
+    {
+      "code": "empty_section",
+      "details": null,
+      "path": "current:843_1:doc_key_words#0"
+    },
+    {
+      "code": "unknown_html_tag_removed",
+      "details": null,
+      "path": "current:843_1:doc_3#0"
+    },
+    {
+      "code": "oversized_sentence_split",
+      "details": {
+        "pieces": 11,
+        "token_estimate": 11926
+      },
+      "path": "current:843_1:doc_bible#0:block#0"
+    },
+    {
+      "code": "oversized_sentence_split",
+      "details": {
+        "pieces": 2,
+        "token_estimate": 1782
+      },
+      "path": "current:843_1:doc_a1#0:block#0"
+    },
+    {
+      "code": "oversized_sentence_split",
+      "details": {
+        "pieces": 2,
+        "token_estimate": 1816
+      },
+      "path": "current:843_1:doc_a3#0:block#1"
+    },
+    {
+      "code": "legacy_parse_command_not_removed",
+      "details": "Legacy parse command still preserves old per-document contract; parsed-build and showcase do not use it."
+    }
+  ],
+  "repository": {
+    "base_commit": "a19174efc59d780d4fd416b0beff6e76140873e2",
+    "branch": "codex/clinrec-raw-bank-transactional-lifecycle",
+    "dataset_repository_commit": "a19174efc59d780d4fd416b0beff6e76140873e2",
+    "final_commit": null
+  },
+  "tests": {
+    "mypy": "passed",
+    "pytest_count": 113,
+    "pytest_failed": 0,
+    "pytest_passed": true,
+    "ruff": "passed"
+  },
+  "validation": {
+    "chunks_over_maximum": 0,
+    "citation_titles_missing": 0,
+    "determinism": true,
+    "hard_errors": 0,
+    "unresolved_foreign_keys": 0,
+    "unsafe_html": 0,
+    "valid": true,
+    "warnings": 6
+  }
+}

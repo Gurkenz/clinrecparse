@@ -162,9 +162,6 @@ IMAGE_SIGNATURES = {
     "image/png": (b"\x89PNG\r\n\x1a\n",),
     "image/webp": (b"RIFF",),
 }
-CHUNK_TEXT_LIMIT = 4000
-
-
 def parse_documents(settings: Settings, options: ParseOptions) -> ParseSummary:
     timestamp = options.timestamp or utc_timestamp()
     candidates = select_document_dirs(settings, options)
@@ -1294,7 +1291,7 @@ def build_search_chunks(document: dict[str, Any], state: ParseState) -> list[dic
                 "document_id": document_id,
                 "type": "recommendation",
                 "section_path": section_path(section),
-                "text": limit_chunk_text(str(recommendation.get("text") or "")),
+                "text": preserve_chunk_text(str(recommendation.get("text") or "")),
                 "uur": recommendation.get("uur"),
                 "udd": recommendation.get("udd"),
                 "comments": recommendation.get("comments"),
@@ -1323,7 +1320,7 @@ def build_search_chunks(document: dict[str, Any], state: ParseState) -> list[dic
                     "document_id": document_id,
                     "type": "section_text",
                     "section_path": section_path(section),
-                    "text": limit_chunk_text(text),
+                    "text": preserve_chunk_text(text),
                 }
             )
     for table in state.tables:
@@ -1344,7 +1341,7 @@ def build_search_chunks(document: dict[str, Any], state: ParseState) -> list[dic
                     "document_id": document_id,
                     "type": "table_row",
                     "section_path": section_path(section),
-                    "text": limit_chunk_text(text),
+                    "text": preserve_chunk_text(text),
                     "table_id": table.get("id"),
                     "row": row.get("index"),
                 }
@@ -1362,7 +1359,7 @@ def build_search_chunks(document: dict[str, Any], state: ParseState) -> list[dic
                 "document_id": document_id,
                 "type": "image_caption",
                 "section_path": section_path(section),
-                "text": limit_chunk_text(alt),
+                "text": preserve_chunk_text(alt),
                 "image_id": image.get("id"),
             }
         )
@@ -1379,8 +1376,8 @@ def section_path(section: dict[str, Any]) -> list[dict[str, Any]]:
     return [{"id": section.get("section_id"), "title": section.get("title")}]
 
 
-def limit_chunk_text(text: str) -> str:
-    return text[:CHUNK_TEXT_LIMIT]
+def preserve_chunk_text(text: str) -> str:
+    return text
 
 
 def write_qa_report(
