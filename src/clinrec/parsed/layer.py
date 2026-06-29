@@ -1066,17 +1066,45 @@ def validate_document(
                     {"raw": raw_total, "parsed": parsed_total},
                 )
             )
+    document_tables = table_rows_by_document.get(document_id, [])
+    table_order = {
+        string_value(table.get("table_id")): index
+        for index, table in enumerate(
+            sorted(
+                document_tables,
+                key=lambda row: (
+                    int(row.get("source_order") or 0),
+                    int(row.get("table_index") or 0),
+                ),
+            )
+        )
+    }
     raw_cell_hashes = [record.text_sha256 for record in inventory.table_cells]
     parsed_cell_hashes = [
         string_value(row.get("text_sha256"))
-        for row in table_cell_rows_by_document.get(document_id, [])
+        for row in sorted(
+            table_cell_rows_by_document.get(document_id, []),
+            key=lambda item: (
+                table_order.get(string_value(item.get("table_id")), 0),
+                int(item.get("row_index") or 0),
+                int(item.get("column_index") or 0),
+                int(item.get("cell_index") or 0),
+            ),
+        )
     ]
     if raw_cell_hashes != parsed_cell_hashes:
         errors.append(issue(document_id, "raw_table_cell_text_mismatch", None))
     raw_placement_hashes = [record.text_sha256 for record in inventory.table_placements]
     parsed_placement_hashes = [
         string_value(row.get("text_sha256"))
-        for row in table_placement_rows_by_document.get(document_id, [])
+        for row in sorted(
+            table_placement_rows_by_document.get(document_id, []),
+            key=lambda item: (
+                table_order.get(string_value(item.get("table_id")), 0),
+                int(item.get("logical_row") or 0),
+                int(item.get("logical_column") or 0),
+            ),
+        )
     ]
     if raw_placement_hashes != parsed_placement_hashes:
         errors.append(issue(document_id, "raw_table_placement_text_mismatch", None))
