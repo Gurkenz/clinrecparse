@@ -7,6 +7,7 @@ import html
 import json
 import re
 import shutil
+import tempfile
 import zipfile
 from collections import Counter
 from collections.abc import Iterable
@@ -14,7 +15,6 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
 
 from bs4 import BeautifulSoup
 from bs4.element import NavigableString, PageElement, Tag
@@ -30,6 +30,23 @@ from clinrec.bank.common import (
     stable_json_dumps,
     string_value,
 )
+from clinrec.parsed.html import (
+    GENERATED_SAFE_ATTRS,
+    SAFE_ATTRS_BY_TAG,
+    SAFE_TAGS,
+    UNSAFE_TAGS,
+    add_section_attributes,
+    fragment_html,
+    inner_html,
+    is_safe_url,
+    meaningful_children,
+    nearest_table,
+    normalize_text,
+    positive_span,
+    sanitize_html_tree,
+    table_cell_text,
+    visible_text,
+)
 from clinrec.parsed.models import (
     CANONICAL_PARSER_VERSION,
     CANONICAL_SCHEMA_VERSION,
@@ -37,6 +54,10 @@ from clinrec.parsed.models import (
     extension_for_mime,
     safe_id,
     sha256_text,
+)
+from clinrec.parsed.source_inventory import (
+    RawSectionRecord,
+    build_raw_source_inventory,
 )
 from clinrec.research.reports import write_json, write_jsonl
 from clinrec.research.sections import section_html, section_id_for
@@ -47,58 +68,6 @@ DEFAULT_SHOWCASE_CODE_VERSION = "843_1"
 CHUNK_TARGET_TOKENS = 700
 CHUNK_MAXIMUM_TOKENS = 1100
 TOKEN_CHAR_BUDGET = CHUNK_MAXIMUM_TOKENS * 4
-UNSAFE_TAGS = {
-    "script",
-    "style",
-    "iframe",
-    "object",
-    "embed",
-    "form",
-    "input",
-    "button",
-    "meta",
-    "link",
-}
-SAFE_TAGS = {
-    "a",
-    "b",
-    "blockquote",
-    "br",
-    "caption",
-    "col",
-    "colgroup",
-    "dd",
-    "div",
-    "dl",
-    "dt",
-    "em",
-    "h1",
-    "h2",
-    "h3",
-    "h4",
-    "h5",
-    "h6",
-    "hr",
-    "i",
-    "img",
-    "li",
-    "ol",
-    "p",
-    "section",
-    "span",
-    "strong",
-    "sub",
-    "sup",
-    "table",
-    "tbody",
-    "td",
-    "tfoot",
-    "th",
-    "thead",
-    "tr",
-    "u",
-    "ul",
-}
 HEADING_TAGS = {f"h{level}" for level in range(1, 7)}
 DATA_URI_RE = re.compile(
     r"^data:(?P<mime>[-\w.+]+/[-\w.+]+)(?:;[-\w.+]+=[^;,]+)*;base64,(?P<data>.*)$",
@@ -139,50 +108,6 @@ IMAGE_SIGNATURES = {
     "image/webp": (b"RIFF",),
     "image/gif": (b"GIF87a", b"GIF89a"),
 }
-RAW_CHILD_SECTION_KEYS = (
-    "sections",
-    "Sections",
-    "children",
-    "Children",
-    "items",
-    "Items",
-    "subsections",
-    "Subsections",
-)
-SAFE_URL_SCHEMES = {"", "http", "https", "mailto"}
-SAFE_ATTRS_BY_TAG = {
-    "*": {"title", "aria-label"},
-    "a": {"href", "title"},
-    "img": {"src", "alt", "title", "width", "height"},
-    "td": {"rowspan", "colspan"},
-    "th": {"rowspan", "colspan", "scope"},
-    "ol": {"start", "type"},
-    "ul": {"type"},
-}
-GENERATED_SAFE_ATTRS = {
-    "data-section-id",
-    "data-table-id",
-    "data-image-id",
-    "data-asset-id",
-    "data-image-status",
-}
-
-
-@dataclass(frozen=True)
-class RawSectionRecord:
-    section: dict[str, Any]
-    raw_path: str
-    parent_raw_path: str | None
-    source_order: int
-    depth: int
-
-
-@dataclass(frozen=True)
-class RawSourceInventory:
-    sections: list[RawSectionRecord]
-    errors: list[dict[str, Any]]
-
-
 class ShowcaseError(RuntimeError):
     pass
 
@@ -632,12 +557,6 @@ def validate_parsed_bundle(bundle: ParsedDocumentBundle) -> dict[str, Any]:
     inventory = build_raw_source_inventory(bundle.state.source.payload)
     errors.extend(inventory.errors)
     raw_sections_count = len(inventory.sections)
-    raw_table_count = 0
-    raw_image_count = 0
-    for record in inventory.sections:
-        soup = BeautifulSoup(section_html(record.section), "lxml")
-        raw_table_count += len([tag for tag in soup.find_all("table") if isinstance(tag, Tag)])
-        raw_image_count += len([tag for tag in soup.find_all("img") if isinstance(tag, Tag)])
     raw_paths = {record.raw_path for record in inventory.sections}
     parsed_paths = {string_value(section.get("raw_path")) for section in bundle.sections}
     for missing_path in sorted(raw_paths - parsed_paths):
@@ -658,10 +577,13 @@ def validate_parsed_bundle(bundle: ParsedDocumentBundle) -> dict[str, Any]:
     }
     source_counts = {
         "sections": raw_sections_count,
-        "tables": raw_table_count,
-        "images": raw_image_count,
+        "text_units": len(inventory.text_units),
+        "tables": len(inventory.tables),
+        "table_cells": len(inventory.table_cells),
+        "logical_table_placements": len(inventory.table_placements),
+        "images": len(inventory.images),
     }
-    for key in ("sections", "tables", "images"):
+    for key in ("sections", "tables", "table_cells", "logical_table_placements", "images"):
         if source_counts[key] != parsed_counts[key]:
             errors.append(
                 issue(
@@ -670,6 +592,34 @@ def validate_parsed_bundle(bundle: ParsedDocumentBundle) -> dict[str, Any]:
                     {"raw": source_counts[key], "parsed": parsed_counts[key]},
                 )
             )
+    raw_cell_hashes = [record.text_sha256 for record in inventory.table_cells]
+    parsed_cell_hashes = [string_value(row.get("text_sha256")) for row in bundle.table_cells]
+    if raw_cell_hashes != parsed_cell_hashes:
+        errors.append(
+            issue(
+                bundle.document.get("document_id", "document"),
+                "raw_table_cell_text_mismatch",
+                {
+                    "raw_cells": len(raw_cell_hashes),
+                    "parsed_cells": len(parsed_cell_hashes),
+                },
+            )
+        )
+    raw_placement_hashes = [record.text_sha256 for record in inventory.table_placements]
+    parsed_placement_hashes = [
+        string_value(row.get("text_sha256")) for row in bundle.table_placements
+    ]
+    if raw_placement_hashes != parsed_placement_hashes:
+        errors.append(
+            issue(
+                bundle.document.get("document_id", "document"),
+                "raw_table_placement_text_mismatch",
+                {
+                    "raw_placements": len(raw_placement_hashes),
+                    "parsed_placements": len(parsed_placement_hashes),
+                },
+            )
+        )
     validate_duplicate_ids(
         errors,
         (
@@ -712,6 +662,7 @@ def validate_parsed_bundle(bundle: ParsedDocumentBundle) -> dict[str, Any]:
         errors,
     )
     validate_chunks(bundle.tables, bundle.images, bundle.chunks, errors)
+    validate_recommendation_chunks(bundle.blocks, bundle.recommendations, bundle.chunks, errors)
     validate_citation_titles(bundle.chunks, errors)
     coverage = coverage_map_for_state(bundle.state)
     for report in (coverage["text"], coverage["tables"], coverage["images"]):
@@ -756,108 +707,6 @@ def copy_source_files(root: Path, source: ShowcaseInput) -> None:
     ):
         if path is not None:
             shutil.copyfile(path, source_root / name)
-
-
-def build_raw_source_inventory(payload: dict[str, Any]) -> RawSourceInventory:
-    obj_value = payload.get("obj")
-    obj = obj_value if isinstance(obj_value, dict) else {}
-    sections_value = obj.get("sections")
-    records: list[RawSectionRecord] = []
-    errors: list[dict[str, Any]] = []
-    if not isinstance(sections_value, list):
-        errors.append(issue("obj.sections", "raw_sections_not_list", type(sections_value).__name__))
-        return RawSourceInventory(sections=records, errors=errors)
-    append_raw_section_records(
-        records,
-        errors,
-        sections_value,
-        parent_raw_path=None,
-        container_path="obj.sections",
-        depth=0,
-    )
-    return RawSourceInventory(sections=records, errors=errors)
-
-
-def append_raw_section_records(
-    records: list[RawSectionRecord],
-    errors: list[dict[str, Any]],
-    items: list[Any],
-    *,
-    parent_raw_path: str | None,
-    container_path: str,
-    depth: int,
-) -> None:
-    for index, item in enumerate(items):
-        raw_path = f"{container_path}[{index}]"
-        if not isinstance(item, dict):
-            errors.append(issue(raw_path, "raw_section_not_object", type(item).__name__))
-            continue
-        source_order = len(records)
-        records.append(
-            RawSectionRecord(
-                section=item,
-                raw_path=raw_path,
-                parent_raw_path=parent_raw_path,
-                source_order=source_order,
-                depth=depth,
-            )
-        )
-        for child_key in RAW_CHILD_SECTION_KEYS:
-            if child_key not in item:
-                continue
-            child_value = item.get(child_key)
-            child_path = f"{raw_path}.{child_key}"
-            if not isinstance(child_value, list):
-                errors.append(
-                    issue(child_path, "raw_child_sections_not_list", type(child_value).__name__)
-                )
-                continue
-            section_like_children = [
-                child for child in child_value if is_raw_section_like_child(child)
-            ]
-            malformed_children = [
-                child for child in child_value if not is_raw_section_like_child(child)
-            ]
-            if malformed_children and section_like_children:
-                errors.append(
-                    issue(
-                        child_path,
-                        "raw_child_section_container_mixed",
-                        {"items": len(child_value), "section_like": len(section_like_children)},
-                    )
-                )
-            if not section_like_children:
-                continue
-            append_raw_section_records(
-                records,
-                errors,
-                child_value,
-                parent_raw_path=raw_path,
-                container_path=child_path,
-                depth=depth + 1,
-            )
-
-
-def is_raw_section_like_child(value: Any) -> bool:
-    if not isinstance(value, dict):
-        return False
-    section_keys = {
-        "id",
-        "Id",
-        "ID",
-        "title",
-        "Title",
-        "name",
-        "Name",
-        "content",
-        "Content",
-        "html",
-        "Html",
-        "HTML",
-        "text",
-        "Text",
-    }
-    return bool(section_keys.intersection(value) or set(RAW_CHILD_SECTION_KEYS).intersection(value))
 
 
 def raw_section_id(record: RawSectionRecord) -> str:
@@ -1095,6 +944,8 @@ def process_section_images(
                     content,
                     declared_mime_type=declared_mime_type,
                     detected_mime_type=detected_mime_type,
+                    width=width,
+                    height=height,
                     occurrence_id=image_id,
                 )
                 resolution_status = "resolved"
@@ -1830,8 +1681,77 @@ def append_text_chunk(
         primary_block_ids=primary_block_ids,
         overlap_block_ids=[],
         source_fragments=source_fragments,
-        extra={},
+        extra=recommendation_metadata_for_blocks(state, primary_block_ids),
     )
+
+
+def recommendation_metadata_for_blocks(
+    state: ShowcaseState,
+    block_ids: list[str],
+) -> dict[str, Any]:
+    block_id_set = {string_value(block_id) for block_id in block_ids}
+    matched = [
+        recommendation
+        for recommendation in state.recommendations
+        if block_id_set.intersection(
+            {string_value(value) for value in (recommendation.get("block_ids") or [])}
+        )
+    ]
+    if not matched:
+        return {}
+    recommendation_ids = [
+        string_value(recommendation.get("recommendation_id")) for recommendation in matched
+    ]
+    return {
+        "recommendation_ids": recommendation_ids,
+        "recommendation_block_ids": sorted(
+            {
+                string_value(value)
+                for recommendation in matched
+                for value in (recommendation.get("recommendation_block_ids") or [])
+                if string_value(value) in block_id_set
+            }
+        ),
+        "comment_block_ids": sorted(
+            {
+                string_value(value)
+                for recommendation in matched
+                for value in (recommendation.get("comment_block_ids") or [])
+                if string_value(value) in block_id_set
+            }
+        ),
+        "grade_block_ids": sorted(
+            {
+                string_value(value)
+                for recommendation in matched
+                for value in (recommendation.get("grade_block_ids") or [])
+                if string_value(value) in block_id_set
+            }
+        ),
+        "reference_block_ids": sorted(
+            {
+                string_value(value)
+                for recommendation in matched
+                for value in (recommendation.get("reference_block_ids") or [])
+                if string_value(value) in block_id_set
+            }
+        ),
+        "recommendation_reference_ids": sorted(
+            {
+                string_value(value)
+                for recommendation in matched
+                for value in (recommendation.get("reference_ids") or [])
+            }
+        ),
+        "uur": next(
+            (recommendation.get("uur") for recommendation in matched if recommendation.get("uur")),
+            None,
+        ),
+        "udd": next(
+            (recommendation.get("udd") for recommendation in matched if recommendation.get("udd")),
+            None,
+        ),
+    }
 
 
 def append_table_chunks_for_table(state: ShowcaseState, table: dict[str, Any]) -> None:
@@ -1895,6 +1815,10 @@ def table_rows_for_chunks(
         origin = cells_by_id.get(string_value(placement.get("origin_cell_id")), {})
         row_item = dict(placement)
         row_item["is_header"] = bool(origin.get("is_header"))
+        row_item["source_char_start"] = 0
+        row_item["source_char_end"] = len(string_value(row_item.get("text")))
+        row_item["fragment_index"] = 0
+        row_item["fragment_count"] = 1
         rows.setdefault(logical_row, []).append(row_item)
     result: list[dict[str, Any]] = []
     for row_index in sorted(rows):
@@ -1935,13 +1859,20 @@ def split_oversized_table_row(
         text = string_value(cell.get("text"))
         if not text:
             continue
-        for piece in split_text_losslessly(text):
+        split_pieces = split_text_losslessly(text)
+        for piece_index, piece in enumerate(split_pieces):
+            cell_piece = dict(cell)
+            cell_piece["text"] = piece["text"]
+            cell_piece["source_char_start"] = piece["start"]
+            cell_piece["source_char_end"] = piece["end"]
+            cell_piece["fragment_index"] = piece_index
+            cell_piece["fragment_count"] = len(split_pieces)
             pieces.append(
                 {
                     "row_index": row["row_index"],
-                    "cells": [cell],
+                    "cells": [cell_piece],
                     "text": (
-                        f"cell {cell.get('row_index')}:{cell.get('column_index')}: "
+                        f"cell {cell.get('physical_row')}:{cell.get('logical_column')}: "
                         f"{piece['text']}"
                     ),
                 }
@@ -2007,13 +1938,45 @@ def append_table_chunk(
                 "cell_ids": cell_ids,
                 "placement_ids": placement_ids,
             }
-        ],
+        ]
+        + table_source_fragments(included_rows, table_id),
         extra={
             "header_row_indices": [row["row_index"] for row in header_rows],
             "cell_ids": cell_ids,
             "placement_ids": placement_ids,
         },
     )
+
+
+def table_source_fragments(
+    rows: list[dict[str, Any]],
+    table_id: str,
+) -> list[dict[str, Any]]:
+    fragments: list[dict[str, Any]] = []
+    for row in rows:
+        for cell in row["cells"]:
+            text = string_value(cell.get("text"))
+            if not text:
+                continue
+            placement_id = string_value(cell.get("placement_id"))
+            fragments.append(
+                {
+                    "kind": "table_placement",
+                    "table_id": table_id,
+                    "placement_id": placement_id,
+                    "source_unit_id": placement_id,
+                    "origin_cell_id": string_value(
+                        cell.get("origin_cell_id") or cell.get("cell_id")
+                    ),
+                    "source_char_start": int(cell.get("source_char_start") or 0),
+                    "source_char_end": int(cell.get("source_char_end") or len(text)),
+                    "fragment_index": int(cell.get("fragment_index") or 0),
+                    "fragment_count": int(cell.get("fragment_count") or 1),
+                    "text": text,
+                    "text_sha256": sha256_text(text),
+                }
+            )
+    return fragments
 
 
 def append_chunk(
@@ -2516,7 +2479,15 @@ def validate_showcase_directory(root: Path) -> dict[str, Any]:
         ),
     )
     validate_raw_copy(root, document, errors)
-    validate_raw_occurrence_counts(root, sections, tables, images, errors)
+    validate_raw_occurrence_counts(
+        root,
+        sections,
+        tables,
+        table_cells,
+        table_placements,
+        images,
+        errors,
+    )
     validate_counts(document, sections, blocks, tables, images, assets, references, errors)
     validate_text_preservation(root, sections, errors)
     validate_html_safety(sections, errors)
@@ -2524,6 +2495,7 @@ def validate_showcase_directory(root: Path) -> dict[str, Any]:
     validate_references(sections, blocks, tables, images, chunks, errors)
     validate_table_placements(tables, table_cells, table_placements, chunks, errors)
     validate_chunks(tables, images, chunks, errors)
+    validate_recommendation_chunks(blocks, recommendations, chunks, errors)
     validate_citation_titles(chunks, errors)
     validate_coverage_reports(root, errors)
     validate_frontend(root, tables, images, errors)
@@ -2580,6 +2552,8 @@ def validate_raw_occurrence_counts(
     root: Path,
     sections: list[dict[str, Any]],
     tables: list[dict[str, Any]],
+    table_cells: list[dict[str, Any]],
+    table_placements: list[dict[str, Any]],
     images: list[dict[str, Any]],
     errors: list[dict[str, Any]],
 ) -> None:
@@ -2588,20 +2562,14 @@ def validate_raw_occurrence_counts(
         return
     payload = json.loads(raw_path.read_text(encoding="utf-8"))
     inventory = build_raw_source_inventory(payload)
-    raw_items = [record.section for record in inventory.sections]
     for inventory_error in inventory.errors:
         errors.append(inventory_error)
-    raw_table_count = 0
-    raw_image_count = 0
-    for item in raw_items:
-        html_text = section_html(item)
-        soup = BeautifulSoup(html_text, "lxml")
-        raw_table_count += len([tag for tag in soup.find_all("table") if isinstance(tag, Tag)])
-        raw_image_count += len([tag for tag in soup.find_all("img") if isinstance(tag, Tag)])
     expected = {
-        "sections": (len(raw_items), len(sections)),
-        "tables": (raw_table_count, len(tables)),
-        "images": (raw_image_count, len(images)),
+        "sections": (len(inventory.sections), len(sections)),
+        "tables": (len(inventory.tables), len(tables)),
+        "table_cells": (len(inventory.table_cells), len(table_cells)),
+        "logical_table_placements": (len(inventory.table_placements), len(table_placements)),
+        "images": (len(inventory.images), len(images)),
     }
     for unit, (raw_count, parsed_count) in expected.items():
         if raw_count != parsed_count:
@@ -2819,6 +2787,17 @@ def validate_table_placements(
         if chunk.get("chunk_type") == "table"
         for placement_id in (chunk.get("placement_ids") or [])
     }
+    fragment_placements = {
+        string_value(fragment.get("placement_id"))
+        for chunk in chunks
+        if chunk.get("chunk_type") == "table"
+        for fragment in (chunk.get("source_fragments") or [])
+        if isinstance(fragment, dict) and fragment.get("kind") == "table_placement"
+    }
+    placements_by_id = {
+        string_value(placement.get("placement_id")): placement
+        for placement in table_placements
+    }
     for placement in table_placements:
         placement_id = string_value(placement.get("placement_id"))
         table_id = string_value(placement.get("table_id"))
@@ -2836,6 +2815,60 @@ def validate_table_placements(
                 missing,
             )
         )
+    missing_fragments = sorted(expected_placements - fragment_placements)
+    if missing_fragments:
+        errors.append(
+            issue(
+                "canonical/chunks.jsonl",
+                "logical_table_placement_fragment_missing",
+                missing_fragments,
+            )
+        )
+    for chunk in chunks:
+        if chunk.get("chunk_type") != "table":
+            continue
+        for fragment in chunk.get("source_fragments") or []:
+            if not isinstance(fragment, dict) or fragment.get("kind") != "table_placement":
+                continue
+            placement_id = string_value(fragment.get("placement_id"))
+            matched_placement = placements_by_id.get(placement_id)
+            if matched_placement is None:
+                errors.append(
+                    issue(
+                        string_value(chunk.get("chunk_id")),
+                        "unknown_table_fragment_placement",
+                        placement_id,
+                    )
+                )
+                continue
+            fragment_text = string_value(fragment.get("text"))
+            if string_value(fragment.get("text_sha256")) != sha256_text(fragment_text):
+                errors.append(
+                    issue(
+                        string_value(chunk.get("chunk_id")),
+                        "table_fragment_hash_mismatch",
+                        placement_id,
+                    )
+                )
+            start = int(fragment.get("source_char_start") or 0)
+            end = int(fragment.get("source_char_end") or 0)
+            source_text = string_value(matched_placement.get("text"))
+            if start < 0 or end < start or end > len(source_text):
+                errors.append(
+                    issue(
+                        string_value(chunk.get("chunk_id")),
+                        "table_fragment_range_invalid",
+                        {"placement_id": placement_id, "start": start, "end": end},
+                    )
+                )
+            elif source_text[start:end] != fragment_text:
+                errors.append(
+                    issue(
+                        string_value(chunk.get("chunk_id")),
+                        "table_fragment_text_mismatch",
+                        placement_id,
+                    )
+                )
 
 
 def validate_chunks(
@@ -2903,6 +2936,51 @@ def validate_chunks(
                     None,
                 )
             )
+
+
+def validate_recommendation_chunks(
+    blocks: list[dict[str, Any]],
+    recommendations: list[dict[str, Any]],
+    chunks: list[dict[str, Any]],
+    errors: list[dict[str, Any]],
+) -> None:
+    recommendation_ids = {
+        string_value(recommendation.get("recommendation_id"))
+        for recommendation in recommendations
+    }
+    block_to_recommendations: dict[str, set[str]] = {}
+    for block in blocks:
+        block_id = string_value(block.get("block_id"))
+        for recommendation_id in block.get("recommendation_ids") or []:
+            block_to_recommendations.setdefault(block_id, set()).add(
+                string_value(recommendation_id)
+            )
+    chunked_recommendations: set[str] = set()
+    for chunk in chunks:
+        chunk_id = string_value(chunk.get("chunk_id"))
+        expected_ids: set[str] = set()
+        for block_id in chunk.get("primary_block_ids") or []:
+            expected_ids.update(block_to_recommendations.get(string_value(block_id), set()))
+        if not expected_ids:
+            continue
+        actual_ids = {
+            string_value(value) for value in (chunk.get("recommendation_ids") or [])
+        }
+        if not actual_ids:
+            errors.append(issue(chunk_id, "recommendation_chunk_metadata_missing", None))
+            continue
+        if not expected_ids.issubset(actual_ids):
+            errors.append(
+                issue(
+                    chunk_id,
+                    "recommendation_chunk_metadata_incomplete",
+                    {"expected": sorted(expected_ids), "actual": sorted(actual_ids)},
+                )
+            )
+        chunked_recommendations.update(actual_ids)
+    missing = sorted(recommendation_ids - chunked_recommendations)
+    if missing:
+        errors.append(issue("recommendations", "recommendations_not_chunked", missing))
 
 
 def validate_citation_titles(chunks: list[dict[str, Any]], errors: list[dict[str, Any]]) -> None:
@@ -3128,19 +3206,65 @@ def verify_showcase_zip(root: Path, archive: Path) -> dict[str, Any]:
     errors: list[dict[str, Any]] = []
     if not archive.exists():
         return {"schema_version": SHOWCASE_SCHEMA_VERSION, "valid": False, "errors": ["missing"]}
+    names: list[str] = []
     with zipfile.ZipFile(archive, "r") as zip_file:
         names = zip_file.namelist()
         for name in names:
             parts = Path(name).parts
             if Path(name).is_absolute() or ".." in parts:
                 errors.append(issue(name, "unsafe_zip_path", None))
-        required = [
-            f"{root.name}/{path}"
-            for path in [*required_showcase_files(), "reports/showcase-validation.json"]
-        ]
-        for name in required:
-            if name not in names:
-                errors.append(issue(name, "zip_required_file_missing", None))
+        expected_names = {
+            (Path(root.name) / path.relative_to(root)).as_posix()
+            for path in root.rglob("*")
+            if path.is_file()
+        }
+        actual_names = set(names)
+        missing_names = sorted(expected_names - actual_names)
+        extra_names = sorted(actual_names - expected_names)
+        for name in missing_names:
+            errors.append(issue(name, "zip_file_missing", None))
+        for name in extra_names:
+            errors.append(issue(name, "zip_extra_file", None))
+        if not errors:
+            with tempfile.TemporaryDirectory(prefix="clinrec-showcase-zip-") as temp_name:
+                extract_root = Path(temp_name)
+                zip_file.extractall(extract_root)
+                extracted_showcase = extract_root / root.name
+                checksum_file = extracted_showcase / "checksums.sha256"
+                if not checksum_file.exists():
+                    errors.append(issue("checksums.sha256", "zip_checksums_missing", None))
+                else:
+                    listed_files: set[str] = set()
+                    for line in checksum_file.read_text(encoding="utf-8").splitlines():
+                        if not line.strip():
+                            continue
+                        digest, relative = line.split(maxsplit=1)
+                        relative = relative.strip()
+                        listed_files.add(relative)
+                        extracted_file = extracted_showcase / relative
+                        if not extracted_file.exists():
+                            errors.append(issue(relative, "zip_checksum_file_missing", None))
+                            continue
+                        actual_digest = sha256_file(extracted_file)
+                        if actual_digest != digest:
+                            errors.append(
+                                issue(
+                                    relative,
+                                    "zip_checksum_mismatch",
+                                    {"expected": digest, "actual": actual_digest},
+                                )
+                            )
+                    extracted_files = {
+                        path.relative_to(extracted_showcase).as_posix()
+                        for path in extracted_showcase.rglob("*")
+                        if path.is_file() and path.name != "checksums.sha256"
+                    }
+                    extra_unlisted = sorted(extracted_files - listed_files)
+                    missing_listed = sorted(listed_files - extracted_files)
+                    for relative in extra_unlisted:
+                        errors.append(issue(relative, "zip_checksum_unlisted_file", None))
+                    for relative in missing_listed:
+                        errors.append(issue(relative, "zip_checksum_listed_file_missing", None))
     return {
         "schema_version": SHOWCASE_SCHEMA_VERSION,
         "valid": not errors,
@@ -3153,7 +3277,9 @@ def write_showcase_readme(root: Path, state: ShowcaseState, validation: dict[str
     counts = counts_for_state(state)
     warnings = Counter(string_value(row.get("code")) for row in state.warnings)
     lines = [
-        "# Clinrec showcase 843_1",
+        f"# Clinrec showcase {state.source.code_version}",
+        "",
+        string_value(state.document.get("title")),
         "",
         "## Input",
         "",
@@ -3221,7 +3347,7 @@ def write_showcase_readme(root: Path, state: ShowcaseState, validation: dict[str
             "",
             "## Known Limitations",
             "",
-            "- Schema `0.3-pilot` is a draft showcase contract.",
+            f"- Schema `{SHOWCASE_SCHEMA_VERSION}` is a draft showcase contract.",
             (
                 "- Image chunks use source metadata and section context only; "
                 "no image descriptions are generated."
@@ -3317,6 +3443,8 @@ def write_asset_once(
     *,
     declared_mime_type: str | None,
     detected_mime_type: str,
+    width: int | None,
+    height: int | None,
     occurrence_id: str,
 ) -> str:
     asset_sha = sha256_bytes(content)
@@ -3341,6 +3469,8 @@ def write_asset_once(
                 "mime_type": detected_mime_type,
                 "extension": extension,
                 "size_bytes": len(content),
+                "width": width,
+                "height": height,
                 "occurrence_ids": [occurrence_id],
                 "source": "decoded_data_uri",
             }
@@ -3353,6 +3483,10 @@ def write_asset_once(
                 ]
                 if occurrence_id not in occurrence_ids:
                     asset["occurrence_ids"] = [*occurrence_ids, occurrence_id]
+                if asset.get("width") is None:
+                    asset["width"] = width
+                if asset.get("height") is None:
+                    asset["height"] = height
                 break
     return relative
 
@@ -3388,7 +3522,7 @@ def table_cells_and_grid(
             rowspan = positive_span(cell.get("rowspan"))
             colspan = positive_span(cell.get("colspan"))
             cell_id = f"{table_id}:cell#{row_index}:{column_index}:{cell_index}"
-            text = normalize_text(cell.get_text(" ", strip=True))
+            text = table_cell_text(cell)
             record = {
                 "table_id": table_id,
                 "cell_id": cell_id,
@@ -3779,72 +3913,6 @@ def raw_table_fragments(raw_html: str) -> list[str]:
     return [str(table) for table in soup.find_all("table") if isinstance(table, Tag)]
 
 
-def sanitize_html_tree(root: Tag | BeautifulSoup, warnings: list[str]) -> None:
-    for tag in list(root.find_all(True)):
-        if not isinstance(tag, Tag):
-            continue
-        name = tag.name.lower()
-        if name in UNSAFE_TAGS:
-            tag.decompose()
-            warnings.append("unsafe_tag_removed")
-            continue
-        if name not in SAFE_TAGS:
-            tag.unwrap()
-            warnings.append("unknown_html_tag_removed")
-            continue
-        allowed_attrs = SAFE_ATTRS_BY_TAG.get("*", set()) | SAFE_ATTRS_BY_TAG.get(name, set())
-        for attr in list(tag.attrs):
-            attr_name = attr.casefold()
-            if attr_name.startswith("on") or attr_name == "style":
-                del tag.attrs[attr]
-                warnings.append("unsafe_attribute_removed")
-                continue
-            if attr_name not in allowed_attrs:
-                del tag.attrs[attr]
-                warnings.append("unknown_attribute_removed")
-                continue
-            if attr_name in {"href", "src"} and not is_safe_url(tag.get(attr), tag_name=name):
-                del tag.attrs[attr]
-                warnings.append("unsafe_url_removed")
-
-
-def add_section_attributes(root: Tag | BeautifulSoup, *, section_id: str) -> None:
-    for tag in root.find_all(True):
-        if isinstance(tag, Tag):
-            tag["data-section-id"] = section_id
-
-
-def meaningful_children(root: Tag | BeautifulSoup) -> list[PageElement]:
-    children: list[PageElement] = []
-    for child in root.children:
-        if isinstance(child, NavigableString):
-            if normalize_text(str(child)):
-                children.append(child)
-        elif isinstance(child, Tag):
-            if child.name.lower() in {"html", "body"}:
-                children.extend(meaningful_children(child))
-            elif (
-                child.get_text(strip=True)
-                or child.name.lower() in {"img", "table"}
-                or child.find(["img", "table"]) is not None
-            ):
-                children.append(child)
-    return children
-
-
-def fragment_html(root: Tag | BeautifulSoup) -> str:
-    return "".join(str(child) for child in meaningful_children(root))
-
-
-def inner_html(tag: Tag) -> str:
-    return "".join(str(child) for child in tag.contents)
-
-
-def nearest_table(tag: Tag) -> Tag | None:
-    parent = tag.find_parent("table")
-    return parent if isinstance(parent, Tag) else None
-
-
 def table_classification(table: Tag, cells: list[dict[str, Any]]) -> str:
     if not cells:
         return "malformed"
@@ -4196,53 +4264,6 @@ def image_dimensions(content: bytes, mime_type: str | None) -> tuple[int | None,
                 break
             index += 2 + segment_length
     return None, None
-
-
-def is_javascript_url(value: Any) -> bool:
-    if isinstance(value, list):
-        text = " ".join(str(item) for item in value)
-    else:
-        text = str(value or "")
-    return text.strip().casefold().startswith("javascript:")
-
-
-def is_safe_url(value: Any, *, tag_name: str) -> bool:
-    if isinstance(value, list):
-        text = " ".join(str(item) for item in value)
-    else:
-        text = str(value or "")
-    stripped = text.strip()
-    if not stripped:
-        return True
-    if is_javascript_url(stripped):
-        return False
-    if tag_name == "img" and stripped.casefold().startswith("data:image/"):
-        return ";base64," in stripped.casefold()
-    try:
-        parsed = urlsplit(stripped)
-    except ValueError:
-        return False
-    if parsed.scheme.casefold() == "file":
-        return False
-    if parsed.scheme.casefold() == "data":
-        return False
-    return parsed.scheme.casefold() in SAFE_URL_SCHEMES
-
-
-def positive_span(value: Any) -> int:
-    try:
-        parsed = int(str(value))
-    except (TypeError, ValueError):
-        return 1
-    return parsed if parsed > 0 else 1
-
-
-def visible_text(html_text: str) -> str:
-    return BeautifulSoup(html_text, "lxml").get_text(" ", strip=True)
-
-
-def normalize_text(value: str) -> str:
-    return re.sub(r"\s+", " ", value).strip()
 
 
 def document_code_version(payload: dict[str, Any]) -> str:

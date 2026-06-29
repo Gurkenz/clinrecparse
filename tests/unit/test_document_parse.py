@@ -153,7 +153,7 @@ def test_parse_documents_writes_normalized_outputs(tmp_path: Path) -> None:
     assert parsed["document"]["code_version"] == "843_1"
     assert parsed["document"]["age"] == {"category": 1}
     assert parsed["sections"][0]["raw_data"]["found"] is True
-    assert parsed["parser_version"] == "parsed-canonical-0.4"
+    assert parsed["parser_version"] == "parsed-canonical-0.5"
     assert parsed["validation"]["valid"] is True
 
     assert len(parsed["tables"]) == 2

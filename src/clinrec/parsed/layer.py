@@ -6,6 +6,7 @@ import re
 import shutil
 from collections import Counter
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
@@ -22,17 +23,19 @@ from clinrec.bank.common import (
     sha256_file,
     string_value,
 )
+from clinrec.parsed.html import is_javascript_url
 from clinrec.parsed.models import CANONICAL_PARSER_VERSION, CANONICAL_SCHEMA_VERSION
 from clinrec.parsed.pipeline import (
     ParseConfig,
     ParsedShowcaseOptions,
-    is_javascript_url,
+    git_commit_or_unknown,
     resolve_showcase_input,
     validate_parsed_bundle,
 )
 from clinrec.parsed.pipeline import (
     parse_document as parse_canonical_document,
 )
+from clinrec.parsed.source_inventory import build_raw_source_inventory
 from clinrec.research.reports import write_json, write_jsonl
 from clinrec.research.sections import raw_sections, section_html
 
@@ -87,6 +90,7 @@ class ParsedExportSummary:
 @dataclass(frozen=True)
 class ParsedDiffSummary:
     input: Path
+    output: Path
     pairs: int
     section_changes: int
     table_changes: int
@@ -106,6 +110,9 @@ class RawDocumentRef:
 class BuildState:
     output: Path
     source_root: Path
+    created_at: str
+    repository_commit: str
+    build_config_sha256: str
     documents: list[dict[str, Any]]
     sections: list[dict[str, Any]]
     blocks: list[dict[str, Any]]
@@ -136,9 +143,29 @@ def build_parsed_dataset(options: ParsedBuildOptions) -> ParsedBuildSummary:
     part_output.mkdir(parents=True, exist_ok=True)
     (part_output / "reports").mkdir(parents=True, exist_ok=True)
     refs = select_raw_documents(options)
+    created_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    repository_commit = git_commit_or_unknown()
+    build_config_sha256 = sha256_bytes(
+        json.dumps(
+            {
+                "input": options.input.as_posix(),
+                "output": options.output.as_posix(),
+                "code_versions": options.code_versions,
+                "all_current": options.all_current,
+                "include_previous": options.include_previous,
+                "parser_version": PARSER_VERSION,
+                "schema_version": PARSED_SCHEMA_VERSION,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )
     state = BuildState(
         output=part_output,
         source_root=options.input,
+        created_at=created_at,
+        repository_commit=repository_commit,
+        build_config_sha256=build_config_sha256,
         documents=[],
         sections=[],
         blocks=[],
@@ -316,9 +343,9 @@ def parse_raw_document(state: BuildState, ref: RawDocumentRef) -> None:
         ParseConfig(
             root=state.output,
             dataset_id=state.output.name,
-            created_at="",
-            repository_commit="",
-            build_config_sha256="",
+            created_at=state.created_at,
+            repository_commit=state.repository_commit,
+            build_config_sha256=state.build_config_sha256,
             document_kind=ref.kind,
             current_code_version=ref.current_code_version,
             source_raw_path=raw_relative,
@@ -442,13 +469,23 @@ def extend_unique(
     rows: list[dict[str, Any]],
     key: str,
 ) -> None:
-    seen = {string_value(row.get(key)) for row in target}
+    by_id = {string_value(row.get(key)): row for row in target}
     for row in rows:
         stable_id = string_value(row.get(key))
-        if stable_id in seen:
+        if stable_id in by_id:
+            existing = by_id[stable_id]
+            existing_occurrences = [
+                string_value(value) for value in (existing.get("occurrence_ids") or [])
+            ]
+            for occurrence_id in row.get("occurrence_ids") or []:
+                occurrence = string_value(occurrence_id)
+                if occurrence and occurrence not in existing_occurrences:
+                    existing_occurrences.append(occurrence)
+            if existing_occurrences:
+                existing["occurrence_ids"] = existing_occurrences
             continue
         target.append(row)
-        seen.add(stable_id)
+        by_id[stable_id] = row
 
 
 def search_chunk_from_rag(chunk: dict[str, Any]) -> dict[str, Any]:
@@ -524,6 +561,9 @@ def write_dataset_artifacts(
         "parser_version": PARSER_VERSION,
         "dataset_id": options.output.name,
         "source_corpus": options.input.as_posix(),
+        "created_at": state.created_at,
+        "repository_commit": state.repository_commit,
+        "build_config_sha256": state.build_config_sha256,
         "source_documents": source_documents,
         "parsed_documents": len(state.documents),
         "failed_documents": len(state.anomalies),
@@ -618,7 +658,7 @@ def parsed_summary(state: BuildState, *, source_documents: int) -> dict[str, Any
     }
 
 
-def validate_parsed_release(input_path: Path) -> dict[str, Any]:
+def validate_parsed_release(input_path: Path, *, write_report: bool = True) -> dict[str, Any]:
     errors: list[dict[str, Any]] = []
     warnings: list[dict[str, Any]] = []
     required = [
@@ -662,7 +702,10 @@ def validate_parsed_release(input_path: Path) -> dict[str, Any]:
     assets = read_jsonl(input_path / "assets.jsonl")
     recommendations = read_jsonl(input_path / "recommendations.jsonl")
     references = read_jsonl(input_path / "references.jsonl")
+    search_chunks = read_jsonl(input_path / "search" / "chunks.jsonl")
     chunks = read_jsonl(input_path / "rag" / "chunks.jsonl")
+    citations = read_jsonl(input_path / "rag" / "citation-index.jsonl")
+    embedding_inputs = read_jsonl(input_path / "rag" / "embedding-input.jsonl")
     validations = read_jsonl(input_path / "reports" / "document-validation.jsonl")
     for path, rows, key in (
         ("documents.jsonl", documents, "document_id"),
@@ -691,7 +734,30 @@ def validate_parsed_release(input_path: Path) -> dict[str, Any]:
     placement_ids = {string_value(row.get("placement_id")) for row in table_placements}
     image_ids = {string_value(image.get("image_id")) for image in images}
     asset_ids = {string_value(asset.get("asset_id")) for asset in assets}
+    chunk_ids = {string_value(chunk.get("chunk_id")) for chunk in chunks}
+    validation_document_ids = {
+        string_value(validation.get("document_id")) for validation in validations
+    }
+    if validation_document_ids != document_ids:
+        errors.append(
+            issue(
+                "reports/document-validation.jsonl",
+                "document_validation_set_mismatch",
+                {
+                    "missing": sorted(document_ids - validation_document_ids),
+                    "extra": sorted(validation_document_ids - document_ids),
+                },
+            )
+        )
     for validation in validations:
+        if string_value(validation.get("document_id")) not in document_ids:
+            errors.append(
+                issue(
+                    string_value(validation.get("document_id")),
+                    "document_validation_without_document",
+                    None,
+                )
+            )
         if not validation.get("valid"):
             errors.append(
                 issue(
@@ -700,6 +766,26 @@ def validate_parsed_release(input_path: Path) -> dict[str, Any]:
                     None,
                 )
             )
+    source_corpus = Path(string_value(dataset.get("source_corpus")))
+    if not source_corpus.is_absolute():
+        source_corpus = source_corpus.resolve()
+    sections_by_document = group_rows(sections, "document_id")
+    tables_by_document = group_rows(tables, "document_id")
+    table_cells_by_document = group_rows(table_cells, "document_id")
+    table_placements_by_document = group_rows(table_placements, "document_id")
+    images_by_document = group_rows(images, "document_id")
+    for document in documents:
+        validate_document(
+            input_path,
+            source_corpus,
+            document,
+            sections_by_document,
+            tables_by_document,
+            table_cells_by_document,
+            table_placements_by_document,
+            images_by_document,
+            errors,
+        )
     for section in sections:
         validate_section_html(section, errors)
         if string_value(section.get("document_id")) not in document_ids:
@@ -742,6 +828,34 @@ def validate_parsed_release(input_path: Path) -> dict[str, Any]:
                     None,
                 )
             )
+    assets_by_id = {string_value(asset.get("asset_id")): asset for asset in assets}
+    for asset in assets:
+        asset_path = string_value(asset.get("path"))
+        asset_file = input_path / asset_path
+        if not asset_path or not asset_file.exists():
+            errors.append(
+                issue(string_value(asset.get("asset_id")), "asset_file_missing", asset_path)
+            )
+            continue
+        actual_sha = sha256_file(asset_file)
+        expected_sha = string_value(asset.get("asset_sha256") or asset.get("sha256"))
+        if expected_sha and actual_sha != expected_sha:
+            errors.append(
+                issue(
+                    string_value(asset.get("asset_id")),
+                    "assembled_asset_sha_mismatch",
+                    {"expected": expected_sha, "actual": actual_sha},
+                )
+            )
+        expected_size = int(asset.get("size_bytes") or 0)
+        if expected_size and asset_file.stat().st_size != expected_size:
+            errors.append(
+                issue(
+                    string_value(asset.get("asset_id")),
+                    "assembled_asset_size_mismatch",
+                    {"expected": expected_size, "actual": asset_file.stat().st_size},
+                )
+            )
     for image in images:
         validate_image_asset(input_path, image, errors, warnings)
         asset_id = string_value(image.get("asset_id"))
@@ -753,6 +867,19 @@ def validate_parsed_release(input_path: Path) -> dict[str, Any]:
                     asset_id,
                 )
             )
+        if asset_id and asset_id in assets_by_id:
+            occurrence_ids = [
+                string_value(value)
+                for value in (assets_by_id[asset_id].get("occurrence_ids") or [])
+            ]
+            if string_value(image.get("image_id")) not in occurrence_ids:
+                errors.append(
+                    issue(
+                        string_value(image.get("image_id")),
+                        "asset_occurrence_missing_image",
+                        asset_id,
+                    )
+                )
     for recommendation in recommendations:
         for block_id in recommendation.get("block_ids") or []:
             if string_value(block_id) not in block_ids:
@@ -816,12 +943,36 @@ def validate_parsed_release(input_path: Path) -> dict[str, Any]:
                     None,
                 )
             )
+    search_ids = {string_value(chunk.get("chunk_id")) for chunk in search_chunks}
+    citation_ids = {string_value(row.get("chunk_id")) for row in citations}
+    embedding_ids = {
+        string_value(row.get("chunk_id") or row.get("id")) for row in embedding_inputs
+    }
+    parity: dict[str, Any] = {
+        "valid": True,
+        "checks": {},
+        "errors": [],
+    }
+    for name, ids in (
+        ("search_chunks", search_ids),
+        ("citation_index", citation_ids),
+        ("embedding_input", embedding_ids),
+    ):
+        missing = sorted(chunk_ids - ids)
+        extra = sorted(ids - chunk_ids)
+        check = {"missing": missing, "extra": extra, "passed": not missing and not extra}
+        parity["checks"][name] = check
+        if not check["passed"]:
+            parity["valid"] = False
+            errors.append(issue(name, "rag_package_parity_mismatch", check))
+            parity["errors"].append({"path": name, "details": check})
     report = {
         "schema_version": PARSED_SCHEMA_VERSION,
         "input": input_path.as_posix(),
         "valid": not errors,
         "errors": errors,
         "warnings": warnings,
+        "package_parity": parity,
         "summary": {
             "documents": len(documents),
             "sections": len(sections),
@@ -838,8 +989,10 @@ def validate_parsed_release(input_path: Path) -> dict[str, Any]:
             "warnings": len(warnings),
         },
     }
-    reports = input_path / "reports"
-    write_json(reports / "release-validation.json", report)
+    if write_report:
+        reports = input_path / "reports"
+        write_json(reports / "release-validation.json", report)
+        write_json(reports / "package-parity.json", parity)
     return report
 
 
@@ -865,6 +1018,10 @@ def validate_document(
     source_root: Path,
     document: dict[str, Any],
     section_rows_by_document: dict[str, list[dict[str, Any]]],
+    table_rows_by_document: dict[str, list[dict[str, Any]]],
+    table_cell_rows_by_document: dict[str, list[dict[str, Any]]],
+    table_placement_rows_by_document: dict[str, list[dict[str, Any]]],
+    image_rows_by_document: dict[str, list[dict[str, Any]]],
     errors: list[dict[str, Any]],
 ) -> None:
     document_id = string_value(document.get("document_id"))
@@ -875,8 +1032,11 @@ def validate_document(
     if sha256_file(raw_path) != document.get("source_raw_sha256"):
         errors.append(issue(document_id, "source_raw_sha_mismatch", raw_path.as_posix()))
     payload = json.loads(raw_path.read_text(encoding="utf-8"))
-    raw_count = len([section for section in raw_sections(payload) if isinstance(section, dict)])
-    parsed_count = len(section_rows_by_document.get(document_id, []))
+    inventory = build_raw_source_inventory(payload)
+    errors.extend(inventory.errors)
+    raw_count = len(inventory.sections)
+    parsed_sections = section_rows_by_document.get(document_id, [])
+    parsed_count = len(parsed_sections)
     if raw_count != parsed_count:
         errors.append(
             issue(
@@ -885,6 +1045,67 @@ def validate_document(
                 {"raw": raw_count, "parsed": parsed_count},
             )
         )
+    expected_counts = {
+        "tables": (len(inventory.tables), len(table_rows_by_document.get(document_id, []))),
+        "table_cells": (
+            len(inventory.table_cells),
+            len(table_cell_rows_by_document.get(document_id, [])),
+        ),
+        "logical_table_placements": (
+            len(inventory.table_placements),
+            len(table_placement_rows_by_document.get(document_id, [])),
+        ),
+        "images": (len(inventory.images), len(image_rows_by_document.get(document_id, []))),
+    }
+    for unit, (raw_total, parsed_total) in expected_counts.items():
+        if raw_total != parsed_total:
+            errors.append(
+                issue(
+                    document_id,
+                    f"{unit}_count_mismatch",
+                    {"raw": raw_total, "parsed": parsed_total},
+                )
+            )
+    raw_cell_hashes = [record.text_sha256 for record in inventory.table_cells]
+    parsed_cell_hashes = [
+        string_value(row.get("text_sha256"))
+        for row in table_cell_rows_by_document.get(document_id, [])
+    ]
+    if raw_cell_hashes != parsed_cell_hashes:
+        errors.append(issue(document_id, "raw_table_cell_text_mismatch", None))
+    raw_placement_hashes = [record.text_sha256 for record in inventory.table_placements]
+    parsed_placement_hashes = [
+        string_value(row.get("text_sha256"))
+        for row in table_placement_rows_by_document.get(document_id, [])
+    ]
+    if raw_placement_hashes != parsed_placement_hashes:
+        errors.append(issue(document_id, "raw_table_placement_text_mismatch", None))
+    raw_by_path = {record.raw_path: record for record in inventory.sections}
+    parsed_paths = {string_value(section.get("raw_path")) for section in parsed_sections}
+    raw_paths = set(raw_by_path)
+    for missing_path in sorted(raw_paths - parsed_paths):
+        errors.append(issue(document_id, "missing_raw_section_path", missing_path))
+    for extra_path in sorted(parsed_paths - raw_paths):
+        errors.append(issue(document_id, "parsed_section_without_raw_path", extra_path))
+    for section in parsed_sections:
+        raw_path_value = string_value(section.get("raw_path"))
+        raw_record = raw_by_path.get(raw_path_value)
+        if raw_record is None:
+            continue
+        raw_text = normalize_text(visible_text(section_html(raw_record.section)))
+        parsed_text = normalize_text(visible_text(string_value(section.get("normalized_html"))))
+        if raw_text != parsed_text:
+            errors.append(
+                issue(
+                    string_value(section.get("section_id")),
+                    "raw_section_text_mismatch",
+                    {
+                        "raw_path": raw_path_value,
+                        "raw_sha256": sha256_text(raw_text),
+                        "parsed_sha256": sha256_text(parsed_text),
+                    },
+                )
+            )
     document_json = document_json_path(input_path, document)
     if not document_json.exists():
         errors.append(issue(document_id, "parsed_document_missing_document_json", None))
@@ -980,11 +1201,21 @@ def validate_image_asset(
 
 
 def export_parsed_dataset(input_path: Path, output: Path) -> ParsedExportSummary:
-    output.mkdir(parents=True, exist_ok=True)
-    backend = output / "backend"
-    frontend = output / "frontend"
-    search = output / "search"
-    rag = output / "rag"
+    release_report = validate_parsed_release(input_path, write_report=False)
+    if not release_report["valid"]:
+        raise BankError(
+            f"parsed-export refused invalid release: {len(release_report['errors'])} error(s)"
+        )
+    output_parent = output.parent
+    part_output = output_parent / f".{output.name}.part"
+    safe_remove_tree(part_output, output_parent)
+    if output.exists():
+        raise BankError(f"Export output already exists: {output}")
+    part_output.mkdir(parents=True, exist_ok=True)
+    backend = part_output / "backend"
+    frontend = part_output / "frontend"
+    search = part_output / "search"
+    rag = part_output / "rag"
     backend_files = (
         ("documents.jsonl", backend / "documents.jsonl"),
         ("sections.jsonl", backend / "sections.jsonl"),
@@ -1023,21 +1254,37 @@ def export_parsed_dataset(input_path: Path, output: Path) -> ParsedExportSummary
         "assets": assets,
     }
     write_json(frontend / "manifest.json", manifest)
-    write_checksums(output)
-    write_json(output / "export-manifest.json", manifest)
+    write_json(part_output / "export-manifest.json", manifest)
+    export_validation = validate_export_package(part_output, input_path, release_report)
+    write_json(part_output / "reports" / "export-validation.json", export_validation)
+    if not export_validation["valid"]:
+        safe_remove_tree(part_output, output_parent)
+        raise BankError(
+            f"parsed-export package validation failed: "
+            f"{len(export_validation['errors'])} error(s)"
+        )
+    write_checksums(part_output)
+    part_output.replace(output)
     return ParsedExportSummary(
         input=input_path,
         output=output,
         backend_files=len(backend_files),
         frontend_documents=len(documents),
         assets=assets,
-        search_chunks=len(read_jsonl(search / "chunks.jsonl")),
-        rag_chunks=len(read_jsonl(rag / "chunks.jsonl")),
+        search_chunks=len(read_jsonl(output / "search" / "chunks.jsonl")),
+        rag_chunks=len(read_jsonl(output / "rag" / "chunks.jsonl")),
         manifest_path=output / "export-manifest.json",
     )
 
 
-def build_parsed_diff(input_path: Path) -> ParsedDiffSummary:
+def build_parsed_diff(input_path: Path, output: Path | None = None) -> ParsedDiffSummary:
+    if output is None:
+        output = input_path.parent / f"{input_path.name}-diff"
+    output_parent = output.parent
+    part_output = output_parent / f".{output.name}.part"
+    safe_remove_tree(part_output, output_parent)
+    if output.exists():
+        raise BankError(f"Parsed diff output already exists: {output}")
     relations = read_jsonl(input_path / "relations.jsonl")
     sections = read_jsonl(input_path / "sections.jsonl")
     tables = read_jsonl(input_path / "tables.jsonl")
@@ -1067,31 +1314,229 @@ def build_parsed_diff(input_path: Path) -> ParsedDiffSummary:
         section_rows.extend(diff_sections(current_doc, previous_doc, sections_by_doc))
         table_rows.extend(diff_asset_rows(current_doc, previous_doc, tables_by_doc, "table_id"))
         image_rows.extend(diff_asset_rows(current_doc, previous_doc, images_by_doc, "image_id"))
-    diff_root = input_path / "diff"
-    write_jsonl(diff_root / "pairs.jsonl", pair_rows)
-    write_jsonl(diff_root / "sections.jsonl", section_rows)
-    write_jsonl(diff_root / "tables.jsonl", table_rows)
-    write_jsonl(diff_root / "images.jsonl", image_rows)
+    write_jsonl(part_output / "pairs.jsonl", pair_rows)
+    write_jsonl(part_output / "sections.jsonl", section_rows)
+    write_jsonl(part_output / "tables.jsonl", table_rows)
+    write_jsonl(part_output / "images.jsonl", image_rows)
     summary = {
         "schema_version": PARSED_SCHEMA_VERSION,
+        "input": input_path.as_posix(),
+        "output": output.as_posix(),
         "pairs": len(pair_rows),
         "section_changes": len(section_rows),
         "table_changes": len(table_rows),
         "image_changes": len(image_rows),
     }
-    write_json(diff_root / "summary.json", summary)
-    parsed_summary_path = input_path / "reports" / "parsed-summary.json"
-    parsed = read_json_file(parsed_summary_path)
-    parsed["diff_pairs"] = len(pair_rows)
-    write_json(parsed_summary_path, parsed)
+    write_json(part_output / "summary.json", summary)
+    manifest = content_hash_manifest(part_output)
+    write_json(part_output / "manifest.json", manifest)
+    write_checksums(part_output)
+    part_output.replace(output)
     return ParsedDiffSummary(
         input=input_path,
+        output=output,
         pairs=len(pair_rows),
         section_changes=len(section_rows),
         table_changes=len(table_rows),
         image_changes=len(image_rows),
-        summary_path=diff_root / "summary.json",
+        summary_path=output / "summary.json",
     )
+
+
+def validate_export_package(
+    output: Path,
+    input_path: Path,
+    release_report: dict[str, Any],
+) -> dict[str, Any]:
+    errors: list[dict[str, Any]] = []
+    warnings: list[dict[str, Any]] = []
+    required = [
+        "backend/documents.jsonl",
+        "backend/sections.jsonl",
+        "backend/blocks.jsonl",
+        "backend/tables.jsonl",
+        "backend/table-cells.jsonl",
+        "backend/table-placements.jsonl",
+        "backend/images.jsonl",
+        "backend/assets.jsonl",
+        "backend/recommendations.jsonl",
+        "backend/references.jsonl",
+        "backend/relations.jsonl",
+        "backend/dataset.json",
+        "search/chunks.jsonl",
+        "rag/chunks.jsonl",
+        "rag/citation-index.jsonl",
+        "rag/embedding-input.jsonl",
+        "frontend/manifest.json",
+        "export-manifest.json",
+    ]
+    for relative in required:
+        if not (output / relative).exists():
+            errors.append(issue(relative, "export_required_file_missing", None))
+
+    for source_relative, export_relative in (
+        ("documents.jsonl", "backend/documents.jsonl"),
+        ("sections.jsonl", "backend/sections.jsonl"),
+        ("blocks.jsonl", "backend/blocks.jsonl"),
+        ("tables.jsonl", "backend/tables.jsonl"),
+        ("table-cells.jsonl", "backend/table-cells.jsonl"),
+        ("table-placements.jsonl", "backend/table-placements.jsonl"),
+        ("images.jsonl", "backend/images.jsonl"),
+        ("assets.jsonl", "backend/assets.jsonl"),
+        ("recommendations.jsonl", "backend/recommendations.jsonl"),
+        ("references.jsonl", "backend/references.jsonl"),
+        ("relations.jsonl", "backend/relations.jsonl"),
+        ("search/chunks.jsonl", "search/chunks.jsonl"),
+        ("rag/chunks.jsonl", "rag/chunks.jsonl"),
+        ("rag/citation-index.jsonl", "rag/citation-index.jsonl"),
+        ("rag/embedding-input.jsonl", "rag/embedding-input.jsonl"),
+    ):
+        if (input_path / source_relative).exists() and (output / export_relative).exists():
+            source_hash = sha256_file(input_path / source_relative)
+            export_hash = sha256_file(output / export_relative)
+            if source_hash != export_hash:
+                errors.append(
+                    issue(
+                        export_relative,
+                        "export_file_hash_mismatch",
+                        {"source": source_hash, "export": export_hash},
+                    )
+                )
+
+    documents = read_jsonl(input_path / "documents.jsonl")
+    for document in documents:
+        code_version = string_value(document.get("code_version"))
+        if document.get("document_kind") == "previous":
+            frontend_path = (
+                output
+                / "frontend"
+                / "documents"
+                / "previous"
+                / string_value(document.get("current_code_version"))
+                / f"{code_version}.json"
+            )
+        else:
+            frontend_path = output / "frontend" / "documents" / "current" / f"{code_version}.json"
+        if not frontend_path.exists():
+            errors.append(issue(frontend_path.as_posix(), "frontend_document_missing", None))
+            continue
+        payload = read_json_file(frontend_path)
+        table_values = payload.get("tables")
+        image_values = payload.get("images")
+        section_values = payload.get("sections")
+        frontend_tables: list[Any] = table_values if isinstance(table_values, list) else []
+        frontend_images: list[Any] = image_values if isinstance(image_values, list) else []
+        section_rows = [
+            section for section in section_values if isinstance(section, dict)
+        ] if isinstance(section_values, list) else []
+        table_markers = 0
+        image_markers = 0
+        for section in section_rows:
+            normalized_html = string_value(section.get("normalized_html"))
+            if "data:image/" in normalized_html:
+                errors.append(
+                    issue(
+                        string_value(section.get("section_id")),
+                        "frontend_base64_image_src",
+                        None,
+                    )
+                )
+            soup = BeautifulSoup(normalized_html, "html.parser")
+            for tag in soup.find_all(True):
+                if not isinstance(tag, Tag):
+                    continue
+                for attr in tag.attrs:
+                    attr_name = attr.casefold()
+                    if attr_name.startswith("on"):
+                        errors.append(
+                            issue(
+                                string_value(section.get("section_id")),
+                                "frontend_unsafe_event_handler",
+                                attr,
+                            )
+                        )
+                    if attr_name in {"href", "src"} and is_javascript_url(tag.get(attr)):
+                        errors.append(
+                            issue(
+                                string_value(section.get("section_id")),
+                                "frontend_unsafe_javascript_url",
+                                attr,
+                            )
+                        )
+            table_markers += len(
+                [
+                    tag
+                    for tag in soup.find_all(
+                        lambda item: isinstance(item, Tag)
+                        and item.has_attr("data-table-id")
+                    )
+                    if isinstance(tag, Tag)
+                ]
+            )
+            image_markers += len(
+                [
+                    tag
+                    for tag in soup.find_all(
+                        lambda item: isinstance(item, Tag)
+                        and item.has_attr("data-image-id")
+                    )
+                    if isinstance(tag, Tag)
+                ]
+            )
+            for image_tag in soup.find_all("img"):
+                if not isinstance(image_tag, Tag):
+                    continue
+                src = string_value(image_tag.get("src"))
+                if not src:
+                    errors.append(
+                        issue(
+                            string_value(section.get("section_id")),
+                            "frontend_image_src_missing",
+                            None,
+                        )
+                    )
+                elif src.startswith("data:") or src.startswith(("http://", "https://")):
+                    errors.append(
+                        issue(
+                            string_value(section.get("section_id")),
+                            "frontend_image_src_not_local",
+                            src,
+                        )
+                    )
+                elif not (output / "frontend" / src).exists():
+                    errors.append(
+                        issue(
+                            string_value(section.get("section_id")),
+                            "frontend_image_asset_missing",
+                            src,
+                        )
+                    )
+        if table_markers != len(frontend_tables):
+            errors.append(
+                issue(
+                    frontend_path.as_posix(),
+                    "frontend_table_placement_count_mismatch",
+                    {"markers": table_markers, "tables": len(frontend_tables)},
+                )
+            )
+        if image_markers != len(frontend_images):
+            errors.append(
+                issue(
+                    frontend_path.as_posix(),
+                    "frontend_image_placement_count_mismatch",
+                    {"markers": image_markers, "images": len(frontend_images)},
+                )
+            )
+
+    return {
+        "schema_version": PARSED_SCHEMA_VERSION,
+        "input": input_path.as_posix(),
+        "output": output.as_posix(),
+        "valid": not errors and bool(release_report.get("valid")),
+        "release_valid": bool(release_report.get("valid")),
+        "errors": errors,
+        "warnings": warnings,
+    }
 
 
 def diff_sections(

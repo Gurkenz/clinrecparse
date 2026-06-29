@@ -20,7 +20,7 @@ Frontend HTML must not contain base64 images, script tags, event handlers, or
 - `assets/by-sha256/*`
 - `manifest.json`
 
-Showcase `document.json` uses schema `0.3-pilot`. It contains a TOC, ordered
+Showcase `document.json` uses schema `0.4-pilot`. It contains a TOC, ordered
 sections, normalized HTML, table IDs, image occurrence IDs, asset records, and
 warnings. It is intended for local preview and integration review, not as a
 production UI contract.

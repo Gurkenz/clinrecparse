@@ -1004,18 +1004,25 @@ def parsed_build_diff(
             file_okay=False,
             dir_okay=True,
             readable=True,
-            writable=True,
         ),
     ],
+    output: Annotated[
+        Path | None,
+        typer.Option(
+            "--output",
+            help="Diff output directory. Defaults to a sibling '<input>-diff' directory.",
+        ),
+    ] = None,
 ) -> None:
     """Build structural current/previous parsed diffs without clinical significance claims."""
     try:
-        summary = run_parsed_build_diff(input)
+        summary = run_parsed_build_diff(input, output)
     except BankError as exc:
         typer.echo(f"parsed-build-diff failed: {exc}", err=True)
         raise typer.Exit(bank_exit_code(exc)) from exc
     typer.echo("parsed-build-diff completed")
     typer.echo(f"input: {summary.input}")
+    typer.echo(f"output: {summary.output}")
     typer.echo(f"pairs: {summary.pairs}")
     typer.echo(f"section_changes: {summary.section_changes}")
     typer.echo(f"table_changes: {summary.table_changes}")

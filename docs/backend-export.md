@@ -23,7 +23,7 @@ Properties:
 - Foreign keys are stable parsed IDs.
 - Source raw path and raw SHA-256 remain available for audit.
 
-`clinrec parsed-build-showcase` writes schema `0.3-pilot` backend records to
+`clinrec parsed-build-showcase` writes schema `0.4-pilot` backend records to
 `data/showcase/{CodeVersion}/backend/`. The package mirrors canonical records:
 
 - `documents.jsonl`

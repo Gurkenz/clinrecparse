@@ -21,7 +21,7 @@ rewritten or normalized.
 
 Included packages:
 
-- `canonical/`: draft `0.3-pilot` records and extracted local assets.
+- `canonical/`: draft `0.4-pilot` records and extracted local assets.
 - `backend/`: JSON/JSONL import package with stable foreign keys.
 - `frontend/`: document payload with normalized HTML and local asset paths.
 - `ml/`: text chunks, table chunks, image-context chunks, and

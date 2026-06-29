@@ -4,7 +4,9 @@ import json
 from pathlib import Path
 from typing import Any
 
-from clinrec.bank.common import sha256_bytes
+import pytest
+
+from clinrec.bank.common import BankError, sha256_bytes
 from clinrec.parsed.layer import (
     ParsedBuildOptions,
     build_parsed_dataset,
@@ -108,3 +110,129 @@ def test_parsed_build_validate_export_and_diff(tmp_path: Path) -> None:
     assert (parsed / image["asset_path"]).exists()
     assert (tmp_path / "exports" / "pilot-v1" / "backend" / "documents.jsonl").exists()
     assert (tmp_path / "exports" / "pilot-v1" / "rag" / "embedding-input.jsonl").exists()
+    assert not (parsed / "diff").exists()
+    assert diff.output == tmp_path / "parsed" / "pilot-v1-diff"
+    assert (diff.output / "checksums.sha256").exists()
+
+
+def test_export_refuses_invalid_release_atomically(tmp_path: Path) -> None:
+    corpus = tmp_path / "research" / "corpus"
+    write_raw(
+        corpus / "current" / "270_3",
+        "270_3",
+        [{"id": "section_intro", "name": "Intro", "content": "<p>Hello</p>"}],
+    )
+    parsed = tmp_path / "parsed" / "pilot-v1"
+    build_parsed_dataset(
+        ParsedBuildOptions(input=corpus, output=parsed, code_versions=("270_3",))
+    )
+    validation_path = parsed / "reports" / "document-validation.jsonl"
+    validation = json.loads(validation_path.read_text(encoding="utf-8").splitlines()[0])
+    validation["valid"] = False
+    validation_path.write_text(json.dumps(validation) + "\n", encoding="utf-8")
+
+    output = tmp_path / "exports" / "pilot-v1"
+    with pytest.raises(BankError):
+        export_parsed_dataset(parsed, output)
+
+    assert not output.exists()
+    assert not (tmp_path / "exports" / ".pilot-v1.part").exists()
+
+
+def test_diff_writes_separate_output_without_mutating_release(tmp_path: Path) -> None:
+    corpus = tmp_path / "research" / "corpus"
+    write_raw(
+        corpus / "current" / "270_3",
+        "270_3",
+        [{"id": "section_intro", "name": "Intro", "content": "<p>Hello</p>"}],
+    )
+    write_raw(
+        corpus / "previous" / "270_3" / "270_2",
+        "270_2",
+        [{"id": "section_intro", "name": "Intro", "content": "<p>Hello old</p>"}],
+    )
+    parsed = tmp_path / "parsed" / "pilot-v1"
+    build_parsed_dataset(
+        ParsedBuildOptions(
+            input=corpus,
+            output=parsed,
+            code_versions=("270_3",),
+            include_previous=True,
+        )
+    )
+    summary_path = parsed / "reports" / "parsed-summary.json"
+    before = summary_path.read_text(encoding="utf-8")
+
+    diff = build_parsed_diff(parsed)
+
+    assert diff.output == tmp_path / "parsed" / "pilot-v1-diff"
+    assert (diff.output / "summary.json").exists()
+    assert (diff.output / "manifest.json").exists()
+    assert (diff.output / "checksums.sha256").exists()
+    assert not (parsed / "diff").exists()
+    assert summary_path.read_text(encoding="utf-8") == before
+
+
+def test_cross_document_asset_occurrences_are_merged(tmp_path: Path) -> None:
+    corpus = tmp_path / "research" / "corpus"
+    image_html = f"<p>Image</p><img alt='chart' src='data:image/png;base64,{PNG_1X1}'>"
+    write_raw(
+        corpus / "current" / "270_3",
+        "270_3",
+        [{"id": "section_intro", "name": "Intro", "content": image_html}],
+    )
+    write_raw(
+        corpus / "previous" / "270_3" / "270_2",
+        "270_2",
+        [{"id": "section_intro", "name": "Intro", "content": image_html}],
+    )
+    parsed = tmp_path / "parsed" / "pilot-v1"
+    build_parsed_dataset(
+        ParsedBuildOptions(
+            input=corpus,
+            output=parsed,
+            code_versions=("270_3",),
+            include_previous=True,
+        )
+    )
+
+    assets = [
+        json.loads(line)
+        for line in (parsed / "assets.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+
+    assert len(assets) == 1
+    assert len(assets[0]["occurrence_ids"]) == 2
+    assert assets[0]["width"] == 1
+    assert assets[0]["height"] == 1
+
+
+def test_nested_table_text_not_duplicated_in_parent_cell(tmp_path: Path) -> None:
+    corpus = tmp_path / "research" / "corpus"
+    write_raw(
+        corpus / "current" / "270_3",
+        "270_3",
+        [
+            {
+                "id": "section_intro",
+                "name": "Intro",
+                "content": (
+                    "<table><tr><td>Outer<table><tr><td>Inner</td></tr></table>"
+                    "</td></tr></table>"
+                ),
+            }
+        ],
+    )
+    parsed = tmp_path / "parsed" / "pilot-v1"
+    build_parsed_dataset(
+        ParsedBuildOptions(input=corpus, output=parsed, code_versions=("270_3",))
+    )
+
+    cells = [
+        json.loads(line)
+        for line in (parsed / "table-cells.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+
+    assert any(cell["text"] == "Outer" for cell in cells)
+    assert any(cell["text"] == "Inner" for cell in cells)
+    assert all(cell["text"] != "Outer Inner" for cell in cells)

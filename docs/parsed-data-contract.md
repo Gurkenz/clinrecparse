@@ -1,8 +1,8 @@
 # Parsed data contract
 
-General parsed dataset schema version: `0.3-pilot`.
+General parsed dataset schema version: `0.4-pilot`.
 
-Canonical parser version: `parsed-canonical-0.4`.
+Canonical parser version: `parsed-canonical-0.5`.
 
 Core files:
 
