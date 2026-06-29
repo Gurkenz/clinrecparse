@@ -13,6 +13,10 @@ from clinrec.parsed.layer import (
     validate_parsed_dataset,
 )
 
+PNG_1X1 = (
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII="
+)
+
 
 def raw_document(code_version: str, sections: list[dict[str, Any]]) -> bytes:
     code_text, version_text = code_version.split("_", maxsplit=1)
@@ -54,11 +58,11 @@ def test_parsed_build_validate_export_and_diff(tmp_path: Path) -> None:
         {
             "id": "section_intro",
             "name": "Intro",
-            "content": (
-                "<p onclick='bad()'>Hello <a href='javascript:bad()'>link</a></p>"
-                "<img alt='chart' src='data:image/png;base64,aGVsbG8='>"
-                "<table><tr><th>A</th></tr><tr><td>B</td></tr></table>"
-            ),
+                "content": (
+                    "<p onclick='bad()'>Hello <a href='javascript:bad()'>link</a></p>"
+                    f"<img alt='chart' src='data:image/png;base64,{PNG_1X1}'>"
+                    "<table><tr><th>A</th></tr><tr><td>B</td></tr></table>"
+                ),
         }
     ]
     previous_sections = [
@@ -104,4 +108,3 @@ def test_parsed_build_validate_export_and_diff(tmp_path: Path) -> None:
     assert (parsed / image["asset_path"]).exists()
     assert (tmp_path / "exports" / "pilot-v1" / "backend" / "documents.jsonl").exists()
     assert (tmp_path / "exports" / "pilot-v1" / "rag" / "embedding-input.jsonl").exists()
-

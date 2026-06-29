@@ -832,7 +832,16 @@ def document_identity(
 def section_html(section: dict[str, Any] | None) -> str:
     if section is None:
         return ""
-    value = first_present(section, "content", "Content", "text")
+    value = first_present(
+        section,
+        "content",
+        "Content",
+        "html",
+        "Html",
+        "HTML",
+        "text",
+        "Text",
+    )
     return value if isinstance(value, str) else ""
 
 

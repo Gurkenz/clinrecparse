@@ -22,11 +22,13 @@ from clinrec.bank.common import (
     sha256_file,
     string_value,
 )
+from clinrec.parsed.models import CANONICAL_PARSER_VERSION, CANONICAL_SCHEMA_VERSION
 from clinrec.parsed.pipeline import (
     ParseConfig,
     ParsedShowcaseOptions,
     is_javascript_url,
     resolve_showcase_input,
+    validate_parsed_bundle,
 )
 from clinrec.parsed.pipeline import (
     parse_document as parse_canonical_document,
@@ -34,8 +36,8 @@ from clinrec.parsed.pipeline import (
 from clinrec.research.reports import write_json, write_jsonl
 from clinrec.research.sections import raw_sections, section_html
 
-PARSED_SCHEMA_VERSION = "1.0"
-PARSER_VERSION = "parsed-layer-1"
+PARSED_SCHEMA_VERSION = CANONICAL_SCHEMA_VERSION
+PARSER_VERSION = CANONICAL_PARSER_VERSION
 
 
 @dataclass(frozen=True)
@@ -106,32 +108,52 @@ class BuildState:
     source_root: Path
     documents: list[dict[str, Any]]
     sections: list[dict[str, Any]]
+    blocks: list[dict[str, Any]]
     tables: list[dict[str, Any]]
+    table_cells: list[dict[str, Any]]
+    table_placements: list[dict[str, Any]]
     images: list[dict[str, Any]]
+    assets: list[dict[str, Any]]
+    recommendations: list[dict[str, Any]]
+    references: list[dict[str, Any]]
     relations: list[dict[str, Any]]
     search_chunks: list[dict[str, Any]]
     rag_chunks: list[dict[str, Any]]
     citation_rows: list[dict[str, Any]]
+    document_validations: list[dict[str, Any]]
     anomalies: list[dict[str, Any]]
 
 
 def build_parsed_dataset(options: ParsedBuildOptions) -> ParsedBuildSummary:
     validate_build_options(options)
     ensure_parsed_output_safe(options.output)
-    options.output.mkdir(parents=True, exist_ok=True)
-    (options.output / "reports").mkdir(parents=True, exist_ok=True)
+    output_parent = options.output.parent
+    part_output = output_parent / f".{options.output.name}.part"
+    failure_report = output_parent / f"{options.output.name}.failure.json"
+    safe_remove_tree(part_output, output_parent)
+    if options.output.exists():
+        raise BankError(f"Parsed output already exists: {options.output}")
+    part_output.mkdir(parents=True, exist_ok=True)
+    (part_output / "reports").mkdir(parents=True, exist_ok=True)
     refs = select_raw_documents(options)
     state = BuildState(
-        output=options.output,
+        output=part_output,
         source_root=options.input,
         documents=[],
         sections=[],
+        blocks=[],
         tables=[],
+        table_cells=[],
+        table_placements=[],
         images=[],
+        assets=[],
+        recommendations=[],
+        references=[],
         relations=[],
         search_chunks=[],
         rag_chunks=[],
         citation_rows=[],
+        document_validations=[],
         anomalies=[],
     )
     for ref in refs:
@@ -147,12 +169,34 @@ def build_parsed_dataset(options: ParsedBuildOptions) -> ParsedBuildSummary:
                     "error": str(exc),
                 }
             )
+    if state.anomalies:
+        write_failure_report(failure_report, state, options, source_documents=len(refs))
+        safe_remove_tree(part_output, output_parent)
+        raise BankError(
+            f"parsed-build failed for {len(state.anomalies)} document(s); "
+            f"failure report: {failure_report}"
+        )
     state.relations = build_relations(state.documents)
     write_dataset_artifacts(state, options, source_documents=len(refs))
+    release_validation = validate_parsed_release(part_output)
+    if not release_validation["valid"]:
+        state.anomalies.append(
+            {
+                "stage": "release_validation",
+                "path": part_output.as_posix(),
+                "error": "parsed release validation failed",
+                "errors": release_validation["errors"],
+            }
+        )
+        write_failure_report(failure_report, state, options, source_documents=len(refs))
+        safe_remove_tree(part_output, output_parent)
+        raise BankError(f"parsed release validation failed; failure report: {failure_report}")
     summary = parsed_summary(state, source_documents=len(refs))
-    summary_path = options.output / "reports" / "parsed-summary.json"
+    summary_path = part_output / "reports" / "parsed-summary.json"
     write_json(summary_path, summary)
-    write_jsonl(options.output / "reports" / "parser-anomalies.jsonl", state.anomalies)
+    write_jsonl(part_output / "reports" / "parser-anomalies.jsonl", state.anomalies)
+    part_output.replace(options.output)
+    final_summary_path = options.output / "reports" / "parsed-summary.json"
     return ParsedBuildSummary(
         output=options.output,
         source_documents=len(refs),
@@ -162,7 +206,7 @@ def build_parsed_dataset(options: ParsedBuildOptions) -> ParsedBuildSummary:
         tables=len(state.tables),
         images=len(state.images),
         chunks=len(state.search_chunks),
-        summary_path=summary_path,
+        summary_path=final_summary_path,
     )
 
 
@@ -173,6 +217,43 @@ def validate_build_options(options: ParsedBuildOptions) -> None:
         raise BankError(f"Parsed input corpus is missing: {options.input}")
     for code_version in options.code_versions:
         parse_code_version_or_raise(code_version)
+
+
+def write_failure_report(
+    path: Path,
+    state: BuildState,
+    options: ParsedBuildOptions,
+    *,
+    source_documents: int,
+) -> None:
+    write_json(
+        path,
+        {
+            "schema_version": PARSED_SCHEMA_VERSION,
+            "parser_version": PARSER_VERSION,
+            "valid": False,
+            "output": options.output.as_posix(),
+            "temporary_output": state.output.as_posix(),
+            "source_corpus": options.input.as_posix(),
+            "source_documents": source_documents,
+            "parsed_documents": len(state.documents),
+            "failed_documents": len(state.anomalies),
+            "anomalies": state.anomalies,
+            "document_validations": state.document_validations,
+        },
+    )
+
+
+def safe_remove_tree(path: Path, allowed_parent: Path) -> None:
+    if not path.exists():
+        return
+    resolved = path.resolve()
+    parent = allowed_parent.resolve()
+    try:
+        resolved.relative_to(parent)
+    except ValueError as exc:
+        raise BankError(f"Refusing to remove path outside output parent: {path}") from exc
+    shutil.rmtree(resolved)
 
 
 def ensure_parsed_output_safe(output: Path) -> None:
@@ -243,6 +324,17 @@ def parse_raw_document(state: BuildState, ref: RawDocumentRef) -> None:
             source_raw_path=raw_relative,
         ),
     )
+    validation = validate_parsed_bundle(bundle)
+    validation["source_raw_path"] = raw_relative
+    validation["document_kind"] = ref.kind
+    validation["code_version"] = ref.code_version
+    validation["current_code_version"] = ref.current_code_version
+    state.document_validations.append(validation)
+    if not validation["valid"]:
+        raise BankError(
+            f"canonical bundle validation failed for {raw_relative}: "
+            f"{len(validation['errors'])} error(s)"
+        )
     document_dir = document_output_dir(state.output, ref)
     document_dir.mkdir(parents=True, exist_ok=True)
     document = dict(bundle.document)
@@ -251,42 +343,60 @@ def parse_raw_document(state: BuildState, ref: RawDocumentRef) -> None:
     document["source_section_count"] = len(bundle.sections)
     document["image_count"] = len(bundle.images)
     document_sections = [layer_section_row(row, ref) for row in bundle.sections]
+    document_blocks = [layer_canonical_row(row, ref) for row in bundle.blocks]
     document_tables = [layer_table_row(row, ref) for row in bundle.tables]
+    document_table_cells = [layer_canonical_row(row, ref) for row in bundle.table_cells]
+    document_table_placements = [
+        layer_canonical_row(row, ref) for row in bundle.table_placements
+    ]
     document_images = [layer_image_row(row, ref, raw_relative) for row in bundle.images]
+    document_assets = [layer_canonical_row(row, ref) for row in bundle.assets]
+    document_recommendations = [
+        layer_canonical_row(row, ref) for row in bundle.recommendations
+    ]
+    document_references = [layer_canonical_row(row, ref) for row in bundle.references]
     rag_chunks = [layer_chunk_row(row, ref) for row in bundle.chunks]
     search_chunks = [search_chunk_from_rag(row) for row in rag_chunks]
     copy_bundle_assets(state.output, bundle.assets)
     write_json(document_dir / "document.json", document)
     write_jsonl(document_dir / "sections.jsonl", document_sections)
+    write_jsonl(document_dir / "blocks.jsonl", document_blocks)
     write_jsonl(document_dir / "tables.jsonl", document_tables)
+    write_jsonl(document_dir / "table-cells.jsonl", document_table_cells)
+    write_jsonl(document_dir / "table-placements.jsonl", document_table_placements)
     write_jsonl(document_dir / "images.jsonl", document_images)
     state.documents.append(document)
     state.sections.extend(document_sections)
+    state.blocks.extend(document_blocks)
     state.tables.extend(document_tables)
+    state.table_cells.extend(document_table_cells)
+    state.table_placements.extend(document_table_placements)
     state.images.extend(document_images)
+    extend_unique(state.assets, document_assets, "asset_id")
+    state.recommendations.extend(document_recommendations)
+    state.references.extend(document_references)
     state.rag_chunks.extend(rag_chunks)
     state.search_chunks.extend(search_chunks)
     state.citation_rows.extend(citation_row(row) for row in rag_chunks)
 
 
+def layer_canonical_row(row: dict[str, Any], ref: RawDocumentRef) -> dict[str, Any]:
+    result = dict(row)
+    result["schema_version"] = PARSED_SCHEMA_VERSION
+    result["document_kind"] = ref.kind
+    result["code_version"] = ref.code_version
+    result["current_code_version"] = ref.current_code_version
+    return result
+
+
 def layer_section_row(row: dict[str, Any], ref: RawDocumentRef) -> dict[str, Any]:
-    section = dict(row)
-    section["schema_version"] = PARSED_SCHEMA_VERSION
-    section["document_kind"] = ref.kind
-    section["code_version"] = ref.code_version
-    section["current_code_version"] = ref.current_code_version
+    section = layer_canonical_row(row, ref)
     section["section_title"] = section.get("title")
-    section["source_order"] = int(section.get("source_order") or 0) + 1
     return section
 
 
 def layer_table_row(row: dict[str, Any], ref: RawDocumentRef) -> dict[str, Any]:
-    table = dict(row)
-    table["schema_version"] = PARSED_SCHEMA_VERSION
-    table["document_kind"] = ref.kind
-    table["code_version"] = ref.code_version
-    table["current_code_version"] = ref.current_code_version
-    table["source_order"] = int(table.get("source_order") or 0) + 1
+    table = layer_canonical_row(row, ref)
     return table
 
 
@@ -295,13 +405,8 @@ def layer_image_row(
     ref: RawDocumentRef,
     raw_relative: str,
 ) -> dict[str, Any]:
-    image = dict(row)
-    image["schema_version"] = PARSED_SCHEMA_VERSION
-    image["document_kind"] = ref.kind
-    image["code_version"] = ref.code_version
-    image["current_code_version"] = ref.current_code_version
+    image = layer_canonical_row(row, ref)
     image["source_raw_path"] = raw_relative
-    image["source_order"] = int(image.get("source_order") or 0) + 1
     return image
 
 
@@ -330,6 +435,20 @@ def copy_bundle_assets(output: Path, assets: list[dict[str, Any]]) -> None:
             continue
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(source, target)
+
+
+def extend_unique(
+    target: list[dict[str, Any]],
+    rows: list[dict[str, Any]],
+    key: str,
+) -> None:
+    seen = {string_value(row.get(key)) for row in target}
+    for row in rows:
+        stable_id = string_value(row.get(key))
+        if stable_id in seen:
+            continue
+        target.append(row)
+        seen.add(stable_id)
 
 
 def search_chunk_from_rag(chunk: dict[str, Any]) -> dict[str, Any]:
@@ -410,16 +529,40 @@ def write_dataset_artifacts(
         "failed_documents": len(state.anomalies),
         "documents": len(state.documents),
         "sections": len(state.sections),
+        "blocks": len(state.blocks),
         "tables": len(state.tables),
+        "table_cells": len(state.table_cells),
+        "logical_table_placements": len(state.table_placements),
         "images": len(state.images),
+        "assets": len(state.assets),
+        "recommendations": len(state.recommendations),
+        "references": len(state.references),
         "search_chunks": len(state.search_chunks),
         "rag_chunks": len(state.rag_chunks),
     }
     write_json(state.output / "dataset.json", dataset)
     write_jsonl(state.output / "documents.jsonl", sorted_rows(state.documents, "document_id"))
     write_jsonl(state.output / "sections.jsonl", sorted_rows(state.sections, "section_id"))
+    write_jsonl(state.output / "blocks.jsonl", sorted_rows(state.blocks, "block_id"))
     write_jsonl(state.output / "tables.jsonl", sorted_rows(state.tables, "table_id"))
+    write_jsonl(
+        state.output / "table-cells.jsonl",
+        sorted_rows(state.table_cells, "cell_id"),
+    )
+    write_jsonl(
+        state.output / "table-placements.jsonl",
+        sorted_rows(state.table_placements, "placement_id"),
+    )
     write_jsonl(state.output / "images.jsonl", sorted_rows(state.images, "image_id"))
+    write_jsonl(state.output / "assets.jsonl", sorted_rows(state.assets, "asset_id"))
+    write_jsonl(
+        state.output / "recommendations.jsonl",
+        sorted_rows(state.recommendations, "recommendation_id"),
+    )
+    write_jsonl(
+        state.output / "references.jsonl",
+        sorted_rows(state.references, "reference_id"),
+    )
     write_jsonl(
         state.output / "relations.jsonl",
         sorted_rows(state.relations, "current_code_version"),
@@ -437,6 +580,10 @@ def write_dataset_artifacts(
         state.output / "rag" / "embedding-input.jsonl",
         embedding_rows(state.rag_chunks),
     )
+    write_jsonl(
+        state.output / "reports" / "document-validation.jsonl",
+        sorted_rows(state.document_validations, "document_id"),
+    )
 
 
 def parsed_summary(state: BuildState, *, source_documents: int) -> dict[str, Any]:
@@ -448,9 +595,15 @@ def parsed_summary(state: BuildState, *, source_documents: int) -> dict[str, Any
         "parsed_documents": len(state.documents),
         "failed_documents": len(state.anomalies),
         "sections": len(state.sections),
+        "blocks": len(state.blocks),
         "tables": len(state.tables),
+        "table_cells": len(state.table_cells),
+        "logical_table_placements": len(state.table_placements),
         "table_classifications": dict(sorted(table_classes.items())),
         "images": len(state.images),
+        "assets": len(state.assets),
+        "recommendations": len(state.recommendations),
+        "references": len(state.references),
         "images_by_source_type": dict(sorted(image_sources.items())),
         "base64_decoded": sum(1 for row in state.images if row.get("asset_sha256")),
         "external_images": sum(
@@ -465,35 +618,204 @@ def parsed_summary(state: BuildState, *, source_documents: int) -> dict[str, Any
     }
 
 
-def validate_parsed_dataset(input_path: Path) -> ParsedValidationSummary:
-    dataset = read_json_file(input_path / "dataset.json")
-    source_root = Path(string_value(dataset.get("source_corpus")))
+def validate_parsed_release(input_path: Path) -> dict[str, Any]:
     errors: list[dict[str, Any]] = []
     warnings: list[dict[str, Any]] = []
-    text_checks: list[dict[str, Any]] = []
+    required = [
+        "dataset.json",
+        "documents.jsonl",
+        "sections.jsonl",
+        "blocks.jsonl",
+        "tables.jsonl",
+        "table-cells.jsonl",
+        "table-placements.jsonl",
+        "images.jsonl",
+        "assets.jsonl",
+        "recommendations.jsonl",
+        "references.jsonl",
+        "relations.jsonl",
+        "search/chunks.jsonl",
+        "rag/chunks.jsonl",
+        "rag/citation-index.jsonl",
+        "rag/embedding-input.jsonl",
+        "reports/document-validation.jsonl",
+    ]
+    for relative in required:
+        if not (input_path / relative).exists():
+            errors.append(issue(relative, "required_file_missing", None))
+    dataset = read_json_file(input_path / "dataset.json")
+    if int(dataset.get("failed_documents") or 0) != 0:
+        errors.append(
+            issue(
+                "dataset.json",
+                "failed_documents_nonzero",
+                dataset.get("failed_documents"),
+            )
+        )
     documents = read_jsonl(input_path / "documents.jsonl")
     sections = read_jsonl(input_path / "sections.jsonl")
+    blocks = read_jsonl(input_path / "blocks.jsonl")
+    tables = read_jsonl(input_path / "tables.jsonl")
+    table_cells = read_jsonl(input_path / "table-cells.jsonl")
+    table_placements = read_jsonl(input_path / "table-placements.jsonl")
     images = read_jsonl(input_path / "images.jsonl")
-    seen_ids: set[str] = set()
+    assets = read_jsonl(input_path / "assets.jsonl")
+    recommendations = read_jsonl(input_path / "recommendations.jsonl")
+    references = read_jsonl(input_path / "references.jsonl")
+    chunks = read_jsonl(input_path / "rag" / "chunks.jsonl")
+    validations = read_jsonl(input_path / "reports" / "document-validation.jsonl")
     for path, rows, key in (
         ("documents.jsonl", documents, "document_id"),
         ("sections.jsonl", sections, "section_id"),
+        ("blocks.jsonl", blocks, "block_id"),
+        ("tables.jsonl", tables, "table_id"),
+        ("table-cells.jsonl", table_cells, "cell_id"),
+        ("table-placements.jsonl", table_placements, "placement_id"),
         ("images.jsonl", images, "image_id"),
-        ("tables.jsonl", read_jsonl(input_path / "tables.jsonl"), "table_id"),
+        ("assets.jsonl", assets, "asset_id"),
+        ("recommendations.jsonl", recommendations, "recommendation_id"),
+        ("references.jsonl", references, "reference_id"),
+        ("rag/chunks.jsonl", chunks, "chunk_id"),
     ):
+        seen_ids: set[str] = set()
         for row in rows:
             stable_id = string_value(row.get(key))
             if stable_id in seen_ids:
                 errors.append(issue(path, "duplicate_stable_id", stable_id))
             seen_ids.add(stable_id)
-    section_rows_by_document = group_rows(sections, "document_id")
-    for document in documents:
-        validate_document(input_path, source_root, document, section_rows_by_document, errors)
+    document_ids = {string_value(document.get("document_id")) for document in documents}
+    section_ids = {string_value(section.get("section_id")) for section in sections}
+    block_ids = {string_value(block.get("block_id")) for block in blocks}
+    table_ids = {string_value(table.get("table_id")) for table in tables}
+    cell_ids = {string_value(cell.get("cell_id")) for cell in table_cells}
+    placement_ids = {string_value(row.get("placement_id")) for row in table_placements}
+    image_ids = {string_value(image.get("image_id")) for image in images}
+    asset_ids = {string_value(asset.get("asset_id")) for asset in assets}
+    for validation in validations:
+        if not validation.get("valid"):
+            errors.append(
+                issue(
+                    string_value(validation.get("document_id")),
+                    "document_validation_failed",
+                    None,
+                )
+            )
     for section in sections:
         validate_section_html(section, errors)
-        text_checks.append(validate_text_preservation(source_root, section, errors))
+        if string_value(section.get("document_id")) not in document_ids:
+            errors.append(
+                issue(
+                    string_value(section.get("section_id")),
+                    "unresolved_document_id",
+                    None,
+                )
+            )
+    for block in blocks:
+        if string_value(block.get("section_id")) not in section_ids:
+            errors.append(issue(string_value(block.get("block_id")), "unresolved_section_id", None))
+    for table in tables:
+        if string_value(table.get("section_id")) not in section_ids:
+            errors.append(
+                issue(
+                    string_value(table.get("table_id")),
+                    "unresolved_table_section",
+                    None,
+                )
+            )
+    for cell in table_cells:
+        if string_value(cell.get("table_id")) not in table_ids:
+            errors.append(issue(string_value(cell.get("cell_id")), "unresolved_cell_table", None))
+    for placement in table_placements:
+        if string_value(placement.get("table_id")) not in table_ids:
+            errors.append(
+                issue(
+                    string_value(placement.get("placement_id")),
+                    "unresolved_placement_table",
+                    None,
+                )
+            )
+        if string_value(placement.get("origin_cell_id")) not in cell_ids:
+            errors.append(
+                issue(
+                    string_value(placement.get("placement_id")),
+                    "unresolved_origin_cell",
+                    None,
+                )
+            )
     for image in images:
         validate_image_asset(input_path, image, errors, warnings)
+        asset_id = string_value(image.get("asset_id"))
+        if asset_id and asset_id not in asset_ids:
+            errors.append(
+                issue(
+                    string_value(image.get("image_id")),
+                    "unresolved_image_asset",
+                    asset_id,
+                )
+            )
+    for recommendation in recommendations:
+        for block_id in recommendation.get("block_ids") or []:
+            if string_value(block_id) not in block_ids:
+                errors.append(
+                    issue(
+                        string_value(recommendation.get("recommendation_id")),
+                        "unresolved_recommendation_block",
+                        block_id,
+                    )
+                )
+    for reference in references:
+        if string_value(reference.get("block_id")) not in block_ids:
+            errors.append(
+                issue(
+                    string_value(reference.get("reference_id")),
+                    "unresolved_reference_block",
+                    None,
+                )
+            )
+    for chunk in chunks:
+        if string_value(chunk.get("section_id")) not in section_ids:
+            errors.append(
+                issue(
+                    string_value(chunk.get("chunk_id")),
+                    "unresolved_chunk_section",
+                    None,
+                )
+            )
+        table_id = string_value(chunk.get("table_id"))
+        if table_id and table_id not in table_ids:
+            errors.append(
+                issue(
+                    string_value(chunk.get("chunk_id")),
+                    "unresolved_chunk_table",
+                    table_id,
+                )
+            )
+        image_id = string_value(chunk.get("image_id"))
+        if image_id and image_id not in image_ids:
+            errors.append(
+                issue(
+                    string_value(chunk.get("chunk_id")),
+                    "unresolved_chunk_image",
+                    image_id,
+                )
+            )
+        for placement_id in chunk.get("placement_ids") or []:
+            if string_value(placement_id) not in placement_ids:
+                errors.append(
+                    issue(
+                        string_value(chunk.get("chunk_id")),
+                        "unresolved_chunk_placement",
+                        placement_id,
+                    )
+                )
+        if int(chunk.get("estimated_token_count") or chunk.get("token_estimate") or 0) > 1100:
+            errors.append(
+                issue(
+                    string_value(chunk.get("chunk_id")),
+                    "estimated_chunk_size_exceeded",
+                    None,
+                )
+            )
     report = {
         "schema_version": PARSED_SCHEMA_VERSION,
         "input": input_path.as_posix(),
@@ -503,22 +825,36 @@ def validate_parsed_dataset(input_path: Path) -> ParsedValidationSummary:
         "summary": {
             "documents": len(documents),
             "sections": len(sections),
+            "blocks": len(blocks),
+            "tables": len(tables),
+            "table_cells": len(table_cells),
+            "logical_table_placements": len(table_placements),
             "images": len(images),
+            "assets": len(assets),
+            "recommendations": len(recommendations),
+            "references": len(references),
+            "chunks": len(chunks),
             "errors": len(errors),
             "warnings": len(warnings),
         },
     }
     reports = input_path / "reports"
+    write_json(reports / "release-validation.json", report)
+    return report
+
+
+def validate_parsed_dataset(input_path: Path) -> ParsedValidationSummary:
+    report = validate_parsed_release(input_path)
+    reports = input_path / "reports"
     write_json(reports / "parsed-validation.json", report)
-    write_json(reports / "text-preservation.json", {"checks": text_checks})
     write_json(reports / "determinism.json", content_hash_manifest(input_path))
     markdown = render_validation_markdown(report)
     (reports / "parsed-validation.md").write_text(markdown, encoding="utf-8", newline="\n")
     return ParsedValidationSummary(
         input=input_path,
-        valid=not errors,
-        errors=len(errors),
-        warnings=len(warnings),
+        valid=bool(report["valid"]),
+        errors=len(report["errors"]),
+        warnings=len(report["warnings"]),
         report_json=reports / "parsed-validation.json",
         report_markdown=reports / "parsed-validation.md",
     )
@@ -609,15 +945,28 @@ def validate_image_asset(
     warnings: list[dict[str, Any]],
 ) -> None:
     if image.get("decode_error"):
-        warnings.append(issue(string_value(image.get("image_id")), "image_decode_failure", None))
-        return
+        errors.append(
+            issue(
+                string_value(image.get("image_id")),
+                "image_decode_failure",
+                image.get("decode_error"),
+            )
+        )
     asset_path = string_value(image.get("asset_path"))
-    if image.get("source_type") == "base64" and not asset_path:
+    if image.get("source_type") in {"base64", "relative"} and not asset_path:
         errors.append(
             issue(
                 string_value(image.get("image_id")),
                 "unresolved_local_image_reference",
                 None,
+            )
+        )
+    if image.get("source_type") in {"http", "https"}:
+        errors.append(
+            issue(
+                string_value(image.get("image_id")),
+                "external_image_unresolved",
+                image.get("original_src"),
             )
         )
     if asset_path and not (input_path / asset_path).exists():
@@ -636,18 +985,29 @@ def export_parsed_dataset(input_path: Path, output: Path) -> ParsedExportSummary
     frontend = output / "frontend"
     search = output / "search"
     rag = output / "rag"
-    for source, target in (
+    backend_files = (
         ("documents.jsonl", backend / "documents.jsonl"),
         ("sections.jsonl", backend / "sections.jsonl"),
+        ("blocks.jsonl", backend / "blocks.jsonl"),
         ("tables.jsonl", backend / "tables.jsonl"),
+        ("table-cells.jsonl", backend / "table-cells.jsonl"),
+        ("table-placements.jsonl", backend / "table-placements.jsonl"),
         ("images.jsonl", backend / "images.jsonl"),
+        ("assets.jsonl", backend / "assets.jsonl"),
+        ("recommendations.jsonl", backend / "recommendations.jsonl"),
+        ("references.jsonl", backend / "references.jsonl"),
         ("relations.jsonl", backend / "relations.jsonl"),
         ("dataset.json", backend / "dataset.json"),
+        ("reports/document-validation.jsonl", backend / "reports" / "document-validation.jsonl"),
+        ("reports/release-validation.json", backend / "reports" / "release-validation.json"),
+    )
+    data_files = (
         ("search/chunks.jsonl", search / "chunks.jsonl"),
         ("rag/chunks.jsonl", rag / "chunks.jsonl"),
         ("rag/citation-index.jsonl", rag / "citation-index.jsonl"),
         ("rag/embedding-input.jsonl", rag / "embedding-input.jsonl"),
-    ):
+    )
+    for source, target in (*backend_files, *data_files):
         copy_file(input_path / source, target)
     documents = read_jsonl(input_path / "documents.jsonl")
     sections = group_rows(read_jsonl(input_path / "sections.jsonl"), "document_id")
@@ -668,7 +1028,7 @@ def export_parsed_dataset(input_path: Path, output: Path) -> ParsedExportSummary
     return ParsedExportSummary(
         input=input_path,
         output=output,
-        backend_files=6,
+        backend_files=len(backend_files),
         frontend_documents=len(documents),
         assets=assets,
         search_chunks=len(read_jsonl(search / "chunks.jsonl")),
@@ -1037,7 +1397,17 @@ def write_frontend_document(
         "images": images.get(document_id, []),
         "warnings": document.get("warnings") or [],
     }
-    write_json(root / "documents" / f"{code_version}.json", payload)
+    if document.get("document_kind") == "previous":
+        target = (
+            root
+            / "documents"
+            / "previous"
+            / string_value(document.get("current_code_version"))
+            / f"{code_version}.json"
+        )
+    else:
+        target = root / "documents" / "current" / f"{code_version}.json"
+    write_json(target, payload)
 
 
 def copy_assets(source: Path, target: Path) -> int:

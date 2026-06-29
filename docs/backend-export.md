@@ -4,8 +4,14 @@
 
 - `documents.jsonl`
 - `sections.jsonl`
+- `blocks.jsonl`
 - `tables.jsonl`
+- `table-cells.jsonl`
+- `table-placements.jsonl`
 - `images.jsonl`
+- `assets.jsonl`
+- `recommendations.jsonl`
+- `references.jsonl`
 - `relations.jsonl`
 - `dataset.json`
 
@@ -17,7 +23,7 @@ Properties:
 - Foreign keys are stable parsed IDs.
 - Source raw path and raw SHA-256 remain available for audit.
 
-`clinrec parsed-build-showcase` writes schema `0.2-pilot` backend records to
+`clinrec parsed-build-showcase` writes schema `0.3-pilot` backend records to
 `data/showcase/{CodeVersion}/backend/`. The package mirrors canonical records:
 
 - `documents.jsonl`
@@ -25,6 +31,7 @@ Properties:
 - `blocks.jsonl`
 - `tables.jsonl`
 - `table-cells.jsonl`
+- `table-placements.jsonl`
 - `images.jsonl`
 - `assets.jsonl`
 - `recommendations.jsonl`

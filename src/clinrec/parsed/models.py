@@ -5,8 +5,8 @@ import re
 
 from clinrec.bank.common import string_value
 
-CANONICAL_SCHEMA_VERSION = "0.2-pilot"
-CANONICAL_PARSER_VERSION = "parsed-canonical-0.3"
+CANONICAL_SCHEMA_VERSION = "0.3-pilot"
+CANONICAL_PARSER_VERSION = "parsed-canonical-0.4"
 
 
 def sha256_text(value: str) -> str:

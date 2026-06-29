@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from bs4 import BeautifulSoup
 from bs4.element import NavigableString, PageElement, Tag
@@ -29,12 +30,19 @@ from clinrec.bank.common import (
     stable_json_dumps,
     string_value,
 )
-from clinrec.parsed.models import estimate_tokens, extension_for_mime, safe_id, sha256_text
+from clinrec.parsed.models import (
+    CANONICAL_PARSER_VERSION,
+    CANONICAL_SCHEMA_VERSION,
+    estimate_tokens,
+    extension_for_mime,
+    safe_id,
+    sha256_text,
+)
 from clinrec.research.reports import write_json, write_jsonl
-from clinrec.research.sections import raw_sections, section_html, section_id_for
+from clinrec.research.sections import section_html, section_id_for
 
-SHOWCASE_SCHEMA_VERSION = "0.2-pilot"
-SHOWCASE_PARSER_VERSION = "parsed-showcase-0.2"
+SHOWCASE_SCHEMA_VERSION = CANONICAL_SCHEMA_VERSION
+SHOWCASE_PARSER_VERSION = CANONICAL_PARSER_VERSION
 DEFAULT_SHOWCASE_CODE_VERSION = "843_1"
 CHUNK_TARGET_TOKENS = 700
 CHUNK_MAXIMUM_TOKENS = 1100
@@ -131,6 +139,48 @@ IMAGE_SIGNATURES = {
     "image/webp": (b"RIFF",),
     "image/gif": (b"GIF87a", b"GIF89a"),
 }
+RAW_CHILD_SECTION_KEYS = (
+    "sections",
+    "Sections",
+    "children",
+    "Children",
+    "items",
+    "Items",
+    "subsections",
+    "Subsections",
+)
+SAFE_URL_SCHEMES = {"", "http", "https", "mailto"}
+SAFE_ATTRS_BY_TAG = {
+    "*": {"title", "aria-label"},
+    "a": {"href", "title"},
+    "img": {"src", "alt", "title", "width", "height"},
+    "td": {"rowspan", "colspan"},
+    "th": {"rowspan", "colspan", "scope"},
+    "ol": {"start", "type"},
+    "ul": {"type"},
+}
+GENERATED_SAFE_ATTRS = {
+    "data-section-id",
+    "data-table-id",
+    "data-image-id",
+    "data-asset-id",
+    "data-image-status",
+}
+
+
+@dataclass(frozen=True)
+class RawSectionRecord:
+    section: dict[str, Any]
+    raw_path: str
+    parent_raw_path: str | None
+    source_order: int
+    depth: int
+
+
+@dataclass(frozen=True)
+class RawSourceInventory:
+    sections: list[RawSectionRecord]
+    errors: list[dict[str, Any]]
 
 
 class ShowcaseError(RuntimeError):
@@ -230,6 +280,7 @@ class ShowcaseState:
     blocks: list[dict[str, Any]]
     tables: list[dict[str, Any]]
     table_cells: list[dict[str, Any]]
+    table_placements: list[dict[str, Any]]
     images: list[dict[str, Any]]
     assets: list[dict[str, Any]]
     recommendations: list[dict[str, Any]]
@@ -263,6 +314,7 @@ class ParsedDocumentBundle:
     blocks: list[dict[str, Any]]
     tables: list[dict[str, Any]]
     table_cells: list[dict[str, Any]]
+    table_placements: list[dict[str, Any]]
     images: list[dict[str, Any]]
     assets: list[dict[str, Any]]
     recommendations: list[dict[str, Any]]
@@ -341,6 +393,13 @@ def build_parsed_showcase(options: ParsedShowcaseOptions) -> ParsedShowcaseSumma
         safe_remove_tree(build_b, showcase_parent)
 
     finalize_showcase_directory(options.output, state_a, raw_after_sha=raw_after_sha)
+    validation = validate_showcase_directory(options.output)
+    if not validation["valid"]:
+        raise ShowcaseValidationError(
+            "showcase validation failed after finalization",
+            options.output / "reports" / "showcase-validation.json",
+        )
+    write_checksums(options.output)
     archive = options.output.parent / f"clinrec-showcase-{source.code_version}.zip"
     if archive.exists():
         archive.unlink()
@@ -348,8 +407,9 @@ def build_parsed_showcase(options: ParsedShowcaseOptions) -> ParsedShowcaseSumma
     zip_report = verify_showcase_zip(options.output, archive)
     archive_sha = sha256_file(archive)
     archive_size = archive.stat().st_size
+    archive_report = archive.with_suffix(".archive-verification.json")
     write_json(
-        options.output / "reports" / "archive-verification.json",
+        archive_report,
         {
             **zip_report,
             "archive_path": archive.as_posix(),
@@ -357,13 +417,10 @@ def build_parsed_showcase(options: ParsedShowcaseOptions) -> ParsedShowcaseSumma
             "archive_size": archive_size,
         },
     )
-    write_checksums(options.output)
-    validation = validate_showcase_directory(options.output)
-    if not validation["valid"]:
-        raise ShowcaseValidationError(
-            "showcase validation failed after finalization",
-            options.output / "reports" / "showcase-validation.json",
-        )
+    archive.with_suffix(archive.suffix + ".sha256").write_text(
+        f"{archive_sha}  {archive.name}\n",
+        encoding="utf-8",
+    )
 
     return summary_from_state(
         state_a,
@@ -420,8 +477,14 @@ def resolve_showcase_input(options: ParsedShowcaseOptions) -> ShowcaseInput:
         raise ShowcaseInputError(
             f"CodeVersion mismatch: expected {options.code_version}, got {payload_code_version}"
         )
+    obj_value = payload.get("obj")
+    obj: dict[str, Any] = obj_value if isinstance(obj_value, dict) else {}
     payload_code = int_value(first_present(payload, "code", "Code"))
+    if payload_code is None:
+        payload_code = int_value(first_present(obj, "code", "Code"))
     payload_version = int_value(first_present(payload, "version", "Version", "ver", "Ver"))
+    if payload_version is None:
+        payload_version = int_value(first_present(obj, "version", "Version", "ver", "Ver"))
     if payload_code != code or payload_version != version:
         raise ShowcaseInputError(
             "code/version mismatch: "
@@ -500,6 +563,13 @@ def build_showcase_directory(
             build_config_sha256=build_config_sha256,
         ),
     )
+    bundle_validation = validate_parsed_bundle(bundle)
+    write_json(root / "reports" / "bundle-validation.json", bundle_validation)
+    if not bundle_validation["valid"]:
+        raise ShowcaseValidationError(
+            "canonical bundle validation failed",
+            root / "reports" / "bundle-validation.json",
+        )
     write_showcase_packages(bundle.state)
     return bundle.state
 
@@ -525,6 +595,7 @@ def parse_document(
         blocks=[],
         tables=[],
         table_cells=[],
+        table_placements=[],
         images=[],
         assets=[],
         recommendations=[],
@@ -542,6 +613,7 @@ def parse_document(
         blocks=state.blocks,
         tables=state.tables,
         table_cells=state.table_cells,
+        table_placements=state.table_placements,
         images=state.images,
         assets=state.assets,
         recommendations=state.recommendations,
@@ -552,6 +624,118 @@ def parse_document(
         warnings=state.warnings,
         errors=state.errors,
     )
+
+
+def validate_parsed_bundle(bundle: ParsedDocumentBundle) -> dict[str, Any]:
+    errors: list[dict[str, Any]] = list(bundle.errors)
+    warnings: list[dict[str, Any]] = list(bundle.warnings)
+    inventory = build_raw_source_inventory(bundle.state.source.payload)
+    errors.extend(inventory.errors)
+    raw_sections_count = len(inventory.sections)
+    raw_table_count = 0
+    raw_image_count = 0
+    for record in inventory.sections:
+        soup = BeautifulSoup(section_html(record.section), "lxml")
+        raw_table_count += len([tag for tag in soup.find_all("table") if isinstance(tag, Tag)])
+        raw_image_count += len([tag for tag in soup.find_all("img") if isinstance(tag, Tag)])
+    raw_paths = {record.raw_path for record in inventory.sections}
+    parsed_paths = {string_value(section.get("raw_path")) for section in bundle.sections}
+    for missing_path in sorted(raw_paths - parsed_paths):
+        errors.append(issue(missing_path, "missing_raw_section", None))
+    for extra_path in sorted(parsed_paths - raw_paths):
+        errors.append(issue(extra_path, "parsed_section_without_raw_path", None))
+    parsed_counts = {
+        "sections": len(bundle.sections),
+        "tables": len(bundle.tables),
+        "images": len(bundle.images),
+        "blocks": len(bundle.blocks),
+        "table_cells": len(bundle.table_cells),
+        "logical_table_placements": len(bundle.table_placements),
+        "assets": len(bundle.assets),
+        "recommendations": len(bundle.recommendations),
+        "references": len(bundle.references),
+        "chunks": len(bundle.chunks),
+    }
+    source_counts = {
+        "sections": raw_sections_count,
+        "tables": raw_table_count,
+        "images": raw_image_count,
+    }
+    for key in ("sections", "tables", "images"):
+        if source_counts[key] != parsed_counts[key]:
+            errors.append(
+                issue(
+                    bundle.document.get("document_id", "document"),
+                    f"raw_{key}_count_mismatch",
+                    {"raw": source_counts[key], "parsed": parsed_counts[key]},
+                )
+            )
+    validate_duplicate_ids(
+        errors,
+        (
+            ("sections", bundle.sections, "section_id"),
+            ("blocks", bundle.blocks, "block_id"),
+            ("tables", bundle.tables, "table_id"),
+            ("table_cells", bundle.table_cells, "cell_id"),
+            ("table_placements", bundle.table_placements, "placement_id"),
+            ("images", bundle.images, "image_id"),
+            ("assets", bundle.assets, "asset_id"),
+            ("chunks", bundle.chunks, "chunk_id"),
+            ("references", bundle.references, "reference_id"),
+            ("recommendations", bundle.recommendations, "recommendation_id"),
+        ),
+    )
+    validate_counts(
+        bundle.document,
+        bundle.sections,
+        bundle.blocks,
+        bundle.tables,
+        bundle.images,
+        bundle.assets,
+        bundle.references,
+        errors,
+    )
+    validate_assets(bundle.state.root, bundle.images, bundle.assets, errors, warnings)
+    validate_references(
+        bundle.sections,
+        bundle.blocks,
+        bundle.tables,
+        bundle.images,
+        bundle.chunks,
+        errors,
+    )
+    validate_table_placements(
+        bundle.tables,
+        bundle.table_cells,
+        bundle.table_placements,
+        bundle.chunks,
+        errors,
+    )
+    validate_chunks(bundle.tables, bundle.images, bundle.chunks, errors)
+    validate_citation_titles(bundle.chunks, errors)
+    coverage = coverage_map_for_state(bundle.state)
+    for report in (coverage["text"], coverage["tables"], coverage["images"]):
+        if report.get("coverage_percent") != 100.0:
+            errors.append(issue("bundle", "coverage_incomplete", report))
+    maximum_estimated_tokens = max(
+        (
+            int(chunk.get("estimated_token_count") or chunk.get("token_estimate") or 0)
+            for chunk in bundle.chunks
+        ),
+        default=0,
+    )
+    return {
+        "schema_version": SHOWCASE_SCHEMA_VERSION,
+        "parser_version": SHOWCASE_PARSER_VERSION,
+        "document_id": bundle.document.get("document_id"),
+        "valid": not errors,
+        "errors": errors,
+        "warnings": warnings,
+        "source_counts": source_counts,
+        "parsed_counts": parsed_counts,
+        "coverage": coverage,
+        "maximum_estimated_tokens": maximum_estimated_tokens,
+    }
 
 
 def document_id_for_parse(source: RawDocumentSource, config: ParseConfig) -> str:
@@ -574,30 +758,164 @@ def copy_source_files(root: Path, source: ShowcaseInput) -> None:
             shutil.copyfile(path, source_root / name)
 
 
+def build_raw_source_inventory(payload: dict[str, Any]) -> RawSourceInventory:
+    obj_value = payload.get("obj")
+    obj = obj_value if isinstance(obj_value, dict) else {}
+    sections_value = obj.get("sections")
+    records: list[RawSectionRecord] = []
+    errors: list[dict[str, Any]] = []
+    if not isinstance(sections_value, list):
+        errors.append(issue("obj.sections", "raw_sections_not_list", type(sections_value).__name__))
+        return RawSourceInventory(sections=records, errors=errors)
+    append_raw_section_records(
+        records,
+        errors,
+        sections_value,
+        parent_raw_path=None,
+        container_path="obj.sections",
+        depth=0,
+    )
+    return RawSourceInventory(sections=records, errors=errors)
+
+
+def append_raw_section_records(
+    records: list[RawSectionRecord],
+    errors: list[dict[str, Any]],
+    items: list[Any],
+    *,
+    parent_raw_path: str | None,
+    container_path: str,
+    depth: int,
+) -> None:
+    for index, item in enumerate(items):
+        raw_path = f"{container_path}[{index}]"
+        if not isinstance(item, dict):
+            errors.append(issue(raw_path, "raw_section_not_object", type(item).__name__))
+            continue
+        source_order = len(records)
+        records.append(
+            RawSectionRecord(
+                section=item,
+                raw_path=raw_path,
+                parent_raw_path=parent_raw_path,
+                source_order=source_order,
+                depth=depth,
+            )
+        )
+        for child_key in RAW_CHILD_SECTION_KEYS:
+            if child_key not in item:
+                continue
+            child_value = item.get(child_key)
+            child_path = f"{raw_path}.{child_key}"
+            if not isinstance(child_value, list):
+                errors.append(
+                    issue(child_path, "raw_child_sections_not_list", type(child_value).__name__)
+                )
+                continue
+            section_like_children = [
+                child for child in child_value if is_raw_section_like_child(child)
+            ]
+            malformed_children = [
+                child for child in child_value if not is_raw_section_like_child(child)
+            ]
+            if malformed_children and section_like_children:
+                errors.append(
+                    issue(
+                        child_path,
+                        "raw_child_section_container_mixed",
+                        {"items": len(child_value), "section_like": len(section_like_children)},
+                    )
+                )
+            if not section_like_children:
+                continue
+            append_raw_section_records(
+                records,
+                errors,
+                child_value,
+                parent_raw_path=raw_path,
+                container_path=child_path,
+                depth=depth + 1,
+            )
+
+
+def is_raw_section_like_child(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    section_keys = {
+        "id",
+        "Id",
+        "ID",
+        "title",
+        "Title",
+        "name",
+        "Name",
+        "content",
+        "Content",
+        "html",
+        "Html",
+        "HTML",
+        "text",
+        "Text",
+    }
+    return bool(section_keys.intersection(value) or set(RAW_CHILD_SECTION_KEYS).intersection(value))
+
+
+def raw_section_id(record: RawSectionRecord) -> str:
+    source_section_id = section_id_for(record.section)
+    if source_section_id:
+        return source_section_id
+    return f"raw-path-{sha256_text(record.raw_path)[:12]}"
+
+
+def collision_safe_section_components(records: list[RawSectionRecord]) -> dict[str, str]:
+    by_slug: dict[str, set[str]] = {}
+    for record in records:
+        source_section_id = raw_section_id(record)
+        by_slug.setdefault(safe_id(source_section_id), set()).add(source_section_id)
+    components: dict[str, str] = {}
+    for record in records:
+        source_section_id = raw_section_id(record)
+        slug = safe_id(source_section_id)
+        if len(by_slug.get(slug, set())) > 1 or source_section_id.startswith("raw-path-"):
+            slug = f"{slug}-{sha256_text(record.raw_path)[:8]}"
+        components[record.raw_path] = slug
+    return components
+
+
 def parse_showcase_document(state: ShowcaseState) -> None:
     payload = state.source.payload
-    sections = [section for section in raw_sections(payload) if isinstance(section, dict)]
+    inventory = build_raw_source_inventory(payload)
+    state.errors.extend(inventory.errors)
+    sections = inventory.sections
+    section_components = collision_safe_section_components(sections)
     occurrence_counts: Counter[str] = Counter()
-    parent_stack: list[tuple[int, str]] = []
-    for source_order, raw_section in enumerate(sections):
-        source_section_id = section_id_for(raw_section) or f"section_{source_order:04d}"
-        occurrence_index = occurrence_counts[source_section_id]
-        occurrence_counts[source_section_id] += 1
-        depth = section_depth(raw_section)
-        while parent_stack and parent_stack[-1][0] >= depth:
-            parent_stack.pop()
-        parent_section_id = parent_stack[-1][1] if parent_stack and depth > 0 else None
+    parsed_by_raw_path: dict[str, str] = {}
+    for record in sections:
+        raw_section = record.section
+        source_section_id = raw_section_id(record)
+        section_component = section_components[record.raw_path]
+        occurrence_index = occurrence_counts[section_component]
+        occurrence_counts[section_component] += 1
+        depth = record.depth or section_depth(raw_section)
+        parent_section_id = (
+            parsed_by_raw_path.get(record.parent_raw_path)
+            if record.parent_raw_path is not None
+            else None
+        )
         section = parse_showcase_section(
             state,
             raw_section,
-            source_order=source_order,
+            source_order=record.source_order,
             source_section_id=source_section_id,
+            section_component=section_component,
             occurrence_index=occurrence_index,
             parent_section_id=parent_section_id,
             depth=depth,
+            raw_path=record.raw_path,
+            parent_raw_path=record.parent_raw_path,
         )
         state.sections.append(section)
-        parent_stack.append((depth, string_value(section["section_id"])))
+        parsed_by_raw_path[record.raw_path] = string_value(section["section_id"])
 
     refresh_document_record(state)
     extract_recommendations(state)
@@ -613,11 +931,14 @@ def parse_showcase_section(
     *,
     source_order: int,
     source_section_id: str,
+    section_component: str,
     occurrence_index: int,
     parent_section_id: str | None,
     depth: int,
+    raw_path: str,
+    parent_raw_path: str | None,
 ) -> dict[str, Any]:
-    section_key = f"{safe_id(source_section_id)}#{occurrence_index}"
+    section_key = f"{section_component}#{occurrence_index}"
     section_id = f"{state.document_id}:{section_key}"
     raw_html = section_html(raw_section)
     raw_table_htmls = raw_table_fragments(raw_html)
@@ -664,6 +985,8 @@ def parse_showcase_section(
         "source_section_id": source_section_id,
         "occurrence_index": occurrence_index,
         "section_key": section_key,
+        "raw_path": raw_path,
+        "parent_raw_path": parent_raw_path,
         "source_order": source_order,
         "parent_section_id": parent_section_id,
         "depth": depth,
@@ -704,43 +1027,79 @@ def process_section_images(
         image_id = f"{section_id}:image#{image_index}"
         src = string_value(image.get("src"))
         source_type = classify_image_src(src, src_present=image.has_attr("src"))
-        mime_type: str | None = None
+        declared_mime_type: str | None = None
+        detected_mime_type: str | None = None
         asset_sha: str | None = None
         asset_id: str | None = None
         asset_path: str | None = None
         decoded_size: int | None = None
         decode_error: str | None = None
+        resolution_status = "not_resolved"
         signature_matches: bool | None = None
         width: int | None = None
         height: int | None = None
+        content: bytes | None = None
         if source_type == "base64":
-            mime_type, token = split_data_uri(src)
+            declared_mime_type, token = split_data_uri(src)
             try:
                 content = base64.b64decode(re.sub(r"\s+", "", token), validate=True)
                 decoded_size = len(content)
-                signature_matches = image_signature_matches(mime_type, content)
-                width, height = image_dimensions(content, mime_type)
-                asset_sha = sha256_bytes(content)
-                asset_id = f"sha256:{asset_sha}"
-                asset_path = write_asset_once(state, content, mime_type)
-                image["src"] = asset_path
-                image["data-asset-id"] = asset_id
-                if signature_matches is False:
-                    state.warnings.append(
-                        {
-                            "path": image_id,
-                            "code": "image_mime_declaration_mismatch",
-                            "details": mime_type,
-                        }
-                    )
             except (binascii.Error, ValueError) as exc:
                 decode_error = str(exc)
                 image["src"] = ""
                 image["data-image-status"] = "decode_failed"
+        elif source_type == "relative":
+            resolved = resolve_relative_image(state.source, src)
+            if resolved is None:
+                decode_error = "relative image could not be resolved inside allowed source roots"
+                image["src"] = ""
+                image["data-image-status"] = "unresolved"
+            else:
+                content = resolved.read_bytes()
+                decoded_size = len(content)
+                resolution_status = "resolved"
         elif source_type in {"http", "https"}:
-            state.warnings.append(
-                {"path": image_id, "code": "external_image_not_fetched", "details": src}
-            )
+            decode_error = "external image references are not downloaded for release"
+            image["src"] = ""
+            image["data-image-status"] = "external_unresolved"
+        if content is not None:
+            detected_mime_type = detect_image_mime(content)
+            signature_matches = image_signature_matches(declared_mime_type, content)
+            if detected_mime_type != declared_mime_type and declared_mime_type is not None:
+                state.warnings.append(
+                    {
+                        "path": image_id,
+                        "code": "image_mime_declaration_mismatch",
+                        "details": {
+                            "declared": declared_mime_type,
+                            "detected": detected_mime_type,
+                        },
+                    }
+                )
+            if detected_mime_type == "image/svg+xml":
+                decode_error = "unsupported unsanitized SVG image"
+                image["src"] = ""
+                image["data-image-status"] = "unsupported_svg"
+            elif not is_supported_raster_mime(detected_mime_type):
+                decode_error = "unsupported or undetected image format"
+                image["src"] = ""
+                image["data-image-status"] = "unsupported_image"
+            else:
+                if detected_mime_type is None:
+                    raise ValueError("detected raster MIME is missing")
+                width, height = image_dimensions(content, detected_mime_type)
+                asset_sha = sha256_bytes(content)
+                asset_id = f"sha256:{asset_sha}"
+                asset_path = write_asset_once(
+                    state,
+                    content,
+                    declared_mime_type=declared_mime_type,
+                    detected_mime_type=detected_mime_type,
+                    occurrence_id=image_id,
+                )
+                resolution_status = "resolved"
+                image["src"] = asset_path
+                image["data-asset-id"] = asset_id
         image["data-image-id"] = image_id
         image_record = {
             "schema_version": SHOWCASE_SCHEMA_VERSION,
@@ -756,13 +1115,19 @@ def process_section_images(
             "asset_sha256": asset_sha,
             "asset_path": asset_path,
             "source_type": source_type,
-            "mime_type": mime_type,
+            "declared_mime_type": declared_mime_type,
+            "detected_mime_type": detected_mime_type,
+            "mime_type": detected_mime_type or declared_mime_type,
+            "extension": extension_for_mime(detected_mime_type),
+            "size_bytes": decoded_size,
             "decoded_size_bytes": decoded_size,
             "signature_matches_declared_mime": signature_matches,
             "decode_status": (
                 "failed" if decode_error else ("decoded" if asset_id else "not_decoded")
             ),
+            "resolution_status": resolution_status,
             "decode_error": decode_error,
+            "original_src": src,
             "alt": string_value(image.get("alt")),
             "title": string_value(image.get("title")),
             "width": width,
@@ -796,7 +1161,7 @@ def process_section_tables(
     for table_index, table in enumerate(tables):
         table_id = f"{section_id}:table#{table_index}"
         table["data-table-id"] = table_id
-        cell_rows, logical_grid = table_cells_and_grid(table, table_id=table_id)
+        cell_rows, logical_grid, placement_rows = table_cells_and_grid(table, table_id=table_id)
         for cell in cell_rows:
             cell.update(
                 {
@@ -807,6 +1172,16 @@ def process_section_tables(
                 }
             )
             state.table_cells.append(cell)
+        for placement in placement_rows:
+            placement.update(
+                {
+                    "schema_version": SHOWCASE_SCHEMA_VERSION,
+                    "dataset_id": state.dataset_id,
+                    "document_id": state.document_id,
+                    "section_id": section_id,
+                }
+            )
+            state.table_placements.append(placement)
         nested_table_ids = [
             f"{section_id}:table#{nested_index}"
             for nested_index, nested in enumerate(tables)
@@ -818,6 +1193,7 @@ def process_section_tables(
         column_count = max((int(cell["column_index"]) + 1 for cell in cell_rows), default=0)
         logical_row_count = len(logical_grid)
         logical_column_count = max((len(row) for row in logical_grid), default=0)
+        classification = table_classification(table, cell_rows)
         table_record = {
             "schema_version": SHOWCASE_SCHEMA_VERSION,
             "dataset_id": state.dataset_id,
@@ -826,7 +1202,8 @@ def process_section_tables(
             "section_key": section_key,
             "table_id": table_id,
             "table_index": table_index,
-            "classification": table_classification(table, cell_rows),
+            "classification": classification,
+            "csv_available": classification == "simple_rectangular",
             "source_html": source_html,
             "normalized_html": normalized_html,
             "row_count": row_count,
@@ -837,6 +1214,9 @@ def process_section_tables(
             "has_colspan": any(int(cell["colspan"]) > 1 for cell in cell_rows),
             "nested_table_ids": nested_table_ids,
             "cell_ids": [string_value(cell["cell_id"]) for cell in cell_rows],
+            "placement_ids": [
+                string_value(placement["placement_id"]) for placement in placement_rows
+            ],
             "logical_grid": logical_grid,
             "caption": table_caption(table),
             "plain_text": visible_text(normalized_html),
@@ -859,7 +1239,7 @@ def process_section_blocks(
     section_key: str,
 ) -> list[str]:
     block_ids: list[str] = []
-    for block_index, child in enumerate(meaningful_children(root)):
+    for block_index, child in enumerate(logical_block_children(root)):
         block = build_block_record(
             state,
             child,
@@ -872,6 +1252,42 @@ def process_section_blocks(
         state.blocks.append(block)
         block_ids.append(string_value(block["block_id"]))
     return block_ids
+
+
+def logical_block_children(root: Tag | BeautifulSoup) -> list[PageElement]:
+    children: list[PageElement] = []
+    for child in meaningful_children(root):
+        children.extend(logical_block_units(child))
+    return children
+
+
+def logical_block_units(element: PageElement) -> list[PageElement]:
+    if isinstance(element, NavigableString):
+        return [element] if normalize_text(str(element)) else []
+    if not isinstance(element, Tag):
+        return []
+    tag_name = element.name.lower()
+    if tag_name in {"html", "body"}:
+        return logical_block_children(element)
+    if tag_name in {"ul", "ol"}:
+        return [
+            child
+            for child in element.find_all("li", recursive=False)
+            if isinstance(child, Tag) and normalize_text(child.get_text(" ", strip=True))
+        ]
+    if tag_name in {"table", "img"}:
+        return [element]
+    has_embedded_object = element.find(["table", "img"]) is not None
+    if has_embedded_object:
+        flattened: list[PageElement] = []
+        for child in element.children:
+            if isinstance(child, NavigableString):
+                if normalize_text(str(child)):
+                    flattened.append(child)
+            elif isinstance(child, Tag):
+                flattened.extend(logical_block_units(child))
+        return flattened
+    return [element] if normalize_text(element.get_text(" ", strip=True)) else []
 
 
 def build_block_record(
@@ -938,6 +1354,9 @@ def build_block_record(
         "reference_ids": reference_ids,
         "uur": extract_uur(text),
         "udd": extract_udd(text),
+        "list_id": list_id_for_element(element) if isinstance(element, Tag) else None,
+        "list_type": list_type_for_element(element) if isinstance(element, Tag) else None,
+        "item_index": list_item_index(element) if isinstance(element, Tag) else None,
         "warnings": [],
         "source_raw_sha256": state.source.raw_sha256,
     }
@@ -951,8 +1370,11 @@ def register_references(
     block_id: str,
 ) -> list[str]:
     reference_ids: list[str] = []
+    section_reference_index = sum(
+        1 for reference in state.references if reference.get("section_id") == section_id
+    )
     for match in REFERENCE_RE.finditer(text):
-        reference_id = f"{section_id}:reference#{len(state.references)}"
+        reference_id = f"{section_id}:reference#{section_reference_index}"
         reference = {
             "schema_version": SHOWCASE_SCHEMA_VERSION,
             "dataset_id": state.dataset_id,
@@ -960,13 +1382,15 @@ def register_references(
             "section_id": section_id,
             "block_id": block_id,
             "reference_id": reference_id,
-            "reference_index": len(state.references),
+            "reference_index": section_reference_index,
+            "section_reference_index": section_reference_index,
             "source_text": match.group(0),
             "numbers": normalize_reference_numbers(match.group("body")),
             "source_raw_sha256": state.source.raw_sha256,
         }
         state.references.append(reference)
         reference_ids.append(reference_id)
+        section_reference_index += 1
     return reference_ids
 
 
@@ -986,7 +1410,6 @@ def extract_recommendations(state: ShowcaseState) -> None:
                 index += 1
                 continue
             group = [block]
-            in_comment = False
             next_index = index + 1
             while next_index < len(blocks):
                 candidate = blocks[next_index]
@@ -996,13 +1419,11 @@ def extract_recommendations(state: ShowcaseState) -> None:
                 if is_recommendation_boundary_block(candidate):
                     break
                 if COMMENT_RE.search(candidate_text):
-                    in_comment = True
                     group.append(candidate)
                     next_index += 1
                     continue
                 if (
-                    in_comment
-                    or extract_uur(candidate_text) is not None
+                    extract_uur(candidate_text) is not None
                     or extract_udd(candidate_text) is not None
                     or bool(REFERENCE_RE.search(candidate_text))
                 ):
@@ -1014,8 +1435,22 @@ def extract_recommendations(state: ShowcaseState) -> None:
             section_index += 1
             group_texts = [string_value(row.get("text")) for row in group if row.get("text")]
             group_text = "\n\n".join(group_texts)
+            recommendation_block_ids: list[str] = []
+            comment_block_ids: list[str] = []
+            grade_block_ids: list[str] = []
+            reference_block_ids: list[str] = []
             reference_ids: list[str] = []
             for grouped_block in group:
+                grouped_text = string_value(grouped_block.get("text"))
+                grouped_block_id = string_value(grouped_block.get("block_id"))
+                if grouped_block is block:
+                    recommendation_block_ids.append(grouped_block_id)
+                if COMMENT_RE.search(grouped_text):
+                    comment_block_ids.append(grouped_block_id)
+                if extract_uur(grouped_text) or extract_udd(grouped_text):
+                    grade_block_ids.append(grouped_block_id)
+                if REFERENCE_RE.search(grouped_text):
+                    reference_block_ids.append(grouped_block_id)
                 reference_ids.extend(
                     string_value(reference_id)
                     for reference_id in (grouped_block.get("reference_ids") or [])
@@ -1040,6 +1475,10 @@ def extract_recommendations(state: ShowcaseState) -> None:
                 "group_text": group_text,
                 "group_text_sha256": sha256_text(group_text),
                 "block_ids": [row["block_id"] for row in group],
+                "recommendation_block_ids": recommendation_block_ids,
+                "comment_block_ids": comment_block_ids,
+                "grade_block_ids": grade_block_ids,
+                "reference_block_ids": reference_block_ids,
                 "reference_ids": sorted(set(reference_ids)),
                 "uur": uur,
                 "udd": udd,
@@ -1047,8 +1486,13 @@ def extract_recommendations(state: ShowcaseState) -> None:
                     (value for value in group_texts if extract_uur(value) or extract_udd(value)),
                     None,
                 ),
+                "raw_grade_texts": [
+                    value for value in group_texts if extract_uur(value) or extract_udd(value)
+                ],
                 "comments": [
-                    value for value in group_texts[1:] if COMMENT_RE.search(value) or in_comment
+                    string_value(grouped_block.get("text"))
+                    for grouped_block in group
+                    if string_value(grouped_block.get("block_id")) in set(comment_block_ids)
                 ],
                 "source_raw_sha256": state.source.raw_sha256,
             }
@@ -1066,6 +1510,8 @@ def extract_recommendations(state: ShowcaseState) -> None:
                     grouped_block["block_type"] = "grade"
                 elif COMMENT_RE.search(grouped_text):
                     grouped_block["block_type"] = "recommendation_comment"
+                elif REFERENCE_RE.search(grouped_text):
+                    grouped_block["block_type"] = "reference"
             section_recommendations.setdefault(section_id, []).append(recommendation_id)
             index = next_index
     for section in state.sections:
@@ -1214,11 +1660,13 @@ def unit_from_blocks(blocks: list[dict[str, Any]], *, unit_type: str) -> dict[st
         {
             "kind": "block",
             "block_id": block.get("block_id"),
+            "source_unit_id": block.get("block_id"),
             "block_type": block.get("block_type"),
             "source_char_start": 0,
             "source_char_end": len(normalize_text(string_value(block.get("text")))),
             "fragment_index": 0,
             "text": normalize_text(string_value(block.get("text"))),
+            "text_sha256": sha256_text(normalize_text(string_value(block.get("text")))),
         }
         for block in blocks
     ]
@@ -1266,11 +1714,13 @@ def split_unit_if_needed(unit: dict[str, Any], state: ShowcaseState) -> list[dic
                 {
                     "kind": "block",
                     "block_id": block_id,
+                    "source_unit_id": block_id,
                     "block_type": fragment.get("block_type"),
                     "source_char_start": piece["start"],
                     "source_char_end": piece["end"],
                     "fragment_index": piece_index,
                     "text": piece["text"],
+                    "text_sha256": sha256_text(piece["text"]),
                 }
             ],
             "token_estimate": estimate_tokens(piece["text"]),
@@ -1387,7 +1837,7 @@ def append_text_chunk(
 def append_table_chunks_for_table(state: ShowcaseState, table: dict[str, Any]) -> None:
     table_id = string_value(table["table_id"])
     section = section_by_id(state, string_value(table["section_id"]))
-    rows = table_rows_for_chunks(table_id, state.table_cells)
+    rows = table_rows_for_chunks(table_id, state.table_placements, state.table_cells)
     non_empty_rows = [row for row in rows if row["text"]]
     if not non_empty_rows:
         state.warnings.append(
@@ -1431,16 +1881,30 @@ def append_table_chunks_for_table(state: ShowcaseState, table: dict[str, Any]) -
         append_table_chunk(state, section, table, header_rows, group, group_index)
 
 
-def table_rows_for_chunks(table_id: str, cells: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def table_rows_for_chunks(
+    table_id: str,
+    placements: list[dict[str, Any]],
+    cells: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
     rows: dict[int, list[dict[str, Any]]] = {}
-    for cell in cells:
-        if cell.get("table_id") != table_id:
+    cells_by_id = {string_value(cell.get("cell_id")): cell for cell in cells}
+    for placement in placements:
+        if placement.get("table_id") != table_id:
             continue
-        rows.setdefault(int(cell.get("row_index") or 0), []).append(cell)
+        logical_row = int(placement.get("logical_row") or 0)
+        origin = cells_by_id.get(string_value(placement.get("origin_cell_id")), {})
+        row_item = dict(placement)
+        row_item["is_header"] = bool(origin.get("is_header"))
+        rows.setdefault(logical_row, []).append(row_item)
     result: list[dict[str, Any]] = []
     for row_index in sorted(rows):
-        row_cells = sorted(rows[row_index], key=lambda cell: int(cell.get("column_index") or 0))
-        text = " | ".join(string_value(cell.get("text")) for cell in row_cells if cell.get("text"))
+        row_cells = sorted(
+            rows[row_index],
+            key=lambda cell: int(cell.get("logical_column") or 0),
+        )
+        text = " | ".join(
+            string_value(cell.get("text")) for cell in row_cells if cell.get("text")
+        )
         result.append({"row_index": row_index, "cells": row_cells, "text": text})
     return result
 
@@ -1507,7 +1971,13 @@ def append_table_chunk(
     row_start = min(row_indices) if row_indices else 0
     row_end = max(row_indices) if row_indices else 0
     cell_ids = [
-        string_value(cell.get("cell_id"))
+        string_value(cell.get("origin_cell_id") or cell.get("cell_id"))
+        for row in included_rows
+        for cell in row["cells"]
+        if string_value(cell.get("text"))
+    ]
+    placement_ids = [
+        string_value(cell.get("placement_id"))
         for row in included_rows
         for cell in row["cells"]
         if string_value(cell.get("text"))
@@ -1535,11 +2005,13 @@ def append_table_chunk(
                 "row_start": row_start,
                 "row_end": row_end,
                 "cell_ids": cell_ids,
+                "placement_ids": placement_ids,
             }
         ],
         extra={
             "header_row_indices": [row["row_index"] for row in header_rows],
             "cell_ids": cell_ids,
+            "placement_ids": placement_ids,
         },
     )
 
@@ -1561,7 +2033,8 @@ def append_chunk(
     source_fragments: list[dict[str, Any]],
     extra: dict[str, Any],
 ) -> None:
-    normalized = normalize_text(text)
+    serialized = text
+    estimated_token_count = estimate_tokens(serialized)
     chunk = {
         "schema_version": SHOWCASE_SCHEMA_VERSION,
         "dataset_id": state.dataset_id,
@@ -1570,9 +2043,11 @@ def append_chunk(
         "code_version": state.source.code_version,
         "chunk_id": chunk_id,
         "chunk_type": chunk_type,
-        "text": normalized,
-        "text_sha256": sha256_text(normalized),
-        "token_estimate": estimate_tokens(normalized),
+        "text": serialized,
+        "text_sha256": sha256_text(serialized),
+        "estimated_token_count": estimated_token_count,
+        "estimator_name": "chars_div_4",
+        "token_estimate": estimated_token_count,
         "section_id": section.get("section_id"),
         "section_key": section.get("section_key"),
         "section_title": section.get("title"),
@@ -1689,6 +2164,10 @@ def write_showcase_packages(state: ShowcaseState) -> None:
     write_jsonl(canonical / "blocks.jsonl", sorted_by(state.blocks, "block_id"))
     write_jsonl(canonical / "tables.jsonl", sorted_by(state.tables, "table_id"))
     write_jsonl(canonical / "table-cells.jsonl", sorted_by(state.table_cells, "cell_id"))
+    write_jsonl(
+        canonical / "table-placements.jsonl",
+        sorted_by(state.table_placements, "placement_id"),
+    )
     write_jsonl(canonical / "images.jsonl", sorted_by(state.images, "image_id"))
     write_jsonl(canonical / "assets.jsonl", sorted_by(state.assets, "asset_id"))
     write_jsonl(
@@ -1760,7 +2239,8 @@ def write_frontend_package(state: ShowcaseState) -> None:
             for section in sorted_by(state.sections, "source_order")
         ],
         "tables": sorted_by(state.tables, "table_id"),
-        "images": sorted_by(state.images, "image_id"),
+        "table_placements": sorted_by(state.table_placements, "placement_id"),
+        "images": [frontend_image_row(row) for row in sorted_by(state.images, "image_id")],
         "assets": sorted_by(state.assets, "asset_id"),
         "warnings": state.warnings,
     }
@@ -1775,6 +2255,13 @@ def write_frontend_package(state: ShowcaseState) -> None:
         },
     )
     copy_assets_to(state, frontend / "assets" / "by-sha256")
+
+
+def frontend_image_row(image: dict[str, Any]) -> dict[str, Any]:
+    row = dict(image)
+    row.pop("original_src", None)
+    row.pop("raw_src_sha256", None)
+    return row
 
 
 def write_ml_package(state: ShowcaseState) -> None:
@@ -1794,6 +2281,10 @@ def write_ml_package(state: ShowcaseState) -> None:
         sorted_by([row for row in state.chunks if row["chunk_type"] == "image"], "chunk_id"),
     )
     write_jsonl(ml / "tables.jsonl", sorted_by(state.tables, "table_id"))
+    write_jsonl(
+        ml / "table-placements.jsonl",
+        sorted_by(state.table_placements, "placement_id"),
+    )
     write_jsonl(ml / "images.jsonl", sorted_by(state.images, "image_id"))
     write_jsonl(ml / "assets.jsonl", sorted_by(state.assets, "asset_id"))
     write_jsonl(ml / "citation-index.jsonl", sorted_by(state.citation_rows, "chunk_id"))
@@ -2003,6 +2494,7 @@ def validate_showcase_directory(root: Path) -> dict[str, Any]:
     blocks = read_jsonl(root / "canonical" / "blocks.jsonl")
     tables = read_jsonl(root / "canonical" / "tables.jsonl")
     table_cells = read_jsonl(root / "canonical" / "table-cells.jsonl")
+    table_placements = read_jsonl(root / "canonical" / "table-placements.jsonl")
     images = read_jsonl(root / "canonical" / "images.jsonl")
     assets = read_jsonl(root / "canonical" / "assets.jsonl")
     chunks = read_jsonl(root / "canonical" / "chunks.jsonl")
@@ -2015,6 +2507,7 @@ def validate_showcase_directory(root: Path) -> dict[str, Any]:
             ("blocks", blocks, "block_id"),
             ("tables", tables, "table_id"),
             ("table_cells", table_cells, "cell_id"),
+            ("table_placements", table_placements, "placement_id"),
             ("images", images, "image_id"),
             ("assets", assets, "asset_id"),
             ("chunks", chunks, "chunk_id"),
@@ -2029,10 +2522,11 @@ def validate_showcase_directory(root: Path) -> dict[str, Any]:
     validate_html_safety(sections, errors)
     validate_assets(root, images, assets, errors, warnings)
     validate_references(sections, blocks, tables, images, chunks, errors)
+    validate_table_placements(tables, table_cells, table_placements, chunks, errors)
     validate_chunks(tables, images, chunks, errors)
     validate_citation_titles(chunks, errors)
     validate_coverage_reports(root, errors)
-    validate_frontend(root, images, errors)
+    validate_frontend(root, tables, images, errors)
     text_coverage_path = root / "reports" / "text-index-coverage.json"
     table_coverage_path = root / "reports" / "table-index-coverage.json"
     image_coverage_path = root / "reports" / "image-occurrence-coverage.json"
@@ -2093,7 +2587,10 @@ def validate_raw_occurrence_counts(
     if not raw_path.exists():
         return
     payload = json.loads(raw_path.read_text(encoding="utf-8"))
-    raw_items = [item for item in raw_sections(payload) if isinstance(item, dict)]
+    inventory = build_raw_source_inventory(payload)
+    raw_items = [record.section for record in inventory.sections]
+    for inventory_error in inventory.errors:
+        errors.append(inventory_error)
     raw_table_count = 0
     raw_image_count = 0
     for item in raw_items:
@@ -2115,6 +2612,12 @@ def validate_raw_occurrence_counts(
                     {"raw": raw_count, "parsed": parsed_count},
                 )
             )
+    raw_paths = {record.raw_path for record in inventory.sections}
+    parsed_paths = {string_value(section.get("raw_path")) for section in sections}
+    for missing_path in sorted(raw_paths - parsed_paths):
+        errors.append(issue(missing_path, "missing_raw_section", None))
+    for extra_path in sorted(parsed_paths - raw_paths):
+        errors.append(issue(extra_path, "parsed_section_without_raw_path", None))
 
 
 def validate_counts(
@@ -2149,7 +2652,8 @@ def validate_text_preservation(
     if not raw_path.exists():
         return
     payload = json.loads(raw_path.read_text(encoding="utf-8"))
-    raw_items = [item for item in raw_sections(payload) if isinstance(item, dict)]
+    inventory = build_raw_source_inventory(payload)
+    raw_items = [record.section for record in inventory.sections]
     checks: list[dict[str, Any]] = []
     for section in sections:
         source_order = int(section.get("source_order") or 0)
@@ -2176,18 +2680,29 @@ def validate_html_safety(sections: list[dict[str, Any]], errors: list[dict[str, 
         html_text = string_value(section.get("normalized_html"))
         if "data:image/" in html_text:
             errors.append(issue(section_id, "base64_in_normalized_html", None))
-        soup = BeautifulSoup(html_text, "lxml")
+        soup = BeautifulSoup(html_text, "html.parser")
         for tag in soup.find_all(True):
             if not isinstance(tag, Tag):
                 continue
-            if tag.name.lower() in UNSAFE_TAGS:
+            tag_name = tag.name.lower()
+            if tag_name in {"html", "body"}:
+                continue
+            if tag_name in UNSAFE_TAGS or tag_name not in SAFE_TAGS:
                 errors.append(issue(section_id, "unsafe_html_tag", tag.name))
+                continue
+            allowed_attrs = (
+                SAFE_ATTRS_BY_TAG.get("*", set())
+                | SAFE_ATTRS_BY_TAG.get(tag_name, set())
+                | GENERATED_SAFE_ATTRS
+            )
             for attr, value in tag.attrs.items():
                 attr_name = attr.casefold()
                 if attr_name.startswith("on"):
                     errors.append(issue(section_id, "unsafe_html_event_handler", attr))
-                if attr_name in {"href", "src"} and is_javascript_url(value):
-                    errors.append(issue(section_id, "unsafe_html_javascript_url", attr))
+                if attr_name not in allowed_attrs:
+                    errors.append(issue(section_id, "unsafe_html_attribute", attr))
+                if attr_name in {"href", "src"} and not is_safe_url(value, tag_name=tag_name):
+                    errors.append(issue(section_id, "unsafe_html_url", attr))
 
 
 def validate_assets(
@@ -2209,12 +2724,27 @@ def validate_assets(
             errors.append(issue(string_value(asset.get("asset_id")), "asset_sha_mismatch", None))
     for image in images:
         if image.get("decode_error"):
-            warnings.append(issue(string_value(image.get("image_id")), "image_decode_failed", None))
-            continue
+            errors.append(
+                issue(
+                    string_value(image.get("image_id")),
+                    "image_asset_unresolved",
+                    image.get("decode_error"),
+                )
+            )
         asset_id = string_value(image.get("asset_id"))
-        if image.get("source_type") == "base64" and asset_id not in assets_by_id:
+        if image.get("detected_mime_type") == "image/svg+xml":
+            errors.append(issue(string_value(image.get("image_id")), "unsafe_svg_exposed", None))
+        if image.get("source_type") in {"base64", "relative"} and asset_id not in assets_by_id:
             errors.append(
                 issue(string_value(image.get("image_id")), "image_asset_missing", asset_id)
+            )
+        if image.get("source_type") in {"http", "https"}:
+            errors.append(
+                issue(
+                    string_value(image.get("image_id")),
+                    "external_image_unresolved",
+                    image.get("original_src"),
+                )
             )
 
 
@@ -2269,6 +2799,45 @@ def validate_references(
             )
 
 
+def validate_table_placements(
+    tables: list[dict[str, Any]],
+    table_cells: list[dict[str, Any]],
+    table_placements: list[dict[str, Any]],
+    chunks: list[dict[str, Any]],
+    errors: list[dict[str, Any]],
+) -> None:
+    table_ids = {string_value(table.get("table_id")) for table in tables}
+    cell_ids = {string_value(cell.get("cell_id")) for cell in table_cells}
+    expected_placements = {
+        string_value(placement.get("placement_id"))
+        for placement in table_placements
+        if normalize_text(string_value(placement.get("text")))
+    }
+    covered_placements = {
+        string_value(placement_id)
+        for chunk in chunks
+        if chunk.get("chunk_type") == "table"
+        for placement_id in (chunk.get("placement_ids") or [])
+    }
+    for placement in table_placements:
+        placement_id = string_value(placement.get("placement_id"))
+        table_id = string_value(placement.get("table_id"))
+        origin_cell_id = string_value(placement.get("origin_cell_id"))
+        if table_id not in table_ids:
+            errors.append(issue(placement_id, "unresolved_placement_table", table_id))
+        if origin_cell_id not in cell_ids:
+            errors.append(issue(placement_id, "unresolved_origin_cell", origin_cell_id))
+    missing = sorted(expected_placements - covered_placements)
+    if missing:
+        errors.append(
+            issue(
+                "canonical/table-placements.jsonl",
+                "logical_table_placement_missing",
+                missing,
+            )
+        )
+
+
 def validate_chunks(
     tables: list[dict[str, Any]],
     images: list[dict[str, Any]],
@@ -2293,8 +2862,33 @@ def validate_chunks(
             errors.append(issue(chunk_id, "missing_citation", None))
         if not chunk.get("source_raw_sha256"):
             errors.append(issue(chunk_id, "missing_source_raw_sha", None))
-        if int(chunk.get("token_estimate") or 0) > CHUNK_MAXIMUM_TOKENS:
+        estimated_tokens = int(
+            chunk.get("estimated_token_count") or chunk.get("token_estimate") or 0
+        )
+        if estimated_tokens > CHUNK_MAXIMUM_TOKENS:
             errors.append(issue(chunk_id, "chunk_above_maximum", None))
+        if chunk.get("chunk_type") == "text":
+            fragments = [
+                fragment
+                for fragment in (chunk.get("source_fragments") or [])
+                if isinstance(fragment, dict) and fragment.get("kind") == "block"
+            ]
+            reconstructed = "\n\n".join(
+                string_value(fragment.get("text")) for fragment in fragments
+            )
+            if reconstructed != string_value(chunk.get("text")):
+                errors.append(issue(chunk_id, "source_fragment_text_mismatch", None))
+            for fragment in fragments:
+                fragment_text = string_value(fragment.get("text"))
+                expected_hash = string_value(fragment.get("text_sha256"))
+                if expected_hash and expected_hash != sha256_text(fragment_text):
+                    errors.append(
+                        issue(
+                            chunk_id,
+                            "source_fragment_hash_mismatch",
+                            fragment.get("block_id"),
+                        )
+                    )
     for table in tables:
         if string_value(table.get("table_id")) not in table_chunk_ids:
             errors.append(
@@ -2326,6 +2920,73 @@ def validate_citation_titles(chunks: list[dict[str, Any]], errors: list[dict[str
 
 
 def validate_coverage_reports(root: Path, errors: list[dict[str, Any]]) -> None:
+    blocks = read_jsonl(root / "canonical" / "blocks.jsonl")
+    table_placements = read_jsonl(root / "canonical" / "table-placements.jsonl")
+    images = read_jsonl(root / "canonical" / "images.jsonl")
+    chunks = read_jsonl(root / "canonical" / "chunks.jsonl")
+    indexable_blocks = [
+        block
+        for block in blocks
+        if is_indexable_text_block(block, normalize_text(string_value(block.get("text"))))
+    ]
+    covered_blocks = {
+        string_value(block_id)
+        for chunk in chunks
+        if chunk.get("chunk_type") == "text"
+        for block_id in (chunk.get("primary_block_ids") or [])
+    }
+    missing_blocks = [
+        string_value(block.get("block_id"))
+        for block in indexable_blocks
+        if string_value(block.get("block_id")) not in covered_blocks
+    ]
+    fragment_gaps = block_fragment_gaps(indexable_blocks, chunks)
+    if missing_blocks or fragment_gaps:
+        errors.append(
+            issue(
+                "canonical/chunks.jsonl",
+                "text_index_coverage_incomplete",
+                {"missing": missing_blocks, "fragment_gaps": fragment_gaps},
+            )
+        )
+    expected_placements = {
+        string_value(placement.get("placement_id"))
+        for placement in table_placements
+        if normalize_text(string_value(placement.get("text")))
+    }
+    covered_placements = {
+        string_value(placement_id)
+        for chunk in chunks
+        if chunk.get("chunk_type") == "table"
+        for placement_id in (chunk.get("placement_ids") or [])
+    }
+    missing_placements = sorted(expected_placements - covered_placements)
+    if missing_placements:
+        errors.append(
+            issue(
+                "canonical/table-placements.jsonl",
+                "table_index_coverage_incomplete",
+                missing_placements,
+            )
+        )
+    image_chunk_ids = {
+        string_value(chunk.get("image_id"))
+        for chunk in chunks
+        if chunk.get("chunk_type") == "image"
+    }
+    missing_image_chunks = [
+        string_value(image.get("image_id"))
+        for image in images
+        if string_value(image.get("image_id")) not in image_chunk_ids
+    ]
+    if missing_image_chunks:
+        errors.append(
+            issue(
+                "canonical/images.jsonl",
+                "image_occurrence_coverage_incomplete",
+                missing_image_chunks,
+            )
+        )
     for relative, code_prefix in (
         ("reports/text-index-coverage.json", "text_index"),
         ("reports/table-index-coverage.json", "table_index"),
@@ -2344,6 +3005,7 @@ def validate_coverage_reports(root: Path, errors: list[dict[str, Any]]) -> None:
 
 def validate_frontend(
     root: Path,
+    tables: list[dict[str, Any]],
     images: list[dict[str, Any]],
     errors: list[dict[str, Any]],
 ) -> None:
@@ -2352,6 +3014,7 @@ def validate_frontend(
         errors.append(issue("frontend/document.json", "frontend_document_missing", None))
         return
     frontend_html = ""
+    frontend_soup = BeautifulSoup("", "lxml")
     for section in payload.get("sections") or []:
         if not isinstance(section, dict):
             continue
@@ -2359,22 +3022,69 @@ def validate_frontend(
         frontend_html += html_text
         if "data:image/" in html_text:
             errors.append(issue("frontend/document.json", "base64_in_frontend_html", None))
-        for match in re.finditer(r'src="([^"]+)"', html_text):
-            src = match.group(1)
+        for src_match in re.finditer(r'src="([^"]+)"', html_text):
+            src = src_match.group(1)
             if src.startswith("assets/") and not (root / "frontend" / src).exists():
                 errors.append(
                     issue("frontend/document.json", "frontend_asset_reference_unresolved", src)
                 )
+    frontend_soup = BeautifulSoup(frontend_html, "lxml")
     preview_html = (root / "preview" / "index.html").read_text(encoding="utf-8")
+    preview_soup = BeautifulSoup(preview_html, "lxml")
+    for table in tables:
+        table_id = string_value(table.get("table_id"))
+        if not table_id:
+            continue
+        frontend_matches = frontend_soup.find_all(
+            lambda tag, expected=table_id: isinstance(tag, Tag)
+            and tag.get("data-table-id") == expected
+        )
+        preview_matches = preview_soup.find_all(
+            lambda tag, expected=table_id: isinstance(tag, Tag)
+            and tag.get("data-table-id") == expected
+        )
+        if len(frontend_matches) != 1:
+            errors.append(
+                issue(table_id, "frontend_table_placement_count_mismatch", len(frontend_matches))
+            )
+        if len(preview_matches) != 1:
+            errors.append(
+                issue(table_id, "preview_table_placement_count_mismatch", len(preview_matches))
+            )
     for image in images:
         if not image.get("asset_path"):
             continue
         image_id = string_value(image.get("image_id"))
-        escaped_image_id = f'data-image-id="{html.escape(image_id)}"'
-        if escaped_image_id not in frontend_html and image_id not in frontend_html:
-            errors.append(issue(image_id, "local_image_missing_from_frontend_html", None))
-        if image_id not in preview_html:
-            errors.append(issue(image_id, "local_image_missing_from_preview", None))
+        expected_asset = string_value(image.get("asset_path"))
+        image_attrs: dict[str, Any] = {"data-image-id": image_id}
+        frontend_matches = frontend_soup.find_all("img", attrs=image_attrs)
+        preview_matches = preview_soup.find_all("img", attrs=image_attrs)
+        if len(frontend_matches) != 1:
+            errors.append(
+                issue(
+                    image_id,
+                    "frontend_image_placement_count_mismatch",
+                    len(frontend_matches),
+                )
+            )
+        if len(preview_matches) != 1:
+            errors.append(
+                issue(
+                    image_id,
+                    "preview_image_placement_count_mismatch",
+                    len(preview_matches),
+                )
+            )
+        for image_tag in [*frontend_matches, *preview_matches]:
+            src = string_value(image_tag.get("src"))
+            if src != expected_asset:
+                errors.append(
+                    issue(
+                        image_id,
+                        "frontend_image_asset_mismatch",
+                        {"expected": expected_asset, "actual": src},
+                    )
+                )
 
 
 def compare_deterministic_trees(left: Path, right: Path) -> dict[str, Any]:
@@ -2511,7 +3221,7 @@ def write_showcase_readme(root: Path, state: ShowcaseState, validation: dict[str
             "",
             "## Known Limitations",
             "",
-            "- Schema `0.2-pilot` is a draft showcase contract.",
+            "- Schema `0.3-pilot` is a draft showcase contract.",
             (
                 "- Image chunks use source metadata and section context only; "
                 "no image descriptions are generated."
@@ -2556,7 +3266,8 @@ def write_table_sidecars(state: ShowcaseState) -> None:
             encoding="utf-8",
             newline="\n",
         )
-        write_table_csv(target / "table.csv", cells_by_table.get(table_id, []))
+        if table.get("csv_available"):
+            write_table_csv(target / "table.csv", cells_by_table.get(table_id, []))
 
 
 def write_table_csv(path: Path, cells: list[dict[str, Any]]) -> None:
@@ -2582,6 +3293,7 @@ def package_rows(
         ("blocks.jsonl", state.blocks, "block_id"),
         ("tables.jsonl", state.tables, "table_id"),
         ("table-cells.jsonl", state.table_cells, "cell_id"),
+        ("table-placements.jsonl", state.table_placements, "placement_id"),
         ("images.jsonl", state.images, "image_id"),
         ("assets.jsonl", state.assets, "asset_id"),
         ("recommendations.jsonl", state.recommendations, "recommendation_id"),
@@ -2599,9 +3311,16 @@ def copy_assets_to(state: ShowcaseState, target: Path) -> None:
             shutil.copyfile(source_path, target / source_path.name)
 
 
-def write_asset_once(state: ShowcaseState, content: bytes, mime_type: str | None) -> str:
+def write_asset_once(
+    state: ShowcaseState,
+    content: bytes,
+    *,
+    declared_mime_type: str | None,
+    detected_mime_type: str,
+    occurrence_id: str,
+) -> str:
     asset_sha = sha256_bytes(content)
-    extension = extension_for_mime(mime_type)
+    extension = extension_for_mime(detected_mime_type)
     relative = f"assets/by-sha256/{asset_sha}.{extension}"
     path = state.root / "canonical" / relative
     if not path.exists():
@@ -2615,13 +3334,26 @@ def write_asset_once(state: ShowcaseState, content: bytes, mime_type: str | None
                 "dataset_id": state.dataset_id,
                 "asset_id": asset_id,
                 "asset_sha256": asset_sha,
+                "sha256": asset_sha,
                 "path": relative,
-                "mime_type": mime_type,
+                "declared_mime_type": declared_mime_type,
+                "detected_mime_type": detected_mime_type,
+                "mime_type": detected_mime_type,
                 "extension": extension,
                 "size_bytes": len(content),
+                "occurrence_ids": [occurrence_id],
                 "source": "decoded_data_uri",
             }
         )
+    else:
+        for asset in state.assets:
+            if asset.get("asset_id") == asset_id:
+                occurrence_ids = [
+                    string_value(value) for value in (asset.get("occurrence_ids") or [])
+                ]
+                if occurrence_id not in occurrence_ids:
+                    asset["occurrence_ids"] = [*occurrence_ids, occurrence_id]
+                break
     return relative
 
 
@@ -2629,7 +3361,7 @@ def table_cells_and_grid(
     table: Tag,
     *,
     table_id: str,
-) -> tuple[list[dict[str, Any]], list[list[dict[str, Any]]]]:
+) -> tuple[list[dict[str, Any]], list[list[dict[str, Any]]], list[dict[str, Any]]]:
     rows = [
         row
         for row in table.find_all("tr")
@@ -2638,6 +3370,7 @@ def table_cells_and_grid(
     cells: list[dict[str, Any]] = []
     occupied: dict[tuple[int, int], dict[str, Any]] = {}
     grid: list[list[dict[str, Any]]] = []
+    placements: list[dict[str, Any]] = []
     for row_index, row in enumerate(rows):
         grid_row: list[dict[str, Any]] = []
         column_index = 0
@@ -2659,12 +3392,16 @@ def table_cells_and_grid(
             record = {
                 "table_id": table_id,
                 "cell_id": cell_id,
+                "origin_cell_id": cell_id,
                 "row_index": row_index,
                 "column_index": column_index,
                 "cell_index": cell_index,
                 "tag": cell.name.lower(),
                 "text": text,
                 "text_sha256": sha256_text(text),
+                "source_char_start": 0,
+                "source_char_end": len(text),
+                "fragment_index": 0,
                 "html": inner_html(cell),
                 "rowspan": rowspan,
                 "colspan": colspan,
@@ -2673,6 +3410,7 @@ def table_cells_and_grid(
             cells.append(record)
             origin = {
                 "cell_id": cell_id,
+                "origin_cell_id": cell_id,
                 "grid_row": row_index,
                 "grid_column": column_index,
                 "text": text,
@@ -2693,7 +3431,32 @@ def table_cells_and_grid(
             grid_row.append(carried)
             column_index += 1
         grid.append(grid_row)
-    return cells, grid
+    for logical_row, grid_row_items in enumerate(grid):
+        for logical_column, logical_placement in enumerate(grid_row_items):
+            origin_cell_id = string_value(
+                logical_placement.get("origin_cell_id") or logical_placement.get("cell_id")
+            )
+            placement_id = f"{table_id}:placement#{logical_row}:{logical_column}"
+            placements.append(
+                {
+                    "table_id": table_id,
+                    "placement_id": placement_id,
+                    "origin_cell_id": origin_cell_id,
+                    "cell_id": origin_cell_id,
+                    "logical_row": logical_row,
+                    "logical_column": logical_column,
+                    "physical_row": logical_placement.get("grid_row"),
+                    "physical_column": logical_placement.get("grid_column"),
+                    "is_origin": bool(logical_placement.get("is_origin")),
+                    "text": string_value(logical_placement.get("text")),
+                    "text_sha256": sha256_text(string_value(logical_placement.get("text"))),
+                    "rowspan": logical_placement.get("rowspan"),
+                    "colspan": logical_placement.get("colspan"),
+                }
+            )
+            logical_placement["placement_id"] = placement_id
+            logical_placement["origin_cell_id"] = origin_cell_id
+    return cells, grid, placements
 
 
 def build_summary_payload(state: ShowcaseState) -> dict[str, Any]:
@@ -2722,6 +3485,7 @@ def counts_for_state(state: ShowcaseState) -> dict[str, int]:
         "blocks": len(state.blocks),
         "tables": len(state.tables),
         "table_cells": len(state.table_cells),
+        "logical_table_placements": len(state.table_placements),
         "image_occurrences": len(state.images),
         "unique_assets": len(state.assets),
         "recommendations": len(state.recommendations),
@@ -2779,6 +3543,7 @@ def table_validation_report(state: ShowcaseState) -> dict[str, Any]:
             sorted(Counter(string_value(row.get("classification")) for row in state.tables).items())
         ),
         "cells": len(state.table_cells),
+        "logical_placements": len(state.table_placements),
     }
 
 
@@ -2882,23 +3647,23 @@ def block_fragment_gaps(
 
 
 def table_index_coverage_report(state: ShowcaseState) -> dict[str, Any]:
-    expected_cells = {
-        string_value(cell.get("cell_id"))
-        for cell in state.table_cells
-        if normalize_text(string_value(cell.get("text")))
+    expected_placements = {
+        string_value(placement.get("placement_id"))
+        for placement in state.table_placements
+        if normalize_text(string_value(placement.get("text")))
     }
-    covered_cells = {
-        string_value(cell_id)
+    covered_placements = {
+        string_value(placement_id)
         for chunk in state.chunks
         if chunk.get("chunk_type") == "table"
-        for cell_id in (chunk.get("cell_ids") or [])
+        for placement_id in (chunk.get("placement_ids") or [])
     }
-    missing = sorted(expected_cells - covered_cells)
-    expected = len(expected_cells)
+    missing = sorted(expected_placements - covered_placements)
+    expected = len(expected_placements)
     covered = expected - len(missing)
     return {
         "schema_version": SHOWCASE_SCHEMA_VERSION,
-        "unit": "non_empty_physical_cell",
+        "unit": "non_empty_logical_placement",
         "expected": expected,
         "covered": covered,
         "missing": missing,
@@ -3027,13 +3792,18 @@ def sanitize_html_tree(root: Tag | BeautifulSoup, warnings: list[str]) -> None:
             tag.unwrap()
             warnings.append("unknown_html_tag_removed")
             continue
+        allowed_attrs = SAFE_ATTRS_BY_TAG.get("*", set()) | SAFE_ATTRS_BY_TAG.get(name, set())
         for attr in list(tag.attrs):
             attr_name = attr.casefold()
             if attr_name.startswith("on") or attr_name == "style":
                 del tag.attrs[attr]
                 warnings.append("unsafe_attribute_removed")
                 continue
-            if attr_name in {"href", "src"} and is_javascript_url(tag.get(attr)):
+            if attr_name not in allowed_attrs:
+                del tag.attrs[attr]
+                warnings.append("unknown_attribute_removed")
+                continue
+            if attr_name in {"href", "src"} and not is_safe_url(tag.get(attr), tag_name=name):
                 del tag.attrs[attr]
                 warnings.append("unsafe_url_removed")
 
@@ -3219,6 +3989,43 @@ def block_type_for_tag(tag_name: str) -> str:
     return "unknown"
 
 
+def list_type_for_element(element: Tag) -> str | None:
+    if element.name.lower() != "li":
+        return None
+    parent = element.parent
+    if isinstance(parent, Tag) and parent.name.lower() in {"ul", "ol"}:
+        return "ordered" if parent.name.lower() == "ol" else "unordered"
+    return None
+
+
+def list_id_for_element(element: Tag) -> str | None:
+    if element.name.lower() != "li":
+        return None
+    parent = element.parent
+    if not isinstance(parent, Tag) or parent.name.lower() not in {"ul", "ol"}:
+        return None
+    section_id = string_value(element.get("data-section-id"))
+    marker = sha256_text(str(parent))[:12]
+    return f"{section_id}:list#{marker}" if section_id else f"list#{marker}"
+
+
+def list_item_index(element: Tag) -> int | None:
+    if element.name.lower() != "li":
+        return None
+    parent = element.parent
+    if not isinstance(parent, Tag):
+        return None
+    siblings = [
+        child
+        for child in parent.find_all("li", recursive=False)
+        if isinstance(child, Tag)
+    ]
+    for index, sibling in enumerate(siblings):
+        if sibling is element:
+            return index
+    return None
+
+
 def normalize_reference_numbers(body: str) -> list[int]:
     numbers: list[int] = []
     for part in body.split(","):
@@ -3296,6 +4103,28 @@ def classify_image_src(src: str, *, src_present: bool) -> str:
     return "relative"
 
 
+def resolve_relative_image(source: RawDocumentSource, src: str) -> Path | None:
+    stripped = src.strip()
+    if not stripped:
+        return None
+    path = Path(stripped)
+    if path.is_absolute():
+        return None
+    candidates: list[tuple[Path, Path]] = [(source.raw_json.parent, source.raw_json.parent / path)]
+    if source.source_root is not None:
+        candidates.append((source.source_root, source.source_root / path))
+    for root, candidate in candidates:
+        resolved_root = root.resolve()
+        resolved_candidate = candidate.resolve()
+        try:
+            resolved_candidate.relative_to(resolved_root)
+        except ValueError:
+            continue
+        if resolved_candidate.is_file():
+            return resolved_candidate
+    return None
+
+
 def split_data_uri(src: str) -> tuple[str | None, str]:
     match = DATA_URI_RE.match(src)
     if match is None:
@@ -3312,6 +4141,24 @@ def image_signature_matches(mime_type: str | None, content: bytes) -> bool | Non
     if not signatures:
         return None
     return any(content.startswith(signature) for signature in signatures)
+
+
+def detect_image_mime(content: bytes) -> str | None:
+    if content.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if content.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if content.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if content.startswith(b"RIFF") and content[8:12] == b"WEBP":
+        return "image/webp"
+    if re.match(rb"^\s*(?:<\?xml[^>]*>\s*)?<svg[\s>]", content[:512], re.IGNORECASE):
+        return "image/svg+xml"
+    return None
+
+
+def is_supported_raster_mime(mime_type: str | None) -> bool:
+    return mime_type in {"image/png", "image/jpeg", "image/gif", "image/webp"}
 
 
 def image_dimensions(content: bytes, mime_type: str | None) -> tuple[int | None, int | None]:
@@ -3357,6 +4204,29 @@ def is_javascript_url(value: Any) -> bool:
     else:
         text = str(value or "")
     return text.strip().casefold().startswith("javascript:")
+
+
+def is_safe_url(value: Any, *, tag_name: str) -> bool:
+    if isinstance(value, list):
+        text = " ".join(str(item) for item in value)
+    else:
+        text = str(value or "")
+    stripped = text.strip()
+    if not stripped:
+        return True
+    if is_javascript_url(stripped):
+        return False
+    if tag_name == "img" and stripped.casefold().startswith("data:image/"):
+        return ";base64," in stripped.casefold()
+    try:
+        parsed = urlsplit(stripped)
+    except ValueError:
+        return False
+    if parsed.scheme.casefold() == "file":
+        return False
+    if parsed.scheme.casefold() == "data":
+        return False
+    return parsed.scheme.casefold() in SAFE_URL_SCHEMES
 
 
 def positive_span(value: Any) -> int:
@@ -3451,6 +4321,7 @@ def required_showcase_files() -> list[str]:
         "canonical/blocks.jsonl",
         "canonical/tables.jsonl",
         "canonical/table-cells.jsonl",
+        "canonical/table-placements.jsonl",
         "canonical/images.jsonl",
         "canonical/assets.jsonl",
         "canonical/recommendations.jsonl",

@@ -1,0 +1,113 @@
+{
+  "checks": [
+    {
+      "entity": "documents",
+      "extra_ids": [],
+      "missing_ids": [],
+      "parsed": 1,
+      "passed": true,
+      "showcase": 1,
+      "text_mismatches": []
+    },
+    {
+      "entity": "sections",
+      "extra_ids": [],
+      "missing_ids": [],
+      "parsed": 31,
+      "passed": true,
+      "showcase": 31,
+      "text_mismatches": []
+    },
+    {
+      "entity": "blocks",
+      "extra_ids": [],
+      "missing_ids": [],
+      "parsed": 1174,
+      "passed": true,
+      "showcase": 1174,
+      "text_mismatches": []
+    },
+    {
+      "entity": "tables",
+      "extra_ids": [],
+      "missing_ids": [],
+      "parsed": 14,
+      "passed": true,
+      "showcase": 14,
+      "text_mismatches": []
+    },
+    {
+      "entity": "table_cells",
+      "extra_ids": [],
+      "missing_ids": [],
+      "parsed": 348,
+      "passed": true,
+      "showcase": 348,
+      "text_mismatches": []
+    },
+    {
+      "entity": "table_placements",
+      "extra_ids": [],
+      "missing_ids": [],
+      "parsed": 365,
+      "passed": true,
+      "showcase": 365,
+      "text_mismatches": []
+    },
+    {
+      "entity": "images",
+      "extra_ids": [],
+      "missing_ids": [],
+      "parsed": 30,
+      "passed": true,
+      "showcase": 30,
+      "text_mismatches": []
+    },
+    {
+      "entity": "assets",
+      "extra_ids": [],
+      "missing_ids": [],
+      "parsed": 30,
+      "passed": true,
+      "showcase": 30,
+      "text_mismatches": []
+    },
+    {
+      "entity": "recommendations",
+      "extra_ids": [],
+      "missing_ids": [],
+      "parsed": 112,
+      "passed": true,
+      "showcase": 112,
+      "text_mismatches": []
+    },
+    {
+      "entity": "references",
+      "extra_ids": [],
+      "missing_ids": [],
+      "parsed": 261,
+      "passed": true,
+      "showcase": 261,
+      "text_mismatches": []
+    },
+    {
+      "entity": "chunks",
+      "extra_ids": [],
+      "missing_ids": [],
+      "parsed": 132,
+      "passed": true,
+      "showcase": 132,
+      "text_mismatches": []
+    },
+    {
+      "entity": "citations",
+      "extra_ids": [],
+      "missing_ids": [],
+      "parsed": 132,
+      "passed": true,
+      "showcase": 132,
+      "text_mismatches": []
+    }
+  ],
+  "passed": true
+}

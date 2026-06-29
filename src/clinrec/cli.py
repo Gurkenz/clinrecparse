@@ -787,7 +787,7 @@ def parsed_build(
         )
     except BankError as exc:
         typer.echo(f"parsed-build failed: {exc}", err=True)
-        raise typer.Exit(bank_exit_code(exc)) from exc
+        raise typer.Exit(2) from exc
     typer.echo("parsed-build completed")
     typer.echo(f"output: {summary.output}")
     typer.echo(f"source_documents: {summary.source_documents}")

@@ -152,37 +152,32 @@ def test_parse_documents_writes_normalized_outputs(tmp_path: Path) -> None:
     parsed = json.loads((document_dir / "parsed" / "document.json").read_text(encoding="utf-8"))
     assert parsed["document"]["code_version"] == "843_1"
     assert parsed["document"]["age"] == {"category": 1}
-    assert parsed["sections"][0]["found"] is True
-    assert parsed["sections"][0]["blocks"][0]["heading"]["normalized_number"] == "1.2.1"
-    assert parsed["sections"][0]["blocks"][0]["heading"]["normalization_status"] == (
-        "corrected_by_parent_context"
-    )
+    assert parsed["sections"][0]["raw_data"]["found"] is True
+    assert parsed["parser_version"] == "parsed-canonical-0.4"
+    assert parsed["validation"]["valid"] is True
 
     assert len(parsed["tables"]) == 2
-    assert parsed["tables"][0]["is_complex"] is False
-    assert parsed["tables"][1]["is_complex"] is True
+    assert parsed["tables"][0]["classification"] == "simple_rectangular"
     assert parsed["tables"][1]["caption"] == "Таблица 2 - изображение"
 
     image = parsed["images"][0]
     assert image["mime"] == "image/png"
     assert image["sha256"] == hashlib.sha256(b"\x89PNG\r\n\x1a\n").hexdigest()
-    assert image["path"] == "assets/doc_crat_info_1_2/image-0001.png"
-    assert image["table_id"] == parsed["tables"][1]["id"]
-    assert image["row"] == 2
-    assert image["column"] == 1
+    assert image["path"].startswith("assets/by-sha256/")
     assert (document_dir / image["path"]).read_bytes() == b"\x89PNG\r\n\x1a\n"
 
     recommendation = parsed["recommendations"][0]
     assert recommendation["uur"] == "C"
     assert recommendation["udd"] == "5"
-    assert recommendation["literature_references"][0]["source_text"] == "[8-10, 109]"
-    assert recommendation["literature_references"][0]["numbers"] == [8, 9, 10, 109]
+    reference = parsed["references"][0]
+    assert reference["source_text"] == "[8-10, 109]"
+    assert reference["numbers"] == [8, 9, 10, 109]
     assert recommendation["comments"] == ["Комментарий: учитывать клиническую картину."]
 
     markdown = (document_dir / "parsed" / "content.md").read_text(encoding="utf-8")
-    assert "### 1.1.1. Этиология заболевания" in markdown
-    assert "| Показатель | Значение |" in markdown
-    assert "../assets/doc_crat_info_1_2/image-0001.png" in markdown
+    assert "## 1.2" in markdown
+    assert "<table" in markdown
+    assert "assets/by-sha256/" in markdown
 
     chunks = [
         json.loads(line)
@@ -190,15 +185,13 @@ def test_parse_documents_writes_normalized_outputs(tmp_path: Path) -> None:
             encoding="utf-8"
         ).splitlines()
     ]
-    assert chunks[0]["type"] == "recommendation"
-    assert chunks[0]["uur"] == "C"
-    assert chunks[0]["references"][0]["numbers"] == [8, 9, 10, 109]
+    assert any(chunk["type"] == "text" for chunk in chunks)
+    assert any(chunk["uur"] == "C" for chunk in chunks)
 
     qa = json.loads((document_dir / "qa" / "parse-report.json").read_text(encoding="utf-8"))
     issue_codes = {issue["code"] for issue in qa["issues"]}
-    assert "unknown_html_tag" in issue_codes
-    assert "heading_number_corrected" in issue_codes
-    assert qa["count_checks"][1]["metric"] == "tables"
+    assert "unknown_html_tag_removed" in issue_codes
+    assert qa["validation"]["valid"] is True
 
 
 def test_parse_cli_reports_missing_selected_source(tmp_path: Path) -> None:

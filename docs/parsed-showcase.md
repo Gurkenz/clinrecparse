@@ -21,7 +21,7 @@ rewritten or normalized.
 
 Included packages:
 
-- `canonical/`: draft `0.2-pilot` records and extracted local assets.
+- `canonical/`: draft `0.3-pilot` records and extracted local assets.
 - `backend/`: JSON/JSONL import package with stable foreign keys.
 - `frontend/`: document payload with normalized HTML and local asset paths.
 - `ml/`: text chunks, table chunks, image-context chunks, and
@@ -33,5 +33,6 @@ create a vector index, update a production database, or generate summaries.
 
 The command uses `clinrec.parsed.pipeline.parse_document()` and shares the same
 canonical parser with `clinrec parsed-build`. Validation fails closed when raw
-occurrence counts, visible text preservation, block coverage, table-cell coverage,
-image coverage, citation titles, or deterministic rebuild checks fail.
+occurrence counts, visible text preservation, block coverage, logical table
+placement coverage, image coverage, citation titles, or deterministic rebuild
+checks fail.
