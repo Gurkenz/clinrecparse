@@ -44,7 +44,8 @@ def main() -> int:
 def verify_parity(showcase: Path, parsed: Path) -> dict[str, Any]:
     checks: list[dict[str, Any]] = []
     for name, (key, showcase_relative, parsed_relative) in ENTITY_SPECS.items():
-        showcase_rows = read_entity(showcase / "canonical" / showcase_relative, key)
+        showcase_base = showcase if showcase_relative.startswith("ml/") else showcase / "canonical"
+        showcase_rows = read_entity(showcase_base / showcase_relative, key)
         parsed_rows = read_entity(parsed / parsed_relative, key)
         checks.append(compare_entity(name, key, showcase_rows, parsed_rows))
     passed = all(check["passed"] for check in checks)
