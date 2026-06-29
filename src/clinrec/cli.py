@@ -59,6 +59,12 @@ from clinrec.parsed.layer import build_parsed_dataset as run_parsed_build
 from clinrec.parsed.layer import build_parsed_diff as run_parsed_build_diff
 from clinrec.parsed.layer import export_parsed_dataset as run_parsed_export
 from clinrec.parsed.layer import validate_parsed_dataset as run_parsed_validate
+from clinrec.parsed.showcase import (
+    ParsedShowcaseOptions,
+    ShowcaseInputError,
+    ShowcaseValidationError,
+)
+from clinrec.parsed.showcase import build_parsed_showcase as run_parsed_build_showcase
 from clinrec.parsing.document import ParseError, ParseOptions
 from clinrec.parsing.document import parse_documents as run_parse_documents
 from clinrec.qa.checks import QaOptions
@@ -794,6 +800,134 @@ def parsed_build(
     typer.echo(f"summary: {summary.summary_path}")
     if summary.failed_documents:
         raise typer.Exit(1)
+
+
+@app.command("parsed-build-showcase")
+def parsed_build_showcase(
+    input_corpus: Annotated[
+        Path | None,
+        typer.Option(
+            "--input-corpus",
+            help="Research raw corpus directory, e.g. data/research/corpora/live-json-250.",
+            exists=True,
+            file_okay=False,
+            dir_okay=True,
+            readable=True,
+        ),
+    ] = None,
+    raw_json: Annotated[
+        Path | None,
+        typer.Option(
+            "--raw-json",
+            help="Standalone getclinrec.json path.",
+            exists=True,
+            file_okay=True,
+            dir_okay=False,
+            readable=True,
+        ),
+    ] = None,
+    manifest: Annotated[
+        Path | None,
+        typer.Option(
+            "--manifest",
+            help="Optional raw manifest path for standalone mode.",
+            exists=True,
+            file_okay=True,
+            dir_okay=False,
+            readable=True,
+        ),
+    ] = None,
+    catalog_record: Annotated[
+        Path | None,
+        typer.Option(
+            "--catalog-record",
+            help="Optional catalog-record.json path for standalone mode.",
+            exists=True,
+            file_okay=True,
+            dir_okay=False,
+            readable=True,
+        ),
+    ] = None,
+    catalog_candidates: Annotated[
+        Path | None,
+        typer.Option(
+            "--catalog-candidates",
+            help="Optional catalog-candidates.json path for standalone mode.",
+            exists=True,
+            file_okay=True,
+            dir_okay=False,
+            readable=True,
+        ),
+    ] = None,
+    code_version: Annotated[
+        str,
+        typer.Option("--code-version", help="Current CodeVersion to showcase."),
+    ] = "843_1",
+    output: Annotated[
+        Path,
+        typer.Option("--output", help="Showcase output directory."),
+    ] = Path("data/showcase/843_1"),
+    overwrite: Annotated[
+        bool,
+        typer.Option("--overwrite", help="Replace an existing output directory."),
+    ] = False,
+    keep_builds: Annotated[
+        bool,
+        typer.Option("--keep-builds", help="Keep temporary A/B build directories."),
+    ] = False,
+) -> None:
+    """Build, validate, preview, and zip one real parsed showcase document."""
+    try:
+        summary = run_parsed_build_showcase(
+            ParsedShowcaseOptions(
+                input_corpus=input_corpus,
+                raw_json=raw_json,
+                manifest=manifest,
+                catalog_record=catalog_record,
+                catalog_candidates=catalog_candidates,
+                code_version=code_version,
+                output=output,
+                overwrite=overwrite,
+                keep_builds=keep_builds,
+            )
+        )
+    except ShowcaseValidationError as exc:
+        typer.echo(f"parsed-build-showcase validation failed: {exc}", err=True)
+        if exc.report_path is not None:
+            typer.echo(f"report: {exc.report_path}", err=True)
+        raise typer.Exit(2) from exc
+    except (ShowcaseInputError, BankError) as exc:
+        typer.echo(f"parsed-build-showcase failed: {exc}", err=True)
+        raise typer.Exit(1) from exc
+
+    typer.echo("parsed-build-showcase completed")
+    typer.echo(f"output: {summary.output}")
+    typer.echo(f"archive: {summary.archive}")
+    typer.echo(f"archive_sha256: {summary.archive_sha256}")
+    typer.echo(f"archive_size: {summary.archive_size}")
+    typer.echo(f"raw_path: {summary.raw_path}")
+    typer.echo(f"raw_sha256: {summary.raw_sha256}")
+    typer.echo(f"manifest_valid: {summary.manifest_valid}")
+    typer.echo(f"code_version: {summary.code_version}")
+    typer.echo(f"title: {summary.document_title}")
+    typer.echo(f"sections: {summary.sections}")
+    typer.echo(f"blocks: {summary.blocks}")
+    typer.echo(f"tables: {summary.tables}")
+    typer.echo(f"tables_by_classification: {summary.table_classifications}")
+    typer.echo(f"table_cells: {summary.table_cells}")
+    typer.echo(f"image_occurrences: {summary.image_occurrences}")
+    typer.echo(f"unique_assets: {summary.unique_assets}")
+    typer.echo(f"image_decode_failures: {summary.image_decode_failures}")
+    typer.echo(f"recommendations: {summary.recommendations}")
+    typer.echo(f"references: {summary.references}")
+    typer.echo(f"text_chunks: {summary.text_chunks}")
+    typer.echo(f"table_chunks: {summary.table_chunks}")
+    typer.echo(f"image_chunks: {summary.image_chunks}")
+    typer.echo(f"hard_errors: {summary.hard_errors}")
+    typer.echo(f"warnings: {summary.warnings}")
+    typer.echo(f"determinism_passed: {summary.determinism_passed}")
+    typer.echo(f"zip_verified: {summary.zip_verified}")
+    typer.echo(f"validation_report: {summary.validation_report}")
 
 
 @app.command("parsed-validate")

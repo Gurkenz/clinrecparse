@@ -243,12 +243,18 @@ def parse_raw_document(state: BuildState, ref: RawDocumentRef) -> None:
     document_sections: list[dict[str, Any]] = []
     document_tables: list[dict[str, Any]] = []
     document_images: list[dict[str, Any]] = []
+    section_occurrences: Counter[str] = Counter()
     for source_order, section in enumerate(sections, start=1):
+        source_section_id = section_id_for(section) or f"section_{source_order:04d}"
+        occurrence_index = section_occurrences[source_section_id]
+        section_occurrences[source_section_id] += 1
         parsed_section, table_rows, image_rows = parse_section(
             state,
             ref,
             section,
             source_order=source_order,
+            source_section_id=source_section_id,
+            occurrence_index=occurrence_index,
             raw_relative=raw_relative,
             raw_sha=raw_sha,
         )
@@ -275,11 +281,12 @@ def parse_section(
     section: dict[str, Any],
     *,
     source_order: int,
+    source_section_id: str,
+    occurrence_index: int,
     raw_relative: str,
     raw_sha: str,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
-    raw_id = section_id_for(section) or f"section_{source_order:04d}"
-    section_key = f"{safe_id(raw_id)}#{source_order:04d}"
+    section_key = f"{safe_id(source_section_id)}#{occurrence_index}"
     document_uid = document_uid_for(ref.kind, ref.code_version, ref.current_code_version)
     section_uid = f"{document_uid}:{section_key}"
     raw_html = section_html(section)
@@ -311,7 +318,8 @@ def parse_section(
         "code_version": ref.code_version,
         "current_code_version": ref.current_code_version,
         "source_order": source_order,
-        "source_section_id": raw_id,
+        "source_section_id": source_section_id,
+        "occurrence_index": occurrence_index,
         "section_key": section_key,
         "section_title": section_title(section),
         "raw_html_sha256": sha256_text(raw_html),
@@ -399,14 +407,12 @@ def normalize_image(
             decode_error = str(exc)
             image["src"] = ""
             image["data-clinrec-image-status"] = "decode_failed"
-    image_id = (
-        f"{section_uid}:image#{image_index + 1:04d}"
-        if asset_sha is None
-        else f"image:{asset_sha}"
-    )
+    image_id = f"{section_uid}:image#{image_index:04d}"
+    image["data-clinrec-image-id"] = image_id
     return {
         "schema_version": PARSED_SCHEMA_VERSION,
         "image_id": image_id,
+        "occurrence_id": image_id,
         "section_id": section_uid,
         "document_id": document_uid_for(ref.kind, ref.code_version, ref.current_code_version),
         "document_kind": ref.kind,
@@ -417,6 +423,7 @@ def normalize_image(
         "image_index": image_index,
         "source_type": source_type,
         "mime_type": mime_type,
+        "asset_id": f"sha256:{asset_sha}" if asset_sha is not None else None,
         "asset_sha256": asset_sha,
         "asset_path": asset_path,
         "decoded_size_bytes": decoded_size,
